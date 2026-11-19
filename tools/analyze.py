@@ -57,8 +57,8 @@ def load_ratings(path):
             for key in RATINGS[1:]:
                 if row.get(key):
                     value = float(row[key])
-                    limit = 1 if key == "artifact" else 5
-                    if not (0 <= value <= 1 if key == "artifact" else 1 <= value <= limit):
+                    valid = value in (0, 1) if key == "artifact" else 1 <= value <= 5
+                    if not valid:
                         raise ValueError(f"Review {row['id']} has invalid {key}")
                     row[key] = value
                 else:
@@ -141,7 +141,9 @@ def trajectory(rows):
                 continue
             seen.add(sigma)
             for key in ("attention", "conditional_x0"):
-                by_metric[(sigma, key)].append(np.asarray(item[key][0]))
+                values = np.asarray(item[key][0], dtype=np.float64)
+                if np.isfinite(values).all():
+                    by_metric[(sigma, key)].append(values)
     return {
         f"{key}@{sigma:g}": average(cosine_distance(a, b) for a, b in combinations(items, 2))
         for (sigma, key), items in by_metric.items() if len(items) >= 2
@@ -167,7 +169,8 @@ def metrics(root, rows, ratings, perceptual, keep_traces):
         average(float(a != b) for a, b in combinations(groups, 2)) if all(groups) else None
     )
     for key in RATINGS[1:]:
-        result[key] = average(score.get(key) for score in review)
+        values = [score.get(key) for score in review]
+        result[key] = average(values) if all(value is not None for value in values) else None
     if keep_traces:
         result.update(trajectory(rows))
     return result
@@ -175,17 +178,25 @@ def metrics(root, rows, ratings, perceptual, keep_traces):
 
 def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
     summaries = {}
-    for method, group in partition(runs, "method").items():
+    methods = partition(runs, "method")
+    baseline_prompts = partition(methods[baseline], "prompt_id")
+    baseline_cache = {}
+    for method, group in methods.items():
         compared, n_seeds = {}, 0
         for prompt_id, rows in partition(group, "prompt_id").items():
-            native = [r for r in runs if r["method"] == baseline and r["prompt_id"] == prompt_id]
+            native = baseline_prompts.get(prompt_id, [])
             matched = {r["seed"] for r in native} & {r["seed"] for r in rows}
             if len(matched) < 2:
                 continue
             rows = [r for r in rows if r["seed"] in matched]
             native = [r for r in native if r["seed"] in matched]
             data = metrics(root, rows, ratings, perceptual, keep_traces)
-            ref = data if method == baseline else metrics(root, native, ratings, perceptual, keep_traces)
+            cache_key = (prompt_id, frozenset(matched))
+            if method == baseline:
+                baseline_cache[cache_key] = data
+            if cache_key not in baseline_cache:
+                baseline_cache[cache_key] = metrics(root, native, ratings, perceptual, keep_traces)
+            ref = baseline_cache[cache_key]
             for key, value in data.items():
                 compared.setdefault(key, []).append((value, ref.get(key)))
             n_seeds += len(matched)

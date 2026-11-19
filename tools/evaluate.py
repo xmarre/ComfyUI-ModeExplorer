@@ -46,10 +46,12 @@ def graph(args, method, prompt, seed, *, name):
         "10": node("SaveImage", images=["9", 0], filename_prefix=f"modeexplorer_eval/{name}"),
     }
     model_input = ["1", 0]
-    if args.identity_lora:
-        g["11"] = node("LoraLoaderModelOnly", model=model_input, lora_name=args.identity_lora,
-                       strength_model=args.lora_strength)
-        model_input = ["11", 0]
+    for key, name, strength in (
+        ("11", args.model_lora, args.model_lora_strength), ("12", args.identity_lora, args.lora_strength),
+    ):
+        if name:
+            g[key] = node("LoraLoaderModelOnly", model=model_input, lora_name=name, strength_model=strength)
+            model_input = [key, 0]
     if method == "native" and not args.diagnostics:
         g["8"]["inputs"]["model"] = model_input
     else:
@@ -113,7 +115,10 @@ def read_trace(path, offset, seed):
             _, found, payload = line.partition(b"MODEEXPLORER_TRACE ")
             if not found:
                 continue
-            trace = json.loads(payload)
+            try:
+                trace = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
             if trace["seed"] == seed and trace["completed"]:
                 return trace
     return None
@@ -170,6 +175,8 @@ def parse_args():
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--methods", nargs="+", choices=sorted(METHODS), default=list(METHODS))
+    p.add_argument("--model-lora", help="Optional model LoRA for a separate external baseline.")
+    p.add_argument("--model-lora-strength", type=float, default=1.0)
     p.add_argument("--identity-lora")
     p.add_argument("--identity-trigger")
     p.add_argument("--lora-strength", type=float, default=1.0)

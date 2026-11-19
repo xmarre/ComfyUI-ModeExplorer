@@ -43,11 +43,12 @@ def model():
     return comfy.model_patcher.ModelPatcher(base, device, device)
 
 
-def conditions(batch=1, *, mixed=False, reference=False):
+def conditions(batch=1, *, mixed=False, reference=False, split_cfg=False):
     context = torch.randn(1, 5, 64, generator=torch.Generator().manual_seed(74))
     context = torch.cat((context, context * -1), dim=0) if mixed else context
     meta = {"reference_latents": [torch.ones(1, 16, 1, 4, 6)]} if reference else {}
-    return [[context, meta]], [[torch.zeros_like(context), {}]]
+    negative = torch.zeros_like(context[:, :3] if split_cfg else context)
+    return [[context, meta]], [[negative, {}]]
 
 
 def schedule():
@@ -56,9 +57,9 @@ def schedule():
 
 @torch.inference_mode()
 def draw(model, seed=55, *, batch=1, cfg=1.0, sigmas=None, mixed=False, reference=False, stage=None,
-         zero_noise=False, latent=None, mask=None, guider_basic=False):
+         zero_noise=False, latent=None, mask=None, guider_basic=False, split_cfg=False):
     x = torch.zeros(batch, 16, 1, 7, 11) if latent is None else latent
-    p, n = conditions(batch, mixed=mixed, reference=reference)
+    p, n = conditions(batch, mixed=mixed, reference=reference, split_cfg=split_cfg)
     guider = Guider_Basic(model) if guider_basic else comfy.samplers.CFGGuider(model)
     if guider_basic:
         guider.set_conds(p)
@@ -108,9 +109,12 @@ def test_native_trace_parity_and_native_seed(caplog, model):
     assert traces(caplog)[-1]["native_dit_calls"] == 5
     assert len(traces(caplog)[-1]["points"]) == 6
     state = torch.random.get_rng_state()
-    noise = comfy.sample.prepare_noise(torch.zeros(3, 16, 7, 11), 7)
-    repeated = comfy.sample.prepare_noise(torch.zeros(3, 16, 7, 11), 7, [0, 0, 1])
-    assert torch.equal(noise[0], noise[0].clone()) and not torch.equal(noise[0], noise[1])
+    latent = torch.zeros(3, 16, 1, 7, 11)
+    noise = comfy.sample.prepare_noise(latent, 7)
+    different = comfy.sample.prepare_noise(latent, 8)
+    repeated = comfy.sample.prepare_noise(latent, 7, [0, 0, 1])
+    assert not torch.equal(noise, different)
+    assert torch.equal(noise, comfy.sample.prepare_noise(latent, 7))
     assert torch.equal(repeated[0], repeated[1]) and not torch.equal(repeated[1], repeated[2])
     torch.random.set_rng_state(state)
 
@@ -225,27 +229,46 @@ def test_public_sampler_nodes_fix_standard_empty_latent(entry, model):
     assert torch.equal(first, execute(patched))
 
 
-def test_audit_examples_against_installed_node_schemas(model):
+def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
+    import execution
+    import folder_paths
+
+    installed = {
+        "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors"],
+        "text_encoders": ["qwen3vl_4b_fp8_scaled.safetensors"],
+        "vae": ["qwen_image_vae.safetensors"],
+    }
+    monkeypatch.setattr(folder_paths, "get_filename_list", lambda key: installed.get(key, []))
     root = Path(__file__).resolve().parents[1]
     assert asyncio.run(nodes.load_custom_node(str(root)))
     for path in sorted((root / "examples").glob("*.json")):
         graph = json.loads(path.read_text())
         node_map = {node["id"]: node for node in graph["nodes"]}
         assert len(node_map) == len(graph["nodes"])
+        api = {}
         for item in node_map.values():
             schema = nodes.NODE_CLASS_MAPPINGS[item["type"]].INPUT_TYPES()
             inputs = schema.get("required", {}) | schema.get("optional", {})
             for port in item["inputs"]:
                 assert port["name"] in inputs and inputs[port["name"]][0] == port["type"]
-            primitives = [spec for name, spec in inputs.items()
-                          if name not in {port["name"] for port in item["inputs"]}]
-            expected = sum(1 + bool(len(spec) > 1 and spec[1].get("control_after_generate")) for spec in primitives)
-            assert len(item.get("widgets_values", [])) == expected, (path.name, item["type"])
+            ports = {port["name"] for port in item["inputs"]}
+            values = iter(item.get("widgets_values", []))
+            widget_inputs = {}
+            for name, spec in inputs.items():
+                if name not in ports:
+                    widget_inputs[name] = next(values)
+                    if len(spec) > 1 and spec[1].get("control_after_generate"):
+                        next(values)
+            assert next(values, None) is None, (path.name, item["type"])
+            api[str(item["id"])] = {"class_type": item["type"], "inputs": widget_inputs}
         for ident, src, source_slot, dst, dest_slot, value in graph["links"]:
             output = node_map[src]["outputs"][source_slot]
             port = node_map[dst]["inputs"][dest_slot]
             assert port["link"] == ident and ident in output["links"]
             assert value == output["type"] == port["type"]
+            api[str(dst)]["inputs"][port["name"]] = [str(src), source_slot]
+        valid, error, *_ = asyncio.run(execution.validate_prompt(path.name, api, None))
+        assert valid, (path.name, error)
 
 
 def test_spectrum_and_other_numerical_wrappers_are_rejected(model):
@@ -269,3 +292,18 @@ def test_native_lora_patch_ownership_is_preserved(model):
     assert not torch.equal(first, draw(lora))
     assert not torch.equal(draw(lora), draw(model))
     assert torch.equal(first, draw(patched))
+
+
+def test_split_cfg_accounting_and_combined_path(caplog, model):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    patched, = ModeExplorer().apply(model, initialization=True, adaptive=False, diagnostics=True)
+    native = draw(model, cfg=3.5, split_cfg=True)
+    result = draw(patched, cfg=3.5, split_cfg=True)
+    assert torch.isfinite(result).all() and not torch.equal(result, native)
+    assert torch.equal(result, draw(patched, cfg=3.5, split_cfg=True))
+    stats = traces(caplog)[-1]
+    assert stats["native_dit_calls"] == 10
+    assert stats["feature_reference_dit_calls"] == 2
+    assert stats["initialization_guider_calls"] == 4
+    assert stats["initialization_dit_calls"] == 8
+    assert not stats["reasons"]

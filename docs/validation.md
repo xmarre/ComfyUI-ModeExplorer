@@ -13,11 +13,11 @@ python tools/evaluate.py --model krea2_turbo_fp8_scaled.safetensors --out bench-
 python tools/analyze.py bench-output/turbo-smoke --review
 ```
 
-Remove `--smoke` for the 30-prompt × 16-seed panel. The five default methods cover native, both feature objectives, initialization and the combination. Each queue request generates one image. Repeat for Raw by choosing your Raw filename, step count and CFG. For a checkpoint attribution experiment, use the same step count, CFG, schedule and seeds, then independently vary step count and guidance. Record an SDA run with the same settings as a separate external baseline. For identity testing, pass `--identity-lora <name> --identity-trigger <token>` and score the added identity prompts against authorized held-out references. Keep LoRA strength and checkpoint constant for that comparison.
+Remove `--smoke` for the 30-prompt × 16-seed panel. The five default methods cover native, both feature objectives, initialization and the combination. Each queue request generates one image. Repeat for Raw by choosing your Raw filename, step count and CFG. For a checkpoint attribution experiment, use the same step count, CFG, schedule and seeds, then independently vary step count and guidance. Record an SDA run with the same settings in a separate output directory using `--model-lora <SDA filename> --methods native`. For identity testing, pass `--identity-lora <name> --identity-trigger <token>` and score the added identity prompts against authorized held-out references. Keep LoRA strength and checkpoint constant for that comparison.
 
 For separate trajectory runs, add `--server-log <readable-ComfyUI-INFO-log>` and use `--trajectory` when analyzing. The runner records matchable compact traces, per-run native and extra DiT calls, schedule, initial noise statistics, absolute-sigma feature and conditional predicted-clean distances, and observed update magnitudes. Compare native checkpoints at common sigma values. Shape, pooling and branch semantics must match. Compare the clean-latent summary within each model and conditioning regime. The traces are probes of the hypothesized convergence, and downstream matched-image reviews determine whether the probe is informative.
 
-`--gpu 0` samples total device VRAM via nvidia-smi approximately every 200 ms. Keep the GPU otherwise idle and treat this as an approximation to the device high-water mark. The runner records wall time and ComfyUI execution time when the server publishes timestamps. It does one warm-up per method, excluded from metrics. Use runs without trace collection for timing. The optional `--lpips-device cuda` analysis requires the `lpips` Python package and its AlexNet weights; it computes pairwise learned perceptual distances on reduced-size images.
+`--gpu 0` samples total device VRAM via nvidia-smi approximately every 200 ms. Keep the GPU otherwise idle and treat this as an approximation to the device high-water mark. The runner records wall time and ComfyUI execution time when the server publishes timestamps. It does one warm-up per method, excluded from metrics. Use runs without trace collection for timing. The optional `--lpips-device cuda` analysis requires the `lpips` Python package and its AlexNet weights. It computes pairwise learned perceptual distances on reduced-size images.
 
 ## Blinded scoring
 
@@ -30,4 +30,4 @@ Contact sheets and a blank CSV are created under `review/`. Score each image at 
 | Raw vs Turbo convergence stage | Unmeasured on production checkpoints |
 | Composition, anatomy, prompt adherence and identity | Unmeasured on production checkpoints |
 | CUDA timing and device VRAM | Unmeasured |
-| Extra DiT calls | Measured on the tiny native path; production batch/CFG dispatch may differ |
+| Extra DiT calls | Measured on the tiny native path. Production batch and CFG dispatch may differ. |

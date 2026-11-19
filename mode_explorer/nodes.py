@@ -17,14 +17,14 @@ class ModeExplorer:
         return {"required": {
             "model": ("MODEL",),
             "enabled": ("BOOLEAN", {"default": True}),
-            "feature": (FEATURES, {"default": Settings.feature}),
+            "feature": (list(FEATURES), {"default": Settings.feature}),
             "initialization": ("BOOLEAN", {"default": Settings.initialization, "tooltip": "Uses four extra guider evaluations."}),
             "strength": ("FLOAT", {"default": Settings.strength, "min": 0.0, "max": 1.0, "step": 0.01}),
             "fidelity": ("FLOAT", {"default": Settings.fidelity, "min": 0.0, "max": 1.0, "step": 0.01}),
             "min_sigma": ("FLOAT", {"default": Settings.min_sigma, "min": 0.5, "max": 1.0, "step": 0.01, "tooltip": "Absolute flow sigma. Only the initial empty-latent pass is eligible."}),
             "adaptive": ("BOOLEAN", {"default": Settings.adaptive}),
             "similarity": ("FLOAT", {"default": Settings.similarity, "min": 0.0, "max": 0.99, "step": 0.01}),
-            "operation": (OPERATIONS, {"default": Settings.operation}),
+            "operation": (list(OPERATIONS), {"default": Settings.operation}),
             "reference_budget": ("INT", {"default": Settings.reference_budget, "min": 0, "max": 4, "tooltip": "Maximum extra positive transformer forwards for a single image. Batch guidance uses none."}),
             "diagnostics": ("BOOLEAN", {"default": Settings.diagnostics}),
         }}
@@ -59,6 +59,8 @@ class ModeExplorer:
                 patches["attn1_output_patch"] = remaining
             else:
                 patches.pop("attn1_output_patch", None)
+                if not patches:
+                    clone.model_options["transformer_options"].pop("patches", None)
         if active:
             clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)

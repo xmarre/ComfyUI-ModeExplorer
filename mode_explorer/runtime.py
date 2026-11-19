@@ -79,6 +79,7 @@ class Run:
     feature_attempts: int = 0
     shadow_noise: torch.Tensor | None = None
     shadow_clean: torch.Tensor | None = None
+    shadow_start: float | None = None
     points: list[dict] = field(default_factory=list)
     reasons: set[str] = field(default_factory=set)
 
@@ -205,6 +206,16 @@ def as_list(values):
     return values.detach().float().cpu().tolist()
 
 
+def finite_json(value):
+    if isinstance(value, dict):
+        return {key: finite_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [finite_json(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def summary(values):
     # Keep spatial cell order and channel groups. Export no full activations.
     values = values[:MAX_BATCH].movedim(1, -1)
@@ -227,7 +238,8 @@ def record(frame, x, velocity):
     x0 = x[rows].float() - frame.sigma * velocity[rows].float()
     point = {
         "kind": "trajectory", "sigma": frame.sigma,
-        "attention": summary(frame.pooled), "conditional_x0": summary(pool(spatial_image(x0))),
+        "attention": summary(frame.pooled - frame.pooled.mean(dim=(-1, -2), keepdim=True)),
+        "conditional_x0": summary(pool(spatial_image(x0))),
     }
     if frame.metrics is not None:
         cosine, loss, rms = frame.metrics
@@ -243,9 +255,10 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
     if run.shadow_noise is None:
         slot = seed_key(run.seed, "single-reference-assignment") % 8
         run.shadow_noise = reference_noise(x[row], slot + 2).float() * run.noise_scale
+        run.shadow_start = frame.sigma
     shadow = frame.sigma * run.shadow_noise
     if run.shadow_clean is not None:
-        shadow = shadow + (1 - frame.sigma) * run.shadow_clean
+        shadow = shadow + (1 - frame.sigma / run.shadow_start) * run.shadow_clean
     shadow = shadow.to(x.dtype)
     anchor = Frame(frame.grid, 1, 0, "anchor", run, frame.sigma)
     positive_index = frame.offset  # single-sample frames have one row per CFG chunk
@@ -312,9 +325,9 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     grid = tuple(math.ceil(size / patch) for size in x.shape[-2:])
     frame = Frame(grid, run.batch, offset, "sample", run, low)
     if active and run.batch == 1 and run.reference_calls < run.settings.reference_budget:
-        # The first anchor is a native prediction at the actual first sigma.
-        # Future anchors follow its single Euler tangent, never a full extra trajectory.
-        if run.shadow_noise is not None or math.isclose(low, run.start, abs_tol=1e-5):
+        # Use the first eligible actual evaluation even if the solver adjusts its
+        # initial sigma. Do not extrapolate the shadow above its start.
+        if run.shadow_start is None or low <= run.shadow_start:
             frame.reference = shadow_forward(
                 executor, run, frame, x, timesteps, context, attention_mask,
                 ref_latents, options, kwargs,
@@ -463,11 +476,12 @@ class SamplerWrapper:
         finally:
             run.shadow_noise = run.shadow_clean = None
             if settings.diagnostics:
-                LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps({
+                payload = {
                     "seed": run.seed, "completed": completed, "batch": batch,
                     "seconds": time.perf_counter() - begin, "reasons": sorted(run.reasons),
                     "native_dit_calls": run.native_dit_calls, "feature_reference_dit_calls": run.reference_calls,
                     "initialization_dit_calls": run.initialization_dit_calls,
                     "initialization_guider_calls": run.initialization_guider_calls,
                     "feature_attempts": run.feature_attempts, "points": run.points,
-                }, separators=(",", ":")))
+                }
+                LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))
