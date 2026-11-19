@@ -2,7 +2,7 @@
 
 from .runtime import (
     FEATURES, KEY, OPERATIONS, SamplerWrapper, Settings, attention_feature,
-    diffusion_wrapper, has_spectrum, verify_patch_graph, wrappers,
+    diffusion_wrapper, has_spectrum, verify_patch_graph,
 )
 
 
@@ -37,7 +37,7 @@ class ModeExplorer:
 
         base_options = model.model_options
         wrapper_types = (WrappersMP.SAMPLER_SAMPLE, WrappersMP.DIFFUSION_MODEL)
-        attached = any(wrappers(base_options).get(kind, {}).get(KEY) for kind in wrapper_types)
+        attached = any(model.get_wrappers(kind, KEY) for kind in wrapper_types)
         active = enabled and (diagnostics or (strength != 0 and (feature != "native" or initialization)))
         if not active and not attached:
             return (model,)
@@ -45,9 +45,9 @@ class ModeExplorer:
             settings = Settings(feature, initialization, strength, fidelity, min_sigma,
                                 adaptive, similarity, operation, reference_budget, diagnostics)
             self.verify_model(model)
-            if has_spectrum(base_options):
+            if has_spectrum(base_options, model.wrappers):
                 raise RuntimeError("ModeExplorer and Spectrum forecasting need separate MODEL branches.")
-            verify_patch_graph(base_options, settings)
+            verify_patch_graph(base_options, settings, model.wrappers)
 
         clone = model.clone()
         if attached:

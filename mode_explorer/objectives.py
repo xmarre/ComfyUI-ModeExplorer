@@ -107,23 +107,23 @@ def feature_shift(
     adaptive: bool,
     threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    direction, nearest, loss = objective(features.flatten(1), eligible, style)
-    # Restore the scale of dL/d(unit feature). Saturate the update to avoid
-    # amplifying near-zero gradients.
-    values = features.flatten(1)
-    _, size, _ = unit_rows(values)
-    relative = direction * size
-    magnitude = torch.linalg.vector_norm(relative, dim=-1, keepdim=True)
-    direction = (relative / magnitude.clamp_min(EPS)).reshape_as(features)
+    centered = features - features.mean(dim=(-1, -2), keepdim=True)
+    direction, nearest, loss = objective(centered.flatten(1), eligible, style)
+    _, size, _ = unit_rows(centered.flatten(1))
+    relative = (direction * size).reshape_as(features)
+    # Pullback through centering. A common per-sample scale preserves the
+    # coarse-grid channel means while respecting the tightest local bound.
+    relative = relative - relative.mean(dim=(-1, -2), keepdim=True)
+    magnitude = torch.linalg.vector_norm(relative.flatten(1), dim=-1, keepdim=True)
+    direction = relative / magnitude.clamp_min(EPS)[..., None, None]
     cell_norm = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
     anchor_norm = torch.linalg.vector_norm(features.nan_to_num(), dim=1, keepdim=True)
     anchor_norm = torch.where(torch.isfinite(anchor_norm), anchor_norm, 0)
     rate = gain * (1 - 0.85 * fidelity) * magnitude / (magnitude + 0.15)
     if adaptive:
         rate = rate * ((nearest - threshold) / (1.0 - threshold)).clamp(0, 1)
-    # Relative norm of each coarse-cell offset is bounded against its local anchor.
-    correction = direction * anchor_norm / cell_norm.clamp_min(1.0)
-    return correction * rate[..., None, None], nearest.squeeze(-1), loss
+    limit = (anchor_norm / cell_norm.clamp_min(EPS)).amin(dim=(-1, -2), keepdim=True)
+    return direction * limit * rate[..., None, None], nearest.squeeze(-1), loss
 
 
 def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: float) -> torch.Tensor:

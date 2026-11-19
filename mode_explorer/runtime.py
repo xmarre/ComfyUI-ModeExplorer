@@ -106,13 +106,15 @@ def wrappers(options):
     return options.get("transformer_options", {}).get("wrappers", {})
 
 
-def has_spectrum(options):
-    return any(entries.get("spectrum_krea2") for entries in wrappers(options).values())
+def has_spectrum(options, registered=None):
+    return any(entries.get("spectrum_krea2") for tree in (wrappers(options), registered or {})
+               for entries in tree.values())
 
 
-def verify_patch_graph(options, settings):
+def verify_patch_graph(options, settings, registered=None):
     for name in ("sampler_sample", "predict_noise", "calc_cond_batch", "apply_model", "diffusion_model"):
-        if any(key != KEY and value for key, value in wrappers(options).get(name, {}).items()):
+        if any(key != KEY and value for tree in (wrappers(options), registered or {})
+               for key, value in tree.get(name, {}).items()):
             raise RuntimeError(f"ModeExplorer needs the native {name} path. Use a separate MODEL branch for other numerical wrappers.")
     tr = options.get("transformer_options", {})
     if options.get("model_function_wrapper") or options.get("sampler_calc_cond_batch_function"):
@@ -210,6 +212,14 @@ def summary(values):
     return as_list(torch.stack(groups, dim=-1).flatten(1))
 
 
+def spatial_image(latent):
+    if latent.ndim == 4:
+        return latent
+    if latent.ndim == 5 and latent.shape[2] == 1:
+        return latent.squeeze(2)
+    return None
+
+
 def record(frame, x, velocity):
     if frame.pooled is None or len(frame.run.points) >= MAX_POINTS:
         return
@@ -217,7 +227,7 @@ def record(frame, x, velocity):
     x0 = x[rows].float() - frame.sigma * velocity[rows].float()
     point = {
         "kind": "trajectory", "sigma": frame.sigma,
-        "attention": summary(frame.pooled), "conditional_x0": summary(pool(x0)),
+        "attention": summary(frame.pooled), "conditional_x0": summary(pool(spatial_image(x0))),
     }
     if frame.metrics is not None:
         cosine, loss, rms = frame.metrics
@@ -270,10 +280,12 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         run.initialization_dit_calls += 1
         return executor(*arguments, **kwargs)
     run.native_dit_calls += 1
-    if not (run.feature_active or run.settings.diagnostics) or x.ndim != 4:
+    if not (run.feature_active or run.settings.diagnostics) or spatial_image(x) is None:
         return executor(*arguments, **kwargs)
     branches = options.get("cond_or_uncond", ())
     if 0 not in branches:
+        if not branches:
+            run.reasons.add("missing_condition_dispatch")
         return executor(*arguments, **kwargs)
     if branches.count(0) != 1 or x.shape[0] != run.batch * len(branches) or tuple(x.shape[1:]) != run.shape[1:]:
         run.reasons.add("unverified_condition_dispatch")
@@ -339,13 +351,17 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run):
     try:
         clean = estimate(noise)
         refs = (estimate(reference_noise(noise, 0)), estimate(reference_noise(noise, 1)))
-        direction, volume, bandwidth = initial_direction(clean, refs)
+        clean_image = spatial_image(clean)
+        ref_images = tuple(spatial_image(ref) for ref in refs)
+        direction, volume, bandwidth = initial_direction(clean_image, ref_images)
         direction = direction * (run.start * run.noise_scale)
-        candidate = noise_candidate(noise, direction, run.settings.strength * 0.18)
+        candidate = noise_candidate(noise, direction.reshape_as(noise), run.settings.strength * 0.18)
         candidate_clean = estimate(candidate)
-        selected, accepted, gain, relative = select_candidate(
-            noise, candidate, clean, candidate_clean, refs, volume, bandwidth, run.settings.fidelity,
+        chosen, accepted, gain, relative = select_candidate(
+            spatial_image(noise), spatial_image(candidate), clean_image, spatial_image(candidate_clean),
+            ref_images, volume, bandwidth, run.settings.fidelity,
         )
+        selected = chosen.reshape_as(noise)
         if run.settings.diagnostics:
             run.points.append({
                 "kind": "initialization", "accepted": accepted.cpu().tolist(),
@@ -380,8 +396,11 @@ class SamplerWrapper:
         if model_options.get("multigpu_clones") or model_options.get("context_handler") is not None:
             raise RuntimeError("ModeExplorer does not support multi-GPU dispatch or context windows.")
         sampling = model_wrap.inner_model.model_sampling
-        if not isinstance(sampling, CONST) or type(sampling).calculate_denoised is not CONST.calculate_denoised:
-            raise RuntimeError("ModeExplorer requires Krea 2's native flow prediction parameterization.")
+        if not isinstance(sampling, CONST) or any(
+            getattr(type(sampling), key) is not getattr(CONST, key)
+            for key in ("calculate_input", "calculate_denoised", "noise_scaling")
+        ):
+            raise RuntimeError("ModeExplorer requires Krea 2's native flow prediction and noise scaling.")
         if len(sigmas) <= 1:
             return sample()
         seed = extra_args.get("seed")
@@ -390,7 +409,7 @@ class SamplerWrapper:
         active = settings.strength > 0 and (settings.feature != "native" or settings.initialization)
         reasons = set()
         if active:
-            if noise.ndim != 4 or not 1 <= batch <= MAX_BATCH:
+            if spatial_image(noise) is None or not 1 <= batch <= MAX_BATCH:
                 reasons.add("unsupported_latent_shape")
             if not math.isclose(start, 1.0, abs_tol=1e-5):
                 reasons.add("partial_denoise")
@@ -425,6 +444,8 @@ class SamplerWrapper:
             return sample()
 
         scale = getattr(sampling, "noise_scale", 1.0)
+        if not math.isfinite(scale) or scale <= 0:
+            raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active, reasons=reasons)
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
@@ -440,6 +461,7 @@ class SamplerWrapper:
             completed = True
             return result
         finally:
+            run.shadow_noise = run.shadow_clean = None
             if settings.diagnostics:
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps({
                     "seed": run.seed, "completed": completed, "batch": batch,
