@@ -5,6 +5,8 @@ import logging
 import pytest
 import torch
 
+pytest.importorskip("comfyui_spectrum_krea2")
+
 from test_comfy_integration import model, draw
 from mode_explorer.nodes import ModeExplorer
 from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
