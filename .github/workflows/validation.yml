@@ -9,13 +9,13 @@ jobs:
   cpu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: Comfy-Org/ComfyUI
           ref: c8abeb00ad2736b649ca2fceb8395e25072c7ea3
           path: .comfyui
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install CPU dependencies
