@@ -31,3 +31,17 @@ Contact sheets and a blank CSV are created under `review/`. Score each image at 
 | Composition, anatomy, prompt adherence and identity | Unmeasured on production checkpoints |
 | CUDA timing and device VRAM | Unmeasured |
 | Extra DiT calls | Measured on the tiny native path. Production batch and CFG dispatch may differ. |
+
+
+## Spectrum interoperability
+
+The cross-repository tiny-model CPU suite exercises native Krea 2 sampling
+with the actual Spectrum wrapper registration and history-capture logic.
+Both states of ModeExplorer's A/B MODEL switch must pass through the same
+Spectrum node. Apply ModeExplorer before Spectrum: this isolates initial noise
+optimization from Spectrum's sampling session. Auxiliary reference forwards
+run without modifying Spectrum counters, capture hooks or history. Early
+guidance evaluations are real model forwards; Spectrum clears forecast
+history when the guidance regime ends and can resume native forecasting.
+These tests do not establish CUDA safety or improved composition diversity
+on production checkpoints.
