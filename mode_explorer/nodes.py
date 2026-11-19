@@ -27,12 +27,15 @@ class ModeExplorer:
             "operation": (list(OPERATIONS), {"default": Settings.operation}),
             "reference_budget": ("INT", {"default": Settings.reference_budget, "min": 0, "max": 4, "tooltip": "Maximum extra positive transformer forwards for a single image. Batch guidance uses none."}),
             "diagnostics": ("BOOLEAN", {"default": Settings.diagnostics}),
+            "full_spectrum": ("BOOLEAN", {"default": Settings.full_spectrum,
+                "tooltip": "Experimental: leave Spectrum's forecast policy/history untouched. Forecasted steps cannot receive guidance; cross-regime extrapolation is unvalidated."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
               strength=Settings.strength, fidelity=Settings.fidelity, min_sigma=Settings.min_sigma,
               adaptive=Settings.adaptive, similarity=Settings.similarity, operation=Settings.operation,
-              reference_budget=Settings.reference_budget, diagnostics=Settings.diagnostics):
+              reference_budget=Settings.reference_budget, diagnostics=Settings.diagnostics,
+              full_spectrum=Settings.full_spectrum):
         from comfy.patcher_extension import WrappersMP
 
         base_options = model.model_options
@@ -43,7 +46,8 @@ class ModeExplorer:
             return (model,)
         if active:
             settings = Settings(feature, initialization, strength, fidelity, min_sigma,
-                                adaptive, similarity, operation, reference_budget, diagnostics)
+                                adaptive, similarity, operation, reference_budget, diagnostics,
+                                full_spectrum)
             self.verify_model(model)
             if has_spectrum(base_options, model.wrappers):
                 raise RuntimeError("Apply ModeExplorer before Spectrum: noise optimization must precede Spectrum's sampling session.")

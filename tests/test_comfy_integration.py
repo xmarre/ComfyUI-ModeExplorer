@@ -84,6 +84,7 @@ def test_discovery_and_clone_ownership(model):
     assert nodes.NODE_CLASS_MAPPINGS["ModeExplorerKrea2"].RETURN_TYPES == ("MODEL",)
     node = ModeExplorer()
     assert node.INPUT_TYPES()["required"]["model"] == ("MODEL",)
+    assert node.INPUT_TYPES()["required"]["full_spectrum"][1]["default"] is False
     assert node.apply(model, enabled=False)[0] is model
     assert node.apply(model, feature="native")[0] is model
     patched, = node.apply(model)
@@ -307,3 +308,13 @@ def test_split_cfg_accounting_and_combined_path(caplog, model):
     assert stats["initialization_guider_calls"] == 4
     assert stats["initialization_dit_calls"] == 8
     assert not stats["reasons"]
+
+
+def test_full_spectrum_is_an_opt_in_noop_without_spectrum(model):
+    node = ModeExplorer()
+    native, = node.apply(model, feature="feature_cosine", adaptive=False)
+    opted, = node.apply(model, feature="feature_cosine", adaptive=False, full_spectrum=True)
+    assert torch.equal(draw(native), draw(opted))
+    assert not torch.equal(draw(model), draw(opted))
+    with pytest.raises(ValueError, match="full_spectrum must be a boolean"):
+        node.apply(model, full_spectrum=1)

@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: xmarre/ComfyUI-Spectrum-Krea2
-          ref: 4e67dd9da338a20b8804f617632558365ecd12a3
+          ref: 1bd9a28f3f1b5ac878b9e90961ef5da59062edb6
           path: .spectrum
       - uses: actions/setup-python@v6
         with:

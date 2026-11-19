@@ -82,3 +82,47 @@ def test_highres_stage_preserves_spectrum_native_model(model):
     joint = spectrum(guided)
     assert torch.equal(draw(baseline, sigmas=SIGMAS, stage="highres"),
                        draw(joint, sigmas=SIGMAS, stage="highres"))
+
+
+def test_full_spectrum_keeps_native_forecast_plan_and_applies_guidance(caplog, model):
+    """No intervention-driven reset; early native steps retain feature guidance."""
+    caplog.set_level(logging.INFO)
+    baseline = spectrum(model)
+    guided, = ModeExplorer().apply(model, adaptive=False, diagnostics=True,
+                                   full_spectrum=True)
+    full = spectrum(guided)
+    baseline_image = draw(baseline, sigmas=SIGMAS)
+    off = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    full_image = draw(full, sigmas=SIGMAS)
+    on = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+
+    assert off["mode_explorer_spectrum_policy"] == "spectrum_only"
+    assert on["mode_explorer_spectrum_policy"] == "full"
+    assert on["actual"] == off["actual"], (off, on)
+    assert on["forecast"] == off["forecast"], (off, on)
+    assert on["mode_explorer_native_steps"] == 0
+    assert "ModeExplorer early-feature regime transition" not in on["actual_reasons"]
+    assert on["fallback"] is None
+    assert trace["spectrum_policy"] == "full"
+    assert trace["feature_reference_dit_calls"] == 2
+    assert trace["feature_attempts"] == 2
+    points = [p for p in trace["points"] if "shift_rms" in p]
+    assert len(points) == 2
+    assert all(p["shift_rms"][0] > 0 for p in points)
+    assert not torch.equal(full_image, baseline_image)
+    assert torch.equal(full_image, draw(full, sigmas=SIGMAS))
+    assert CURRENT.get() is None
+
+
+def test_default_remains_guarded_on_same_spectrum_configuration(caplog, model):
+    caplog.set_level(logging.INFO)
+    guarded, = ModeExplorer().apply(model, adaptive=False, diagnostics=True)
+    result = draw(spectrum(guarded), sigmas=SIGMAS)
+    assert torch.isfinite(result).all()
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert report["mode_explorer_spectrum_policy"] == "guarded"
+    assert report["mode_explorer_native_steps"] == 2
+    assert "ModeExplorer early-feature regime transition" in report["actual_reasons"]
+    assert trace["spectrum_policy"] == "guarded"

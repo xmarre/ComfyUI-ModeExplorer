@@ -45,3 +45,25 @@ guidance evaluations are real model forwards; Spectrum clears forecast
 history when the guidance regime ends and can resume native forecasting.
 These tests do not establish CUDA safety or improved composition diversity
 on production checkpoints.
+
+
+### Optional Full Spectrum policy
+
+The `Full Spectrum` checkbox defaults to **off** (guarded). When enabled,
+Spectrum keeps its original native/forecast eligibility, extrapolation
+guards, and anchor history. It does not insert a native evaluation or clear
+anchors at the guided-to-unguided boundary. This makes the forecast selection
+policy comparable to Spectrum-only sampling, although data-dependent
+forecast rejections may still give different evaluation counts.
+
+A Spectrum forecast bypasses Krea 2's attention hook, so an eligible
+ModeExplorer guidance step may not actually execute. Check
+`feature_attempts`, `feature_reference_dit_calls`, and `shift_rms` in
+`MODEEXPLORER_TRACE` and the Spectrum report. Forecast history can retain
+features from a guided operator and extrapolate them after the guidance
+window. This cross-regime extrapolation has unmeasured numerical and
+perceptual error. Prefer the default guarded policy when that risk matters.
+
+The cross-repository tiny-model suite verifies the optional mode's native/
+forecast counts against Spectrum-only on a deterministic sampler, verifies
+nonzero early guidance, and checks the default and bypass behavior.

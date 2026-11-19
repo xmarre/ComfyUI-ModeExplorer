@@ -51,6 +51,9 @@ class Settings:
     operation: str = "auto"
     reference_budget: int = 2
     diagnostics: bool = False
+    # Experimental opt-in to the unmodified Spectrum native/forecast policy.
+    # Forecasted evaluations cannot receive attention guidance.
+    full_spectrum: bool = False
 
     def __post_init__(self):
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
@@ -63,6 +66,8 @@ class Settings:
                 raise ValueError(f"ModeExplorer {key} must be in [{low}, {high}]")
         if type(self.reference_budget) is not int or not 0 <= self.reference_budget <= 4:
             raise ValueError("ModeExplorer reference_budget must be an integer in [0, 4]")
+        if type(self.full_spectrum) is not bool:
+            raise ValueError("ModeExplorer full_spectrum must be a boolean")
 
 
 @dataclass
@@ -570,6 +575,8 @@ class SamplerWrapper:
                     "initialization_dit_calls": run.initialization_dit_calls,
                     "initialization_guider_calls": run.initialization_guider_calls,
                     "feature_attempts": run.feature_attempts, "spectrum_forecast_calls": run.spectrum_forecasts,
+                    "spectrum_policy": ("full" if settings.full_spectrum else "guarded")
+                        if spectrum is not None else "none",
                     "points": run.points,
                 }
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))
