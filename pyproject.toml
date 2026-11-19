@@ -1,0 +1,21 @@
+[project]
+name = "comfyui-modeexplorer"
+version = "0.1.0"
+description = "Inference-time generative diversity guidance for native ComfyUI Krea 2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-ModeExplorer"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mode_explorer"]
