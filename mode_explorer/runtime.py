@@ -3,7 +3,10 @@
 import json
 import logging
 import math
+import sys
 import time
+from contextlib import contextmanager
+from functools import partial
 from dataclasses import dataclass, field
 
 import torch
@@ -77,6 +80,8 @@ class Run:
     initialization_dit_calls: int = 0
     native_dit_calls: int = 0
     feature_attempts: int = 0
+    spectrum_forecasts: int = 0
+    spectrum: object = None
     shadow_noise: torch.Tensor | None = None
     shadow_clean: torch.Tensor | None = None
     shadow_start: float | None = None
@@ -112,11 +117,80 @@ def has_spectrum(options, registered=None):
                for entries in tree.values())
 
 
+
+def verified_spectrum(tree):
+    """Verify the actual registered Spectrum owner without importing duplicate state."""
+    kinds = ("sampler_sample", "predict_noise", "diffusion_model")
+    found = {kind: tree.get(kind, {}).get("spectrum_krea2", ()) for kind in kinds}
+    if not any(found.values()):
+        return None
+    if any(len(found[kind]) != 1 for kind in kinds):
+        raise RuntimeError("ModeExplorer requires the complete Spectrum wrapper set.")
+    sampler, predictor, diffusion = (found[kind][0] for kind in kinds)
+    owner = getattr(sampler, "__self__", None)
+    module_name = type(owner).__module__
+    module = sys.modules.get(module_name)
+    if (not module_name.endswith("comfyui_spectrum_krea2.sampling")
+            or module is None or type(owner) is not getattr(module, "Binding", None)
+            or getattr(sampler, "__func__", None) is not type(owner).sampler
+            or getattr(predictor, "__self__", None) is not owner
+            or getattr(predictor, "__func__", None) is not type(owner).predict
+            or not isinstance(diffusion, partial)
+            or len(diffusion.args) != 1 or diffusion.args[0] is not owner
+            or diffusion.keywords):
+        raise RuntimeError("ModeExplorer could not verify Spectrum wrapper ownership.")
+    prefix = module_name.rsplit(".", 1)[0]
+    adapter = sys.modules.get(prefix + ".adapter")
+    runtime = sys.modules.get(prefix + ".runtime")
+    if (adapter is None or runtime is None
+            or diffusion.func is not getattr(adapter, "diffusion", None)
+            or not all(callable(getattr(var, method, None))
+                       for var in (getattr(runtime, "CURRENT", None), getattr(adapter, "CAPTURE", None))
+                       for method in ("get", "set", "reset"))):
+        raise RuntimeError("ModeExplorer could not verify Spectrum's scoped state contract.")
+    return owner, runtime.CURRENT, adapter.CAPTURE
+
+
+@contextmanager
+def isolated_spectrum_reference(run):
+    """Auxiliary DiT passes cannot advance Spectrum or enter its feature history."""
+    if run.spectrum is None:
+        yield
+        return
+    owner, current, capture = run.spectrum
+    session = current.get()
+    if session is not None and session.binding is not owner:
+        raise RuntimeError("ModeExplorer encountered a foreign Spectrum session.")
+    token_session = current.set(None)
+    token_capture = capture.set(None)
+    try:
+        yield
+    finally:
+        capture.reset(token_capture)
+        current.reset(token_session)
+
+
+def spectrum_forecast_count(run):
+    if run.spectrum is None:
+        return None
+    owner, current, _ = run.spectrum
+    session = current.get()
+    return session.counts["forecast"] if session is not None and session.binding is owner else None
+
+
 def verify_patch_graph(options, settings, registered=None):
-    for name in ("sampler_sample", "predict_noise", "calc_cond_batch", "apply_model", "diffusion_model"):
-        if any(key != KEY and value for tree in (wrappers(options), registered or {})
-               for key, value in tree.get(name, {}).items()):
-            raise RuntimeError(f"ModeExplorer needs the native {name} path. Use a separate MODEL branch for other numerical wrappers.")
+    spectrum = None
+    for tree in (wrappers(options), registered or {}):
+        verified = verified_spectrum(tree)
+        if verified is not None:
+            if spectrum is not None and verified[0] is not spectrum[0]:
+                raise RuntimeError("ModeExplorer found inconsistent Spectrum bindings.")
+            spectrum = verified
+        for name in ("sampler_sample", "predict_noise", "calc_cond_batch", "apply_model", "diffusion_model"):
+            for key, value in tree.get(name, {}).items():
+                if value and key != KEY and not (key == "spectrum_krea2"
+                    and name in ("sampler_sample", "predict_noise", "diffusion_model")):
+                    raise RuntimeError(f"ModeExplorer needs the native {name} path except for verified Spectrum.")
     tr = options.get("transformer_options", {})
     if options.get("model_function_wrapper") or options.get("sampler_calc_cond_batch_function"):
         raise RuntimeError("ModeExplorer needs the native model and conditioning dispatch.")
@@ -130,6 +204,7 @@ def verify_patch_graph(options, settings, registered=None):
         fn is not attention_feature for functions in tr["patches"].values() for fn in functions
     ):
         raise RuntimeError("ModeExplorer needs the native attention path. Use a separate MODEL branch for other transformer patches.")
+    return spectrum
 
 
 def token_slice(options: dict, total: int, count: int) -> tuple[int, int]:
@@ -271,10 +346,11 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         return tensor[row] if tensor is not None and tensor.shape[0] == x.shape[0] else tensor
 
     run.reference_calls += 1
-    velocity = executor(
-        shadow, timestep[row], context[row], row_of(mask),
-        [row_of(ref) for ref in refs] if refs is not None else None, probe_options, **kwargs,
-    )
+    with isolated_spectrum_reference(run):
+        velocity = executor(
+            shadow, timestep[row], context[row], row_of(mask),
+            [row_of(ref) for ref in refs] if refs is not None else None, probe_options, **kwargs,
+        )
     if not anchor.seen:
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook during the reference forward.")
     if run.shadow_clean is None:
@@ -293,33 +369,43 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         run.initialization_dit_calls += 1
         return executor(*arguments, **kwargs)
     run.native_dit_calls += 1
+    before_forecast = spectrum_forecast_count(run)
+
+    def forward(args):
+        result = executor(*args, **kwargs)
+        after = spectrum_forecast_count(run)
+        if before_forecast is not None and after is not None and after > before_forecast:
+            run.spectrum_forecasts += after - before_forecast
+            run.native_dit_calls -= 1
+        return result
+
     if not (run.feature_active or run.settings.diagnostics) or spatial_image(x) is None:
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     branches = options.get("cond_or_uncond", ())
     if 0 not in branches:
         if not branches:
             run.reasons.add("missing_condition_dispatch")
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     if branches.count(0) != 1 or x.shape[0] != run.batch * len(branches) or tuple(x.shape[1:]) != run.shape[1:]:
         run.reasons.add("unverified_condition_dispatch")
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     trace = run.settings.diagnostics and len(run.points) < MAX_POINTS
     may_steer = run.feature_active and (run.batch > 1 or run.reference_calls < run.settings.reference_budget)
     if not trace and not may_steer:
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     sigmas = options.get("sigmas")
     if sigmas is None or sigmas.shape != (run.batch,):
         run.reasons.add("unverified_sigma_dispatch")
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     # All native solver rows share the same scalar. Verify custom schedules
     # defensively so guidance never couples distinct timesteps.
     low, high = as_list(torch.stack((sigmas.amin(), sigmas.amax())))
     if not math.isfinite(low) or high != low:
         run.reasons.add("nonuniform_sigma")
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     active = may_steer and sigma_eligible(low, run.settings.min_sigma)
     if not active and not trace:
-        return executor(*arguments, **kwargs)
+        return forward(arguments)
     offset = branches.index(0) * run.batch
     patch = executor.class_obj.patch
     grid = tuple(math.ceil(size / patch) for size in x.shape[-2:])
@@ -338,9 +424,11 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     if frame.pairs is not None:
         run.feature_attempts += 1
     if frame.pairs is None and not trace:
-        return executor(*arguments, **kwargs)
-    result = executor(*arguments[:-1], {**options, FRAME: frame}, **kwargs)
+        return forward(arguments)
+    result = forward((*arguments[:-1], {**options, FRAME: frame}))
     if not frame.seen:
+        if before_forecast is not None and spectrum_forecast_count(run) > before_forecast:
+            return result
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook.")
     if trace:
         record(frame, x, result)
@@ -401,9 +489,7 @@ class SamplerWrapper:
         model_options = extra_args["model_options"]
         if model_options.get(STAGE) == "highres" or getattr(model_wrap, "model_options", {}).get(STAGE) == "highres":
             return sample()
-        if has_spectrum(model_options):
-            raise RuntimeError("ModeExplorer and Spectrum forecasting need separate MODEL branches.")
-        verify_patch_graph(model_options, settings)
+        spectrum = verify_patch_graph(model_options, settings)
         if type(executor.class_obj) is not KSAMPLER:
             raise RuntimeError("ModeExplorer requires the native ComfyUI KSAMPLER container.")
         if model_options.get("multigpu_clones") or model_options.get("context_handler") is not None:
@@ -459,7 +545,8 @@ class SamplerWrapper:
         scale = getattr(sampling, "noise_scale", 1.0)
         if not math.isfinite(scale) or scale <= 0:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
-        run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active, reasons=reasons)
+        run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
+                  spectrum=spectrum, reasons=reasons)
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:
@@ -482,6 +569,7 @@ class SamplerWrapper:
                     "native_dit_calls": run.native_dit_calls, "feature_reference_dit_calls": run.reference_calls,
                     "initialization_dit_calls": run.initialization_dit_calls,
                     "initialization_guider_calls": run.initialization_guider_calls,
-                    "feature_attempts": run.feature_attempts, "points": run.points,
+                    "feature_attempts": run.feature_attempts, "spectrum_forecast_calls": run.spectrum_forecasts,
+                    "points": run.points,
                 }
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))

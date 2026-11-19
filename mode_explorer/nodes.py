@@ -46,7 +46,7 @@ class ModeExplorer:
                                 adaptive, similarity, operation, reference_budget, diagnostics)
             self.verify_model(model)
             if has_spectrum(base_options, model.wrappers):
-                raise RuntimeError("ModeExplorer and Spectrum forecasting need separate MODEL branches.")
+                raise RuntimeError("Apply ModeExplorer before Spectrum: noise optimization must precede Spectrum's sampling session.")
             verify_patch_graph(base_options, settings, model.wrappers)
 
         clone = model.clone()
