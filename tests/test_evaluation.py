@@ -183,7 +183,8 @@ def test_response_profile_and_offline_embeddings(tmp_path):
 
     profiles = evaluate.load_profiles(Path(evaluate.__file__).with_name("response_profiles.json"))
     args = SimpleNamespace(model="krea2", encoder="enc", vae="vae", weight_dtype="default",
-                           model_lora=None, identity_lora=None, negative="", width=1024, height=768,
+                           model_lora=None, identity_lora=None, model_lora_strength=1.0, lora_strength=1.0,
+                           negative="", width=1024, height=768,
                            steps=8, cfg=1, sampler="euler", scheduler="simple", diagnostics=False,
                            variants=profiles)
     graph = evaluate.graph(args, "latent_steer", "prompt", 91, name="response")

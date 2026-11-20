@@ -116,3 +116,16 @@ def test_candidate_policy_is_deterministic_and_scorer_fails_closed():
     selected, score = select_response(stronger, baseline, ResponseSettings(
         selection="external", scorer=lambda candidate, _: float(candidate.mean())), 0, {})
     assert score == 0 and selected[1] is stronger[0][1]
+
+
+def test_matched_clean_candidate_uses_actual_magnitude():
+    from mode_explorer.response import clean_candidate
+
+    baseline = torch.zeros(4)
+    cfg = ResponseSettings(candidate_target_rms=0.01, candidate_gain=0.5)
+    match = clean_candidate(baseline, torch.full((4,), 0.04), cfg, {})
+    assert match[1]["gain"] == pytest.approx(0.25)
+    torch.testing.assert_close(match[0], torch.full((4,), 0.01))
+    too_weak = clean_candidate(baseline, torch.full((4,), 0.01), cfg, {})
+    assert too_weak[1]["reason"] == "target_exceeds_available_response"
+    assert select_response([match, too_weak], baseline, cfg, 0.0, {})[0][1] is match[1]

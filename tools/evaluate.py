@@ -30,8 +30,8 @@ PROFILE_CONTROLS = {
 RESPONSE_CONTROLS = {
     "mode", "basis", "probe_grid", "directions", "trial", "displacement", "norm", "calibration",
     "min_sigma", "max_sigma", "evaluation", "states", "auxiliary_budget", "memory_mb", "clean_limit",
-    "candidate_gain", "selection", "response_direction", "all_actual", "feature_block", "feature_grid",
-    "feature_strength", "feature_direction", "localization", "head", "cell", "export", "checkpoint_label",
+    "candidate_gain", "candidate_target_rms", "selection", "response_direction", "all_actual", "feature_block", "feature_grid",
+    "feature_strength", "feature_references", "feature_pair", "feature_direction", "localization", "head", "cell", "export", "checkpoint_label",
     "frozen_state", "downstream",
 }
 SPECTRUM_CONTROLS = {

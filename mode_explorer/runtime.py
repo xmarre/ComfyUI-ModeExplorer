@@ -476,6 +476,8 @@ def attention_feature(output, options):
     if frame.seen:
         raise RuntimeError("ModeExplorer received the same Krea 2 attention callback twice in one forward.")
     frame.seen = True
+    if frame.phase == "response_pass":
+        return output
     height, width = frame.grid
     start, end = token_slice(options, output.shape[1], height * width)
     numbers = frame.offset, frame.offset + frame.batch
@@ -754,8 +756,10 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             prepare_native_options({FRAME: frame})
     elif active and run.batch > 1:
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)
-    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace and not response_active:
-        return forward(arguments)
+    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace:
+        if not response_active:
+            return forward(arguments)
+        frame.phase = "response_pass"
     try:
         result = forward((*arguments[:-1], {**options, FRAME: frame}))
         if frame.prepare is not None and frame.seen:
@@ -773,7 +777,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     if response_active:
         from .response_runtime import run_response
 
-        return run_response(executor, run, frame, arguments, kwargs, result, actual=True)
+        return run_response(executor, run, frame, arguments, kwargs, result)
     return result
 
 
@@ -984,6 +988,10 @@ class SamplerWrapper:
                 eligibility = "unverified_flow_timestep"
             elif response.steers and response.selection == "external" and response.scorer is None:
                 eligibility = "score_unavailable"
+            elif response.steers and (getattr(model_wrap, "cfg", None) != 1.0 or any(
+                model_options.get(key) for key in ("sampler_cfg_function", "sampler_pre_cfg_function", "sampler_post_cfg_function")
+            )):
+                eligibility = "response_steering_requires_native_cfg_one"
             elif response.steers and (feature_active or initialize):
                 eligibility = "use_native_model_for_response_steering"
             elif response.steers and settings.full_spectrum and spectrum is not None:

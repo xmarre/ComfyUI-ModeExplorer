@@ -28,5 +28,9 @@
   ["constrained", "Low-angle photograph of a red fox jumping over a fallen log from left to right."],
   ["constrained", "A close side-profile photograph of a woman looking left, beside a rain-streaked window."],
   ["constrained", "A photograph of one black cup directly to the left of one white plate on a bare table."],
-  ["constrained", "A full-length frontal photograph of two people in matching red coats standing apart in a white corridor."]
+  ["constrained", "A full-length frontal photograph of two people in matching red coats standing apart in a white corridor."],
+  ["relations", "A black cup directly to the left of a white plate on a bare table, with both objects fully visible."],
+  ["relations", "A black cup directly to the right of a white plate on a bare table, with both objects fully visible."],
+  ["relations", "A red ball entirely inside a clear glass bowl on a kitchen counter."],
+  ["relations", "A red ball entirely outside a clear glass bowl on a kitchen counter."]
 ]

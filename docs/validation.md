@@ -17,7 +17,7 @@ python tools/evaluate.py --model krea2_turbo_fp8_scaled.safetensors --out bench-
 python tools/analyze.py bench-output/turbo-smoke --review
 ```
 
-The default panel contains 30 prompts and 16 seeds. Use `--methods` to choose native, cosine, volume, initialization, and combined arms. Use `--category` and `--seed-count` to limit the panel. Pair an identity LoRA with `--identity-lora` and `--identity-trigger`, and score likeness against authorized held-out photographs. For Raw, select the Raw weights, CFG, step count and `--spectrum-preset raw`. Compare Raw and Turbo first at matched settings, then in distinct checkpoint-specific panels.
+The default panel contains 34 prompts and 16 seeds. Use `--methods` to choose native, cosine, volume, initialization, and combined arms. Use `--category` and `--seed-count` to limit the panel. Pair an identity LoRA with `--identity-lora` and `--identity-trigger`, and score likeness against authorized held-out photographs. For Raw, select the Raw weights, CFG, step count and `--spectrum-preset raw`. Compare Raw and Turbo first at matched settings, then in distinct checkpoint-specific panels.
 
 Use `--profiles tools/spectrum_profiles.json` for named arms. A profile contains a method, optional ModeExplorer settings, optional Spectrum settings, and a Spectrum policy of off, guarded, full or all_actual. Change one variable at a time. Use multiple references and the all selection policy to test collective objective controls. For strictly matched routing, disable Spectrum on both arms or use all_actual and confirm reports contain zero forecasts. Full sham can match reference cost, while data-dependent guards can still change the realized routes in Full guidance.
 

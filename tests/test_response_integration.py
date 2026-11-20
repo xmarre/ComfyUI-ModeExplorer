@@ -137,3 +137,92 @@ def test_spectrum_probe_state_and_route_parity(model, caplog, all_actual):
     assert traces(caplog)[-1]["response"]["auxiliary_dit_calls"] == 7
     assert adapter.CURRENT.get() is None
     assert not adapter.FORCE_NATIVE_ALL_SAMPLERS.get()
+
+
+def test_feature_reference_budget_and_matching_live_anchor(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    bare = configured(model, mode="feature_replay", feature_references=2, calibration="off")
+    assert torch.equal(draw(model, sigmas=SIGMAS), draw(bare, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["auxiliary_dit_calls"] == 3
+    assert len(set(point["feature_reference_slots"])) == 2
+
+    primary, = ModeExplorer().apply(model, strength=0.025, fidelity=0.70, adaptive=False)
+    replay = configured(primary, mode="feature_replay", calibration="off")
+    assert torch.equal(draw(primary, sigmas=SIGMAS), draw(replay, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["feature_reference_origin"] == "live_pooled_reference"
+    assert point["auxiliary_dit_calls"] == 2
+
+
+def test_active_gate_preserves_native_with_no_improvement_or_amplified_cfg(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    scored = configured(model, mode="latent_steer", selection="external", scorer=lambda clean, info: 4)
+    assert torch.equal(draw(scored, sigmas=SIGMAS), draw(model, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["baseline_external_score"] == 4
+    assert {item["reason"] for item in point["candidates"]} == {"no_valid_score_improvement"}
+    assert torch.equal(draw(scored, sigmas=SIGMAS, cfg=2), draw(model, sigmas=SIGMAS, cfg=2))
+    assert traces(caplog)[-1]["response"]["reason"] == "response_steering_requires_native_cfg_one"
+
+
+def test_workspace_limit_precedes_forwards():
+    from types import SimpleNamespace
+    from mode_explorer.response import ResponseSettings
+    from mode_explorer.response_runtime import ResponseRun, run_response
+
+    def fail(*args, **kwargs):
+        pytest.fail("A rejected workspace must not start a model forward")
+
+    run = SimpleNamespace(response=ResponseRun(ResponseSettings(memory_mb=16), fail),
+                          settings=SimpleNamespace(reference_source="bank"), seed=1, noise_scale=1.0, stage="planner")
+    frame = SimpleNamespace(grid=(512, 512), offset=0, sigma=0.97)
+    x = torch.zeros(1).expand(1, 16, 1, 1024, 1024)
+    context = torch.zeros(1, 5, 64)
+    args = (x, torch.tensor([0.97]), context, None, None, {})
+    assert run_response(fail, run, frame, args, {}, x) is x
+    assert run.response.forwards == 0
+    assert run.response.points[0]["reason"] == "research_memory_budget"
+
+
+def test_exception_restores_spectrum_scopes(model, monkeypatch):
+    adapter = pytest.importorskip("comfyui_spectrum_krea2.runtime")
+    from test_spectrum_integration import spectrum
+    from mode_explorer import response_runtime
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("controlled probe failure")
+
+    patched = spectrum(configured(model, all_actual=True))
+    with monkeypatch.context() as edits:
+        edits.setattr(response_runtime, "direction_field", fail)
+        with pytest.raises(RuntimeError, match="controlled probe failure"):
+            draw(patched, sigmas=SIGMAS)
+    assert adapter.CURRENT.get() is None
+    assert not adapter.FORCE_NATIVE_ALL_SAMPLERS.get()
+    assert torch.isfinite(draw(patched, sigmas=SIGMAS)).all()
+
+
+def test_sol_response_forward_isolation(model, caplog):
+    sol = pytest.importorskip("sol_h3.krea2")
+
+    caplog.set_level(logging.INFO)
+    baseline = sol.install(model, sol.Settings(), verbose=True)
+    research = sol.install(configured(model, mode="feature_replay"), sol.Settings(), verbose=True)
+    assert torch.equal(draw(baseline, sigmas=SIGMAS), draw(research, sigmas=SIGMAS))
+    assert any("Sol-Krea2: model_evaluations=6 " in record.message for record in caplog.records)
+    assert traces(caplog)[-1]["response"]["auxiliary_dit_calls"] == 3
+    assert sol._ACTIVE.get() is None and sol._EXECUTION.get() is None
+
+
+def test_active_spectrum_uses_all_actual_through_end_of_trajectory(model, caplog):
+    adapter = pytest.importorskip("comfyui_spectrum_krea2.runtime")
+    from test_spectrum_integration import logs, spectrum
+
+    caplog.set_level(logging.INFO)
+    patched = spectrum(configured(model, mode="latent_steer"))
+    assert not torch.equal(draw(model, sigmas=SIGMAS), draw(patched, sigmas=SIGMAS))
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    assert report["forecast"] == 0 and report["actual"] == len(SIGMAS) - 1
+    assert traces(caplog)[-1]["response"]["points"][0]["applied"]
+    assert not adapter.FORCE_NATIVE_ALL_SAMPLERS.get()

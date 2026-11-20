@@ -11,9 +11,9 @@ import tempfile
 
 import torch
 
-from .objectives import cell_size, seed_key
+from .objectives import cell_areas, seed_key
 from .response import (
-    MAX_EXPORT_BYTES, differences, direction_field, effective_tilt_scale, flow_clean,
+    MAX_EXPORT_BYTES, clean_candidate, differences, direction_field, effective_tilt_scale, flow_clean,
     velocity_for_clean,
     orthonormalize, output_projection, projected_operator, rms, select_response, shifted_pair,
 )
@@ -67,8 +67,6 @@ def feature_delta(shift, current, output, view, sy, sx, frame):
         raise ValueError("cell_out_of_range")
 
     # Measure proposal energy on the actual rectangular token grid.
-    from .objectives import cell_areas
-
     areas = cell_areas(height, width, *shift.shape[-2:], cfg.feature_grid, output.device)
     selector = torch.ones_like(shift, dtype=torch.bool)
     if cfg.head >= 0:
@@ -127,8 +125,10 @@ def spectrum_all_actual(spectrum):
 def _tensor_hash(tensor):
     if tensor is None:
         return None
-    data = tensor.detach().contiguous().view(torch.uint8).cpu().numpy()
-    return hashlib.sha256(data).hexdigest()
+    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
+    digest = hashlib.sha256(f"{tensor.dtype}:{tuple(tensor.shape)}:".encode())
+    digest.update(data)
+    return digest.hexdigest()
 
 
 def read_export(export_id):
@@ -191,13 +191,11 @@ def _export(response, tensors, point):
         point["export_status"] = f"failed_{type(exc).__name__}"
 
 
-def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
+def run_response(executor, run, frame, arguments, kwargs, velocity):
     from comfy.model_management import throw_exception_if_processing_interrupted
     from .runtime import FRAME, Frame, Run, isolated_reference, shadow_forward
 
     response = run.response
-    if response is None or not actual or response.eligibility is not None:
-        return velocity
     cfg = response.config
     response.evaluation += 1
     index = response.evaluation
@@ -214,6 +212,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
         "coordinate": "native_krea2_const_diffusion_input", "stage": run.stage,
         "mode": cfg.mode, "basis": cfg.basis, "trial": cfg.trial, "seed": run.seed,
         "probe_seed": run.seed, "clean_trust_rms": cfg.clean_limit, "candidate_gain": cfg.candidate_gain,
+        "candidate_target_rms": cfg.candidate_target_rms,
         "response_direction": cfg.response_direction, "calibration": cfg.calibration,
         "requested_directions": cfg.directions, "probe_grid": cfg.probe_grid, "displacement_norm": cfg.norm,
         "checkpoint_label": cfg.checkpoint_label,
@@ -221,7 +220,8 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
         "selection": cfg.selection, "cfg_scale": response.cfg_scale,
         "feature_settings": {
             "block": cfg.feature_block, "grid": cfg.feature_grid, "strength": cfg.feature_strength,
-            "reference_source": run.settings.reference_source if run.feature_active else "bank",
+            "references": cfg.feature_references,
+            "reference_source": run.settings.reference_source,
         },
     }
     response.points.append(point)
@@ -238,15 +238,15 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
     token_count = math.prod(frame.grid) + context.shape[1]
     token_count += sum(math.prod(math.ceil(n / executor.class_obj.patch) for n in ref.shape[-2:]) for ref in refs or ())
     captures = len(executor.class_obj.blocks) * cfg.feature_grid**2 * dim * 2 if cfg.downstream else 0
-    size = 4 * (latent.numel() * (18 + 4 * cfg.directions) + 6 * x.numel()
+    size = 4 * (latent.numel() * (18 + 4 * cfg.directions + 2 * cfg.feature_references) + 6 * x.numel()
                 + token_count * x.shape[0] * dim + 8 * frame.grid[1] * dim + captures)
     point["memory_scope"] = "research_tensor_workspace_excluding_native_forward"
     point["estimated_working_bytes"] = size
     if size > cfg.memory_mb * 1024**2:
         point["reason"] = "research_memory_budget"
         return velocity
-    if cfg.steers and (sigma < 1e-5 or cfg.scorer is None and cfg.selection == "external"):
-        point["reason"] = "score_unavailable" if sigma >= 1e-5 else "flow_conversion_endpoint"
+    if cfg.steers and sigma < 1e-5:
+        point["reason"] = "flow_conversion_endpoint"
         return velocity
 
     clean_options = {k: v for k, v in options.items() if k != FRAME}
@@ -255,9 +255,10 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
     point.update(input_dtype=str(x.dtype), velocity_dtype=str(velocity.dtype),
                  timestep=float(timesteps.flatten()[frame.offset]),
                  backend=backend,
-                 conditioning_sha256=_tensor_hash(context[row]),
+                 conditioning_sha256=_tensor_hash(context),
                  attention_mask_sha256=_tensor_hash(mask),
                  reference_latent_sha256=[_tensor_hash(ref) for ref in refs or ()],
+                 reference_method=kwargs.get("ref_latents_method", executor.class_obj.default_ref_method),
                  native_input_sha256=_tensor_hash(latent), branches=list(options.get("cond_or_uncond", ())))
     if cfg.scorer is not None and cfg.selection == "external":
         point["scorer"] = getattr(cfg.scorer, "__qualname__", type(cfg.scorer).__qualname__)
@@ -286,8 +287,8 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
 
             try:
                 saved, data = read_export(cfg.frozen_state)
-                matched = ("sigma", "timestep", "conditioning_sha256", "attention_mask_sha256",
-                           "reference_latent_sha256", "branches", "noise_scale", "cfg_scale")
+                matched = ("sigma", "timestep", "input_dtype", "conditioning_sha256", "attention_mask_sha256",
+                           "reference_latent_sha256", "reference_method", "branches", "noise_scale", "cfg_scale")
                 if any(saved.get(key) != point.get(key) for key in matched):
                     raise ValueError("frozen_sigma_or_conditioning_mismatch")
                 with safe_open(data, framework="pt", device="cpu") as package:
@@ -367,9 +368,16 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                 basis.append(unit)
                 responses.append(derivative.flatten())
             if basis:
-                op, right, eig = projected_operator(basis, responses)
-                point["projected_response"] = op
-                coefficients = right if cfg.response_direction == "singular" else eig
+                try:
+                    op, right, eig = projected_operator(basis, responses)
+                except (ValueError, torch.linalg.LinAlgError):
+                    point["projected_response_rejection"] = "unresolved_projected_spectrum"
+                    basis.clear()
+                    responses.clear()
+                else:
+                    point["projected_response"] = op
+                    coefficients = right if cfg.response_direction == "singular" else eig
+                    point["principal_direction_coefficients"] = coefficients.tolist()
 
         candidates = []
         if cfg.mode == "latent_steer" and coefficients is not None:
@@ -385,13 +393,13 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
             elif response.forwards + 2 <= cfg.auxiliary_budget:
                 for label, candidate in zip(("positive", "negative"), pair[:2]):
                     clean = flow_clean(candidate, predict(candidate), sigma)
-                    candidates.append((base_clean + cfg.candidate_gain * (clean - base_clean), {"arm": label}))
+                    candidates.append(clean_candidate(base_clean, clean - base_clean, cfg, {"arm": label}))
             else:
                 point["candidates"].append({"reason": "auxiliary_forward_budget"})
 
         if wants_feature:
             directions = (cfg.feature_direction,)
-            if cfg.mode == "feature_steer" and cfg.feature_direction in ("repel", "reverse"):
+            if cfg.mode == "feature_steer" and cfg.feature_pair and cfg.feature_direction in ("repel", "reverse"):
                 directions = ("repel", "reverse")
             replay_cfg = replace(
                 run.settings, feature="feature_cosine", feature_block=cfg.feature_block,
@@ -403,12 +411,26 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
             replay_run = Run(replay_cfg, probe_seed, run.start, run.noise_scale, 1, tuple(latent.shape),
                              True, spectrum=run.spectrum, sol=run.sol, stage=run.stage)
             replay_frame = Frame(frame.grid, 1, frame.offset, "response", replay_run, sigma)
-            if response.forwards + 1 + len(directions) <= cfg.auxiliary_budget:
-                spend(1)
-                with torch.no_grad():
-                    replay_frame.reference = shadow_forward(executor, replay_run, replay_frame, x, timesteps,
-                                                            context, mask, refs, clean_options, kwargs, 0)
-                point["feature_reference_slots"] = replay_frame.reference_slots
+            reuse = (not cfg.frozen_state and frame.reference is not None
+                     and len(frame.reference) == cfg.feature_references
+                     and run.settings.feature_block == cfg.feature_block
+                     and run.settings.feature_grid == cfg.feature_grid)
+            reference_cost = 0 if reuse else cfg.feature_references
+            if response.forwards + reference_cost + len(directions) <= cfg.auxiliary_budget:
+                if reuse:
+                    replay_frame.reference = frame.reference
+                    slots = frame.reference_slots
+                else:
+                    anchors = []
+                    with torch.no_grad():
+                        for reference_index in range(reference_cost):
+                            spend(1)
+                            anchors.append(shadow_forward(executor, replay_run, replay_frame, x, timesteps,
+                                                          context, mask, refs, clean_options, kwargs, reference_index))
+                    replay_frame.reference = torch.cat(anchors) if len(anchors) > 1 else anchors[0]
+                    slots = replay_frame.reference_slots
+                point["feature_reference_slots"] = slots
+                point["feature_reference_origin"] = "live_pooled_reference" if reuse else "fresh_shadow"
                 for direction in directions:
                     info = {"arm": direction, "block": cfg.feature_block, "grid": cfg.feature_grid}
                     replay_frame.replay = (replace(cfg, feature_direction=direction), info)
@@ -424,6 +446,8 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                         continue
                     if not replay_frame.seen:
                         info.update(status="rejected", reason="attention_hook_not_observed")
+                    elif not bool(torch.isfinite(v).all()):
+                        info.update(status="rejected", reason="nonfinite_feature_response")
                     else:
                         dv = v.float() - base_velocity.float()
                         clean = flow_clean(latent, v, sigma)
@@ -439,7 +463,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                         if responses:
                             info.update(output_projection(delta, responses))
                         if cfg.mode == "feature_steer" and direction != "sham":
-                            candidates.append((base_clean + cfg.candidate_gain * delta, {
+                            candidates.append(clean_candidate(base_clean, delta, cfg, {
                                 "arm": direction, "response_alignment": info.get("explained_energy_fraction"),
                             }))
                         if cfg.export and bool(torch.isfinite(clean).all()):

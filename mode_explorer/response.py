@@ -36,12 +36,15 @@ class ResponseSettings:
     memory_mb: int = 128
     clean_limit: float = 0.06
     candidate_gain: float = 0.5
+    candidate_target_rms: float = 0.0
     selection: str = "minimum_change"
     response_direction: str = "singular"
     all_actual: bool = False
     feature_block: int = 5
     feature_grid: int = 4
     feature_strength: float = 0.025
+    feature_references: int = 1
+    feature_pair: bool = True
     feature_direction: str = "repel"
     localization: str = "whole"
     head: int = -1
@@ -65,18 +68,20 @@ class ResponseSettings:
             ("probe_grid", 1, 16), ("directions", 1, 4), ("trial", 0, 65535),
             ("evaluation", -1, 127), ("states", 1, MAX_STATES), ("auxiliary_budget", 0, 48),
             ("memory_mb", 16, 512), ("feature_block", 0, 63), ("feature_grid", 1, 16),
-            ("head", -1, 255), ("cell", -1, 255),
+            ("head", -1, 255), ("cell", -1, 255), ("feature_references", 1, 3),
         ):
             value = getattr(self, key)
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"ModeExplorer response {key} must be an integer in [{low}, {high}].")
         for key, low, high in (
             ("displacement", 1e-5, 0.25), ("clean_limit", 1e-5, 0.25),
-            ("candidate_gain", 0.01, 1.0), ("feature_strength", 0.0, 1.0),
+            ("candidate_gain", 0.01, 1.0), ("candidate_target_rms", 0.0, 0.25), ("feature_strength", 0.0, 1.0),
             ("min_sigma", 0.0, 1.0), ("max_sigma", 0.0, 1.0),
         ):
             if not low <= getattr(self, key) <= high:
                 raise ValueError(f"ModeExplorer response {key} must be in [{low}, {high}].")
+        if self.candidate_target_rms > self.clean_limit:
+            raise ValueError("The candidate target RMS exceeds the clean trust limit.")
         if self.frozen_state and self.steers:
             raise ValueError("Frozen-state replay requires a diagnostic or export-only mode.")
         if self.selection == "response_alignment" and self.mode != "feature_steer":
@@ -108,7 +113,12 @@ def effective_tilt_scale(sigma, noise_scale):
     """For isotropic corruption with noise standard deviation sigma * noise_scale."""
     if not 0 < sigma < 1 or not math.isfinite(noise_scale) or noise_scale <= 0:
         return None
-    return (1 - sigma) / (sigma * noise_scale) ** 2
+    std = sigma * noise_scale
+    variance = std * std
+    if not math.isfinite(variance) or variance <= 0:
+        return None
+    scale = (1 - sigma) / variance
+    return scale if math.isfinite(scale) else None
 
 
 def velocity_for_clean(x, clean, sigma):
@@ -202,6 +212,8 @@ def differences(plus, minus, base, a, b):
 def projected_operator(basis, responses):
     matrix = torch.stack([torch.stack([torch.dot(b, response) for response in responses])
                           for b in basis]).to(device="cpu", dtype=torch.float64)
+    if not torch.isfinite(matrix).all():
+        raise ValueError("nonfinite_projected_response")
     symmetric = (matrix + matrix.T) * 0.5
     eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
     _, singular, right = torch.linalg.svd(matrix, full_matrices=False)
@@ -237,6 +249,18 @@ def output_projection(delta, responses):
     }
 
 
+def clean_candidate(base, delta, settings, info):
+    gain = settings.candidate_gain
+    if settings.candidate_target_rms:
+        available = rms(delta)
+        if math.isfinite(available) and available * gain >= settings.candidate_target_rms:
+            gain = settings.candidate_target_rms / available
+        else:
+            info["reason"] = "target_exceeds_available_response"
+    info["gain"] = gain
+    return (base + gain * delta, info)
+
+
 def select_response(candidates, baseline, settings, noise_floor, provenance):
     """Candidate order is stable. External scores are finite, larger-is-better."""
     chosen = None
@@ -251,6 +275,8 @@ def select_response(candidates, baseline, settings, noise_floor, provenance):
         info["clean_displacement_rms"] = change
         if not math.isfinite(change) or change > settings.clean_limit:
             info["reason"] = "clean_trust_bound"
+        elif settings.candidate_target_rms and abs(change - settings.candidate_target_rms) > 0.1 * settings.candidate_target_rms:
+            info["reason"] = "realized_response_misses_target"
         elif change <= max(noise_floor * 2.0, 1e-8):
             info["reason"] = "below_repeat_floor"
         elif settings.selection == "export_only":

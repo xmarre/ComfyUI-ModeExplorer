@@ -9,7 +9,7 @@ import torch
 pytest.importorskip("comfyui_spectrum_krea2")
 
 from test_comfy_integration import model, draw
-from mode_explorer.nodes import ModeExplorer
+from mode_explorer.nodes import ModeExplorer, ModeExplorerResponse
 from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
 from comfyui_spectrum_krea2.runtime import CURRENT
 
@@ -176,6 +176,8 @@ def test_real_scale_locked_regenerate_stage_isolation(caplog, model):
     node = nodes.NODE_CLASS_MAPPINGS["Krea2TurboFlowAlignedRegenerate"]()
     caplog.set_level(logging.INFO)
     guided, = ModeExplorer().apply(model, diagnostics=True, adaptive=False)
+    guided, = ModeExplorerResponse().apply(guided, min_sigma=0.9, max_sigma=1.0,
+                                             directions=1, calibration="off")
     p, n = conditions()
     latent = {"samples": torch.zeros(1, 16, 1, 80, 80)}
     with torch.inference_mode():
@@ -186,6 +188,8 @@ def test_real_scale_locked_regenerate_stage_isolation(caplog, model):
     assert torch.isfinite(output["samples"]).all()
     traces = logs(caplog, "MODEEXPLORER_TRACE ")
     assert len(traces) == 1 and traces[0]["stage"] == "planner" and traces[0]["feature_attempts"] > 0
+    point, = traces[0]["response"]["points"]
+    assert point["stage"] == "planner" and point["status"] == "completed"
     reports = logs(caplog, "Spectrum Krea 2 summary: ")
     assert {item["stage"] for item in reports} == {"planner", "highres"}
     assert CURRENT.get() is None
@@ -313,6 +317,10 @@ def test_kj_loader_sage_override_preserves_guidance_and_spectrum(caplog, model, 
     assert report["fallback"] is None and report["forecast"] > 0
     assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
 
+    probe, = ModeExplorerResponse().apply(loaded, mode="feature_replay", feature_block=1)
+    assert torch.equal(draw(loaded, sigmas=SIGMAS), draw(probe, sigmas=SIGMAS))
+    assert logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"][0]["feature"][0]["status"] == "completed"
+
     foreign = loaded.clone()
 
     def unrelated(func, *args, **kwargs):
@@ -360,3 +368,8 @@ def test_core_attention_selector_preserves_guidance_and_spectrum(caplog, model, 
     trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
     assert report["fallback"] is None and report["forecast"] > 0
     assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
+
+    probe, = ModeExplorerResponse().apply(patched, mode="feature_replay", feature_block=1)
+    assert torch.equal(native, draw(probe, sigmas=SIGMAS))
+    arm = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"][0]["feature"][0]
+    assert arm["status"] == "completed" and arm["realized_edit_l2"] > 0
