@@ -15,7 +15,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 GROUPS = ("composition_group", "camera_group", "pose_group", "layout_group")
-RATINGS = (*GROUPS, "prompt_adherence", "quality", "artifact", "identity")
+DEFECT_RATINGS = ("artifact", "anatomy_defect", "relation_defect")
+RATINGS = (*GROUPS, "prompt_adherence", "quality", "artifact", "identity",
+           "anatomy_defect", "relation_defect", "detail_quality")
 
 
 def describe(path):
@@ -58,7 +60,7 @@ def load_ratings(path):
             for key in RATINGS[len(GROUPS):]:
                 if row.get(key):
                     value = float(row[key])
-                    valid = value in (0, 1) if key == "artifact" else 1 <= value <= 5
+                    valid = value in (0, 1) if key in DEFECT_RATINGS else 1 <= value <= 5
                     if not valid:
                         raise ValueError(f"Review {row['id']} has invalid {key}")
                     row[key] = value
@@ -209,6 +211,20 @@ def forecast_route_signature(run):
     return tuple(signatures) if signatures else None
 
 
+def defect_transitions(rows, baseline_rows, ratings, key):
+    reference = {row["seed"]: ratings.get(row["id"], {}).get(key) for row in baseline_rows}
+    counts = dict(recovered=0, introduced=0, persistent=0, both_clear=0)
+    for row in rows:
+        before = reference.get(row["seed"])
+        after = ratings.get(row["id"], {}).get(key)
+        if before not in (0, 1) or after not in (0, 1):
+            continue
+        label = {(1, 0): "recovered", (0, 1): "introduced",
+                 (1, 1): "persistent", (0, 0): "both_clear"}[before, after]
+        counts[label] += 1
+    return counts
+
+
 def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
     summaries = {}
     methods = partition(runs, "method")
@@ -216,6 +232,7 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
     baseline_cache = {}
     for method, group in methods.items():
         compared, n_seeds = {}, 0
+        defects = {key: dict(recovered=0, introduced=0, persistent=0, both_clear=0) for key in DEFECT_RATINGS}
         for prompt_id, rows in partition(group, "prompt_id").items():
             native = baseline_prompts.get(prompt_id, [])
             matched = {r["seed"] for r in native} & {r["seed"] for r in rows}
@@ -223,6 +240,9 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
                 continue
             rows = [r for r in rows if r["seed"] in matched]
             native = [r for r in native if r["seed"] in matched]
+            for key in DEFECT_RATINGS:
+                for label, count in defect_transitions(rows, native, ratings, key).items():
+                    defects[key][label] += count
             data = metrics(root, rows, ratings, perceptual, keep_traces)
             reference_routes = {row["seed"]: forecast_route_signature(row) for row in native}
             routes = [(forecast_route_signature(row), reference_routes[row["seed"]]) for row in rows]
@@ -237,7 +257,7 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
             for key, value in data.items():
                 compared.setdefault(key, []).append((value, ref.get(key)))
             n_seeds += len(matched)
-        summaries[method] = {"matched_seed_pairs": n_seeds, "metrics": {}}
+        summaries[method] = {"matched_seed_pairs": n_seeds, "metrics": {}, "defect_transitions": defects}
         for key, records in compared.items():
             deltas = [a - b for a, b in records if a is not None and b is not None]
             summaries[method]["metrics"][key] = {

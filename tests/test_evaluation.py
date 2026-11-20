@@ -120,6 +120,16 @@ def test_render_reads_native_api_history_image_and_trace(tmp_path, monkeypatch):
     assert record["sampled_peak_device_mib"] is None
 
 
+def test_defect_transition_counts_exclude_missing_scores():
+    native = [{"seed": i, "id": f"n{i}"} for i in range(5)]
+    guided = [{"seed": i, "id": f"g{i}"} for i in range(5)]
+    ratings = {f"n{i}": {"anatomy_defect": v} for i, v in enumerate([1, 0, 1, 0, 1])}
+    ratings.update({f"g{i}": {"anatomy_defect": v} for i, v in enumerate([0, 1, 1, 0, None])})
+    assert analyze.defect_transitions(guided, native, ratings, "anatomy_defect") == {
+        "recovered": 1, "introduced": 1, "persistent": 1, "both_clear": 1,
+    }
+
+
 def test_paired_analysis_and_blinded_assets(tmp_path):
     rows = []
     ratings = {}
