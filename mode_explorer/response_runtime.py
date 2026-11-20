@@ -13,7 +13,7 @@ import torch
 
 from .objectives import cell_areas, seed_key
 from .response import (
-    MAX_EXPORT_BYTES, MAX_FLOW_SIGMA, clean_candidate, differences, direction_field, effective_tilt_scale, flow_clean,
+    CALIBRATION_OFF_AXIS_LIMIT, MAX_EXPORT_BYTES, MAX_FLOW_SIGMA, calibrated_pairs, clean_candidate, differences, direction_field, effective_tilt_scale, flow_clean,
     latent_cell_bounds, localize_direction, velocity_for_clean,
     orthonormalize, output_projection, projected_operator, rms, select_response, shifted_pair,
 )
@@ -204,7 +204,23 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     index = response.evaluation
     sigma = frame.sigma
     sol_evaluations = getattr(frame, "sol_evaluations", None)
-    if response.reference_initial_sigma is None and sigma_eligible(sigma, getattr(run.settings, "min_sigma", 0.82)):
+    reference_floor = getattr(run.settings, "min_sigma", 0.82)
+    requested_start = cfg.reference_start_sigma
+    if requested_start >= 0:
+        reference_source = "configured_sigma"
+        start_matches = math.isclose(sigma, requested_start, abs_tol=5e-7, rel_tol=0.0)
+        previous_start = response.reference_initial_sigma
+        remember_start = start_matches and (
+            previous_start is None or abs(sigma - requested_start) < abs(previous_start - requested_start)
+        )
+    else:
+        if cfg.reference_min_sigma >= 0:
+            reference_floor = cfg.reference_min_sigma
+            reference_source = "configured_min_sigma"
+        else:
+            reference_source = "model_feature_min_sigma"
+        remember_start = response.reference_initial_sigma is None and sigma_eligible(sigma, reference_floor)
+    if remember_start:
         response.reference_initial_sigma = sigma
         response.reference_initial_sol_evaluations = sol_evaluations
     upper = MAX_FLOW_SIGMA if cfg.max_sigma == 1 else cfg.max_sigma
@@ -228,6 +244,10 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
         "noise_scale": run.noise_scale, "effective_tilt_per_unit_displacement": effective_tilt_scale(sigma, run.noise_scale),
         "selection": cfg.selection, "cfg_scale": response.cfg_scale,
         "feature_reference_initial_sigma": response.reference_initial_sigma,
+        "feature_reference_sigma_source": reference_source,
+        "feature_reference_min_sigma": reference_floor,
+        "feature_reference_requested_start_sigma": requested_start if requested_start >= 0 else None,
+        "probe_precision": cfg.probe_precision,
         "feature_reference_initial_sol_evaluations": response.reference_initial_sol_evaluations,
         "sol_evaluations": sol_evaluations,
         "feature_settings": {
@@ -252,8 +272,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     token_count = math.prod(frame.grid) + context.shape[1]
     token_count += sum(math.prod(math.ceil(n / executor.class_obj.patch) for n in ref.shape[-2:]) for ref in refs or ())
     captures = len(executor.class_obj.blocks) * cfg.feature_grid**2 * dim * 2 if cfg.downstream else 0
-    size = 4 * (latent.numel() * (18 + 4 * cfg.directions + 2 * cfg.feature_references + 6 * len(sites)) + 6 * x.numel()
-                + token_count * x.shape[0] * dim + 8 * frame.grid[1] * dim + captures)
+    pooled_references = 2 * len({block for block, _ in sites}) * cfg.feature_references * cfg.feature_grid**2 * dim
+    size = 4 * (latent.numel() * (24 + 4 * cfg.directions + 2 * cfg.feature_references + 6 * len(sites)) + 6 * x.numel()
+                + token_count * x.shape[0] * dim + 8 * frame.grid[1] * dim + captures + pooled_references)
     point["memory_scope"] = "research_tensor_workspace_excluding_native_forward"
     point["estimated_working_bytes"] = size
     if size > cfg.memory_mb * 1024**2:
@@ -327,19 +348,24 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 if type(probe_seed) is not int:
                     raise ValueError("frozen_probe_seed_missing")
                 saved_initial = saved.get("feature_reference_initial_sigma")
-                if saved_initial is not None:
-                    if type(saved_initial) not in (int, float) or not sigma <= saved_initial <= MAX_FLOW_SIGMA:
-                        raise ValueError("frozen_reference_sigma_mismatch")
-                    reference_sigma = saved_initial
-                    point["feature_reference_sigma_source"] = "export"
-                else:
-                    point["feature_reference_sigma_source"] = "current_run_legacy_export"
+                matches_saved_start = (requested_start >= 0 and type(saved_initial) in (int, float)
+                                       and math.isclose(saved_initial, requested_start, abs_tol=5e-7, rel_tol=0.0))
+                use_saved_start = matches_saved_start or (requested_start < 0 and cfg.reference_min_sigma < 0)
+                if use_saved_start:
+                    if saved_initial is not None:
+                        if type(saved_initial) not in (int, float) or not sigma <= saved_initial <= MAX_FLOW_SIGMA:
+                            raise ValueError("frozen_reference_sigma_mismatch")
+                        reference_sigma = saved_initial
+                        point["feature_reference_sigma_source"] = "export"
+                        point["feature_reference_min_sigma"] = saved.get("feature_reference_min_sigma")
+                    else:
+                        point["feature_reference_sigma_source"] = "current_run_legacy_export"
                 if run.sol is not None:
                     saved_ordinal = saved.get("sol_evaluations")
                     if type(saved_ordinal) is int and saved_ordinal >= 0:
                         sol_evaluations = saved_ordinal
                     saved_initial_ordinal = saved.get("feature_reference_initial_sol_evaluations")
-                    if type(saved_initial_ordinal) is int and saved_initial_ordinal >= 0:
+                    if use_saved_start and type(saved_initial_ordinal) is int and saved_initial_ordinal >= 0:
                         initial_sol_evaluations = saved_initial_ordinal
                 point["sol_evaluations"] = sol_evaluations
                 point["feature_reference_initial_sol_evaluations"] = initial_sol_evaluations
@@ -381,9 +407,30 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 if response.forwards + 2 > cfg.auxiliary_budget:
                     point["differences"].append({"index": i, "status": "skipped", "reason": "auxiliary_forward_budget"})
                     break
-                pair, metrics, reason = shifted_pair(latent, unit, cfg.displacement, cfg.norm, cfg.input_limit)
-                metrics.update(index=i, status="rejected" if reason else "completed", reason=reason)
+                full, half_result, amplitude = calibrated_pairs(latent, unit, cfg)
+                pair, metrics, reason = full
+                metrics.update(index=i, status="rejected" if reason else "completed", reason=reason,
+                               configured_displacement=cfg.displacement, probe_displacement=amplitude,
+                               precision_adjusted=amplitude != cfg.displacement)
                 point["differences"].append(metrics)
+
+                # Test the first usable direction at both amplitudes. Active
+                # steering requires a measured stable check before building its basis.
+                check = None
+                if half_result is not None:
+                    half, half_metrics, half_reason = half_result
+                    rounding_limited = max(metrics["off_axis_fraction"], half_metrics["off_axis_fraction"]) > CALIBRATION_OFF_AXIS_LIMIT
+                    if not basis:
+                        status = ("unresolved" if pair is None or half is None else
+                                  "rounding_limited" if rounding_limited else
+                                  "budget_limited" if response.forwards + 4 > cfg.auxiliary_budget else "pending")
+                        check = {**half_metrics, "reason": half_reason or reason,
+                                 "status": status, "rounding_warning": rounding_limited}
+                        metrics["half_calibration"] = check
+                    if cfg.steers and (half is None or rounding_limited
+                                        or (check is not None and check["status"] != "pending")):
+                        metrics.update(status="rejected", reason="failed_half_amplitude_calibration")
+                        continue
                 if pair is None:
                     continue
                 p, n, a, b = pair
@@ -391,30 +438,26 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 derivative, curvature = differences(plus, minus, base_clean, a, b)
                 if not bool(torch.isfinite(derivative).all() & torch.isfinite(curvature).all()):
                     metrics.update(status="rejected", reason="nonfinite_response")
+                    if check is not None:
+                        check.update(status="unresolved", reason="nonfinite_response")
                     continue
                 signal = rms(plus - minus)
                 metrics.update(first_order_rms=rms(derivative), curvature_rms=rms(curvature),
                                odd_signal_rms=signal * 0.5, even_signal_rms=rms((plus - base_clean) + (minus - base_clean)) * 0.5,
                                cancellation_or_repeat_limited=signal <= max(4 * noise_floor, 1e-8))
-                if cfg.calibration != "off" and not basis and response.forwards + 2 <= cfg.auxiliary_budget:
-                    half, half_metrics, half_reason = shifted_pair(latent, unit, cfg.displacement * 0.5, cfg.norm, cfg.input_limit)
-                    metrics["half_calibration"] = {
-                        **half_metrics, "reason": half_reason, "status": "unresolved" if half_reason else "measured",
-                        "rounding_warning": max(metrics["off_axis_fraction"], half_metrics["off_axis_fraction"]) > 0.10,
-                    }
-                    if half is not None:
-                        hp, hn, ha, hb = half
-                        other, _ = differences(flow_clean(hp, predict(hp), sigma),
-                                               flow_clean(hn, predict(hn), sigma), base_clean, ha, hb)
-                        stability = rms(other - derivative) / max(rms(derivative), 1e-15)
-                        metrics["half_calibration"]["relative_first_order_change"] = stability
-                        metrics["half_calibration"]["status"] = (
-                            "stable" if stability <= cfg.calibration_max_change else "unstable"
-                        )
-                check = metrics.get("half_calibration")
-                if cfg.steers and check is not None and check["status"] in ("unresolved", "unstable"):
-                    metrics.update(status="rejected", reason="failed_half_amplitude_calibration")
-                    continue
+                if check is not None and check["status"] == "pending":
+                    hp, hn, ha, hb = half
+                    other, _ = differences(flow_clean(hp, predict(hp), sigma),
+                                           flow_clean(hn, predict(hn), sigma), base_clean, ha, hb)
+                    stability = rms(other - derivative) / max(rms(derivative), 1e-15)
+                    full_input, _ = differences(p.float(), n.float(), latent.float(), a, b)
+                    half_input, _ = differences(hp.float(), hn.float(), latent.float(), ha, hb)
+                    check["relative_input_direction_change"] = rms(half_input - full_input) / max(rms(full_input), 1e-15)
+                    check["relative_first_order_change"] = stability
+                    check["status"] = "stable" if stability <= cfg.calibration_max_change else "unstable"
+                    if cfg.steers and check["status"] != "stable":
+                        metrics.update(status="rejected", reason="failed_half_amplitude_calibration")
+                        continue
                 if cfg.steers and metrics["cancellation_or_repeat_limited"]:
                     metrics.update(status="rejected", reason="response_below_repeat_floor")
                     continue
@@ -454,23 +497,67 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
             directions = (cfg.feature_direction,)
             if cfg.mode == "feature_steer" and cfg.feature_pair and cfg.feature_direction in ("repel", "reverse"):
                 directions = ("repel", "reverse")
-            first_sigma = reference_sigma if reference_sigma is not None else sigma
+            first_sigma = reference_sigma
+            if first_sigma is None or first_sigma < sigma:
+                reason = "reference_start_not_observed" if first_sigma is None else "reference_start_after_probe"
+                point["feature"].append({"status": "skipped", "reason": reason})
+                sites = ()
             point["feature_reference_initial_sigma"] = first_sigma
-            rebuild = first_sigma > sigma
+            rebuild = first_sigma is not None and first_sigma > sigma
 
             def live_reference_matches(block):
                 return (not cfg.frozen_state and frame.reference is not None
                         and len(frame.reference) == cfg.feature_references
                         and run.settings.feature_block == block
                         and run.settings.feature_grid == cfg.feature_grid
-                        and run.settings.reference_continuation == "first_estimate")
+                        and run.settings.reference_continuation == "first_estimate"
+                        and all(i in run.shadows and run.shadows[i].first_sigma == first_sigma
+                                for i in range(cfg.feature_references)))
 
-            reference_cost = cfg.feature_references * (2 if rebuild else 1)
-            site_cost = sum(len(directions) + (0 if live_reference_matches(block) else reference_cost)
-                            for block, _ in sites)
-            if response.forwards + site_cost > cfg.auxiliary_budget:
+            live_blocks = {block for block, _ in sites if live_reference_matches(block)}
+            cold_blocks = tuple(dict.fromkeys(block for block, _ in sites if block not in live_blocks))
+            reference_cost = cfg.feature_references * (2 if rebuild else 1) if cold_blocks else 0
+            if response.forwards + reference_cost + len(sites) * len(directions) > cfg.auxiliary_budget:
                 point["feature"].append({"status": "skipped", "reason": "auxiliary_forward_budget"})
                 sites = ()
+                cold_blocks = ()
+
+            # The shadow inputs are independent of the intervention site.
+            # Collect pooled features for all requested blocks in one forward.
+            point["feature_reference_capture_blocks"] = list(cold_blocks)
+            point["feature_reference_calls"] = 0
+            cold_references = {}
+            cold_slots = ()
+            if cold_blocks:
+                shadow_cfg = replace(run.settings, feature_block=cold_blocks[0], feature_grid=cfg.feature_grid,
+                                     reference_continuation="first_estimate")
+                shadow_run = Run(shadow_cfg, probe_seed, run.start, run.noise_scale, 1, tuple(latent.shape),
+                                 True, spectrum=run.spectrum, sol=run.sol, stage=run.stage)
+                shadow_frame = Frame(frame.grid, 1, frame.offset, "response", shadow_run, sigma)
+                gathered = {block: [] for block in cold_blocks}
+                if rebuild:
+                    first_frame = Frame(frame.grid, 1, frame.offset, "response", shadow_run, first_sigma)
+                    first_options = {**clean_options, "sigmas": torch.full_like(options["sigmas"], first_sigma)}
+                    first_timestep = torch.full_like(timesteps, first_sigma)
+                with torch.no_grad():
+                    for reference_index in range(cfg.feature_references):
+                        if rebuild:
+                            spend(1)
+                            point["feature_reference_calls"] += 1
+                            shadow_forward(executor, shadow_run, first_frame, x, first_timestep, context, mask,
+                                           refs, first_options, kwargs, reference_index,
+                                           sol_evaluations=initial_sol_evaluations)
+                        spend(1)
+                        point["feature_reference_calls"] += 1
+                        captured = shadow_forward(executor, shadow_run, shadow_frame, x, timesteps, context, mask,
+                                                  refs, clean_options, kwargs, reference_index,
+                                                  sol_evaluations=sol_evaluations, capture_blocks=cold_blocks)
+                        for block in cold_blocks:
+                            gathered[block].append(captured[block])
+                cold_references = {block: torch.cat(values) if len(values) > 1 else values[0]
+                                   for block, values in gathered.items()}
+                cold_slots = shadow_frame.reference_slots
+
             for block, site_head in sites:
                 localization = "only_raw" if cfg.feature_sites and cfg.localization == "whole" else cfg.localization
                 site_cfg = replace(cfg, feature_block=block, head=site_head, localization=localization)
@@ -484,27 +571,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 replay_run = Run(replay_cfg, probe_seed, run.start, run.noise_scale, 1, tuple(latent.shape),
                                  True, spectrum=run.spectrum, sol=run.sol, stage=run.stage)
                 replay_frame = Frame(frame.grid, 1, frame.offset, "response", replay_run, sigma)
-                reuse = live_reference_matches(block)
-                if reuse:
-                    replay_frame.reference = frame.reference
-                    slots = frame.reference_slots
-                else:
-                    anchors = []
-                    with torch.no_grad():
-                        for reference_index in range(cfg.feature_references):
-                            if rebuild:
-                                first_frame = Frame(frame.grid, 1, frame.offset, "response", replay_run, first_sigma)
-                                first_options = {**clean_options, "sigmas": torch.full_like(options["sigmas"], first_sigma)}
-                                spend(1)
-                                shadow_forward(executor, replay_run, first_frame, x, torch.full_like(timesteps, first_sigma),
-                                               context, mask, refs, first_options, kwargs, reference_index,
-                                               sol_evaluations=initial_sol_evaluations)
-                            spend(1)
-                            anchors.append(shadow_forward(executor, replay_run, replay_frame, x, timesteps,
-                                                          context, mask, refs, clean_options, kwargs, reference_index,
-                                                          sol_evaluations=sol_evaluations))
-                    replay_frame.reference = torch.cat(anchors) if len(anchors) > 1 else anchors[0]
-                    slots = replay_frame.reference_slots
+                reuse = block in live_blocks
+                replay_frame.reference = frame.reference if reuse else cold_references[block]
+                slots = frame.reference_slots if reuse else cold_slots
                 origin = "live_pooled_reference" if reuse else "reconstructed_first_estimate" if rebuild else "initial_shadow"
                 if len(sites) == 1:
                     point["feature_reference_slots"] = slots

@@ -16,6 +16,7 @@ POLICIES = ("response_rms", "minimum_change", "response_alignment", "external", 
 LOCALIZATIONS = ("whole", "only_raw", "remove_raw", "only_matched", "remove_matched")
 REPLAY_DIRECTIONS = ("repel", "reverse", "channel_sign", "sham", "tangent", "spatial_random")
 MAX_FLOW_SIGMA = 1.00001
+CALIBRATION_OFF_AXIS_LIMIT = 0.10
 MAX_STATES = 2
 MAX_EXPORT_BYTES = 64 * 1024**2
 
@@ -63,11 +64,15 @@ class ResponseSettings:
     feature_projection: str = "native"
     require_conditioning: bool = False
     require_fidelity: bool = False
+    reference_min_sigma: float = -1.0
+    reference_start_sigma: float = -1.0
+    probe_precision: str = "auto"
 
     def __post_init__(self):
         for key, choices in (
             ("mode", MODES), ("basis", BASES), ("norm", ("rms", "l2")),
-            ("calibration", ("off", "repeat_and_half")), ("selection", POLICIES),
+            ("calibration", ("off", "repeat_and_half")),
+            ("probe_precision", ("auto", "fixed")), ("selection", POLICIES),
             ("response_direction", ("singular", "symmetric")),
             ("feature_projection", ("native", "response_subspace")),
             ("feature_direction", REPLAY_DIRECTIONS), ("localization", LOCALIZATIONS),
@@ -91,6 +96,10 @@ class ResponseSettings:
         ):
             if not low <= getattr(self, key) <= high:
                 raise ValueError(f"ModeExplorer response {key} must be in [{low}, {high}].")
+        for key, high in (("reference_min_sigma", 1.0), ("reference_start_sigma", MAX_FLOW_SIGMA)):
+            value = getattr(self, key)
+            if value != -1 and not 0 <= value <= high:
+                raise ValueError(f"ModeExplorer {key} must be -1 or in [0, {high}].")
         if self.candidate_target_rms > self.clean_limit:
             raise ValueError("The candidate target RMS exceeds the clean trust limit.")
         if self.frozen_state and self.steers:
@@ -251,6 +260,37 @@ def shifted_pair(x, unit, displacement, norm, trust_rms):
         return None, metrics, "input_trust_bound"
     return (pos, neg, a, b), metrics, None
 
+
+
+def calibrated_pairs(x, unit, settings):
+    """Choose representable probe geometry before spending denoiser forwards."""
+    requested = settings.displacement
+    args = (settings.norm, settings.input_limit)
+    full = shifted_pair(x, unit, requested, *args)
+    if settings.calibration == "off":
+        return full, None, requested
+
+    half = shifted_pair(x, unit, requested * 0.5, *args)
+    nominal = (full, half, requested)
+    if settings.probe_precision == "fixed" or x.dtype not in (torch.bfloat16, torch.float16):
+        return nominal
+
+    cap = settings.input_limit * (math.sqrt(x.numel()) if settings.norm == "l2" else 1)
+    amplitude = requested
+    for factor in (1.25, 1.5, 2.0, 3.0, 4.0):
+        if (full[2] is None and half[2] is None
+                and max(full[1]["off_axis_fraction"], half[1]["off_axis_fraction"]) <= CALIBRATION_OFF_AXIS_LIMIT):
+            return full, half, amplitude
+        enlarged = min(requested * factor, cap)
+        if enlarged <= amplitude or full[2] == "nonfinite_input":
+            break
+        amplitude = enlarged
+        full = shifted_pair(x, unit, amplitude, *args)
+        half = shifted_pair(x, unit, amplitude * 0.5, *args)
+    if (full[2] is None and half[2] is None
+            and max(full[1]["off_axis_fraction"], half[1]["off_axis_fraction"]) <= CALIBRATION_OFF_AXIS_LIMIT):
+        return full, half, amplitude
+    return nominal
 
 def differences(plus, minus, base, a, b):
     """Three-point differences with unequal realized steps on each side."""

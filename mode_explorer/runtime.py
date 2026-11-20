@@ -185,6 +185,7 @@ class Frame:
     tap_from: int = 0
     tap_grid: int = 4
     sol_evaluations: int | None = None
+    anchor_blocks: tuple[int, ...] = ()
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -468,6 +469,14 @@ def attention_feature(output, options):
     if frame is None or options.get("block_type") != "single":
         return output
     block = options.get("block_index")
+    if frame.anchor_blocks:
+        if block in frame.anchor_blocks:
+            if block in frame.taps:
+                raise RuntimeError("ModeExplorer captured the same reference block twice.")
+            height, width = frame.grid
+            start, end = token_slice(options, output.shape[1], height * width)
+            frame.taps[block] = token_pool(output[:, start:end], height, width, frame.tap_grid)
+        return output
     if frame.taps is not None and block > frame.tap_from:
         height, width = frame.grid
         start, end = token_slice(options, output.shape[1], height * width)
@@ -612,7 +621,7 @@ def reference_slot(settings, seed, index):
 
 
 def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs, index,
-                   *, sol_evaluations=None):
+                   *, sol_evaluations=None, capture_blocks=()):
     from comfy.model_management import throw_exception_if_processing_interrupted
 
     throw_exception_if_processing_interrupted()
@@ -634,7 +643,9 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         if state.clean is not None:
             shadow = shadow + (1 - frame.sigma / state.first_sigma) * state.clean
     shadow = shadow.to(x.dtype)
-    anchor = Frame(frame.grid, 1, 0, "anchor", run, frame.sigma)
+    anchor = Frame(frame.grid, 1, 0, "anchor", run, frame.sigma,
+                   anchor_blocks=capture_blocks, taps={} if capture_blocks else None,
+                   tap_grid=settings.feature_grid)
     probe_options = {
         **options, FRAME: anchor, "cond_or_uncond": [0],
         "uuids": options.get("uuids", [None] * x.shape[0])[frame.offset:frame.offset + 1],
@@ -649,13 +660,14 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
             shadow, timestep[row], context[row], row_of(mask),
             [row_of(ref) for ref in refs] if refs is not None else None, probe_options, **kwargs,
         )
-    if not anchor.seen:
+    observed = anchor.taps.keys() == set(capture_blocks) if capture_blocks else anchor.seen
+    if not observed:
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook during the reference forward.")
     if rolling:
         state.latent, state.velocity, state.sigma = shadow.float(), velocity.float(), frame.sigma
     elif state.clean is None:
         state.clean = shadow.float() - frame.sigma * velocity.float()
-    return anchor.pooled
+    return anchor.taps if capture_blocks else anchor.pooled
 
 
 def guidance_pending(model_options, sigma):

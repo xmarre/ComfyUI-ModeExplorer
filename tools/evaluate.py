@@ -34,6 +34,7 @@ RESPONSE_CONTROLS = {
     "feature_strength", "feature_references", "feature_pair", "feature_direction", "localization", "head", "cell", "export", "checkpoint_label",
     "frozen_state", "downstream", "input_limit", "calibration_max_change", "latent_cell",
     "feature_sites", "feature_projection", "require_conditioning", "require_fidelity",
+    "reference_min_sigma", "reference_start_sigma", "probe_precision",
 }
 SPECTRUM_CONTROLS = {
     "preset", "degree", "ridge", "warmup", "tail", "window", "growth", "max_history",

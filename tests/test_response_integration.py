@@ -308,7 +308,7 @@ def test_native_bf16_probe_reports_half_amplitude_rounding(model, caplog):
     model.model.diffusion_model.dtype = torch.bfloat16
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     native = draw(model, sigmas=SIGMAS)
-    patched = configured(model, directions=1, calibration_max_change=0.01)
+    patched = configured(model, directions=1, calibration_max_change=0.01, probe_precision="fixed")
     assert torch.equal(native, draw(patched, sigmas=SIGMAS))
     point, = traces(caplog)[-1]["response"]["points"]
     assert point["input_dtype"] == "torch.bfloat16"
@@ -316,7 +316,8 @@ def test_native_bf16_probe_reports_half_amplitude_rounding(model, caplog):
     assert 0.02 < diff["off_axis_fraction"] < 0.25
     half = diff["half_calibration"]
     assert half["off_axis_fraction"] > diff["off_axis_fraction"]
-    assert half["rounding_warning"] and half["status"] == "unstable"
+    assert half["rounding_warning"] and half["status"] == "rounding_limited"
+    assert "relative_first_order_change" not in half
 
 
 def test_compares_feature_sites_using_projected_candidates(model, caplog):
@@ -332,7 +333,9 @@ def test_compares_feature_sites_using_projected_candidates(model, caplog):
     assert point["latent_region"]["cell"] == 1
     best = max(candidates, key=lambda entry: entry["response_alignment"])
     assert point["selected_candidate"] == best["arm"]
-    assert point["auxiliary_dit_calls"] == 10
+    assert point["auxiliary_dit_calls"] == 8
+    assert point["feature_reference_calls"] == 2
+    assert point["feature_reference_capture_blocks"] == [0, 1]
 
 
 def test_steering_accepts_solver_start_tolerance_above_one(model, caplog):
@@ -352,3 +355,98 @@ def test_reconstruction_preflights_initial_and_current_reference_calls(model, ca
     trace = traces(caplog)[-1]["response"]
     assert trace["auxiliary_dit_calls"] == trace["auxiliary_dit_rows"] == 0
     assert trace["points"][0]["feature"][0]["reason"] == "auxiliary_forward_budget"
+
+
+def test_explicit_reference_start_survives_frozen_replay_without_that_solver_step(model, caplog, tmp_path, monkeypatch):
+    import folder_paths
+    from mode_explorer.nodes import ModeExplorerLoadResponse
+
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    anchor, target = map(float, SIGMAS[1:3])
+    settings = {"mode": "feature_replay", "min_sigma": target - .001, "max_sigma": target + .001,
+                "calibration": "off", "export": True}
+    explicit = configured(model, **settings, reference_start_sigma=0.9743)
+    draw(explicit, sigmas=SIGMAS)
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["feature_reference_initial_sigma"] == anchor
+    assert point["feature_reference_sigma_source"] == "configured_sigma"
+    assert point["feature_reference_calls"] == 2
+    loader = ModeExplorerLoadResponse()
+    expected, schedule = loader.load(point["export_id"], "feature_repel_clean")
+    assert not any(float(t) == anchor for t in schedule)
+
+    for reference_options in ({}, {"reference_start_sigma": 0.9743}):
+        draw(configured(model, **settings, **reference_options, frozen_state=point["export_id"]), sigmas=schedule)
+        replay, = traces(caplog)[-1]["response"]["points"]
+        assert replay["feature_reference_sigma_source"] == "export"
+        assert replay["feature_reference_initial_sigma"] == anchor
+        actual, _ = loader.load(replay["export_id"], "feature_repel_clean")
+        assert torch.equal(expected["samples"], actual["samples"])
+
+    draw(configured(model, **settings, reference_start_sigma=0.9743), sigmas=schedule)
+    missing, = traces(caplog)[-1]["response"]["points"]
+    assert missing["feature"][0]["reason"] == "reference_start_not_observed"
+    assert missing["feature_reference_calls"] == 0
+
+
+def test_explicit_floor_never_falls_back_to_an_ineligible_reference(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    sigmas = SIGMAS.clone()
+    sigmas[0] = 0.999995
+    draw(configured(model, mode="feature_replay", reference_min_sigma=1.0, calibration="off"), sigmas=sigmas)
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["feature_reference_sigma_source"] == "configured_min_sigma"
+    assert point["feature_reference_initial_sigma"] is None
+    assert point["feature"][0]["reason"] == "reference_start_not_observed"
+    assert point["auxiliary_dit_calls"] == 0
+
+
+def test_native_bf16_calibration_improves_geometry_without_extra_model_calls(model, caplog):
+    model.model.diffusion_model.bfloat16()
+    model.model.diffusion_model.dtype = torch.bfloat16
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model, sigmas=SIGMAS)
+    assert torch.equal(native, draw(configured(model, directions=1), sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    diff, = point["differences"]
+    assert diff["precision_adjusted"] and 0.02 < diff["probe_displacement"] <= 0.08
+    half = diff["half_calibration"]
+    assert half["status"] in ("stable", "unstable")
+    assert not half["rounding_warning"]
+    assert half["off_axis_fraction"] <= 0.10
+    assert half["relative_input_direction_change"] > 0 and point["auxiliary_dit_calls"] == 5
+
+    constrained = configured(model, mode="latent_steer", directions=1, input_limit=0.024)
+    assert torch.equal(native, draw(constrained, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    diff, = point["differences"]
+    assert diff["half_calibration"]["status"] == "rounding_limited"
+    assert diff["reason"] == "failed_half_amplitude_calibration"
+    assert point["auxiliary_dit_calls"] == 1 and point["selected_candidate"] == "baseline"
+
+
+def test_four_sites_share_reference_forwards_and_match_single_site_responses(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    sites = ("0:0", "0:1", "1:0", "1:1")
+    settings = dict(mode="feature_steer", selection="export_only", feature_pair=False,
+                    calibration="off", feature_references=2)
+    native = draw(model, sigmas=SIGMAS)
+    combined = configured(model, **settings, feature_sites=",".join(sites), auxiliary_budget=8)
+    assert torch.equal(native, draw(combined, sigmas=SIGMAS))
+    together, = traces(caplog)[-1]["response"]["points"]
+    assert together["feature_reference_calls"] == 4
+    assert together["feature_reference_capture_blocks"] == [0, 1]
+    assert together["auxiliary_dit_calls"] == together["auxiliary_dit_rows"] == 8
+
+    for site, expected in zip(sites, together["feature"]):
+        individual = configured(model, **settings, feature_sites=site, auxiliary_budget=5)
+        draw(individual, sigmas=SIGMAS)
+        point, = traces(caplog)[-1]["response"]["points"]
+        assert point["feature"] == [expected]
+
+    limited = configured(model, **settings, feature_sites=",".join(sites), auxiliary_budget=7)
+    draw(limited, sigmas=SIGMAS)
+    response = traces(caplog)[-1]["response"]
+    assert response["auxiliary_dit_calls"] == 0
+    assert response["points"][0]["feature"][0]["reason"] == "auxiliary_forward_budget"
