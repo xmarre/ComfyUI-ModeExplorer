@@ -260,6 +260,7 @@ def metrics(root, rows, ratings, perceptual, keep_traces, embeddings=None):
     if response:
         result["response_completion_fraction"] = average(item["status"] == "completed" for item in response)
         result["response_auxiliary_dit_calls"] = average(item["auxiliary_dit_calls"] for item in response)
+        result["response_auxiliary_dit_rows"] = average(item.get("auxiliary_dit_rows") for item in response)
         points = [p for item in response for p in item["points"] if p["status"] == "completed"]
         result["response_applied_fraction"] = average(p.get("applied", False) for p in points)
         operators = [p["projected_response"] for p in points if "projected_response" in p]

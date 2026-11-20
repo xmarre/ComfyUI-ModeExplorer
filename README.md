@@ -49,6 +49,6 @@ See [Research](docs/research.md) for equations and limitations and [Validation](
 
 ## Response experiments
 
-The **ModeExplorer Response (Krea 2)** node measures input and feature response at a frozen denoising state. It supports projected Jacobians, head and cell ablations, local predicted-clean exports, and opt-in response-based steering. One default latent probe spends seven auxiliary DiT forwards. Diagnostics follow the existing actual/forecast route unless the all-actual control is enabled.
+The **ModeExplorer Response (Krea 2)** node measures input and feature response at a frozen denoising state. It supports projected Jacobians, head and cell ablations, local predicted-clean exports, and opt-in response-based steering. One default latent probe spends seven auxiliary DiT forwards. Packed CFG processes fourteen auxiliary rows for those seven forwards. Diagnostics follow the existing actual/forecast route unless the all-actual control is enabled.
 
 Start with the [latent probe workflow](examples/response_probe.json). The [response guide](docs/response.md) describes the measurements, Raw/Turbo pairing, candidate acceptance and GPU experiments. The [response profiles](tools/response_profiles.json) use the existing evaluator and blinded analyzer.

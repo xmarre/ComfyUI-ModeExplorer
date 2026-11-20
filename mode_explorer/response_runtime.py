@@ -27,6 +27,7 @@ class ResponseRun:
     forwards: int = 0
     rows: int = 0
     reference_initial_sigma: float | None = None
+    reference_initial_sol_evaluations: int | None = None
     evaluation: int = -1
     states: int = 0
     exports: int = 0
@@ -202,8 +203,10 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     response.evaluation += 1
     index = response.evaluation
     sigma = frame.sigma
+    sol_evaluations = getattr(frame, "sol_evaluations", None)
     if response.reference_initial_sigma is None and sigma_eligible(sigma, getattr(run.settings, "min_sigma", 0.82)):
         response.reference_initial_sigma = sigma
+        response.reference_initial_sol_evaluations = sol_evaluations
     upper = MAX_FLOW_SIGMA if cfg.max_sigma == 1 else cfg.max_sigma
     same_sigma = response.last_sigma == sigma
     response.last_sigma = sigma
@@ -225,6 +228,8 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
         "noise_scale": run.noise_scale, "effective_tilt_per_unit_displacement": effective_tilt_scale(sigma, run.noise_scale),
         "selection": cfg.selection, "cfg_scale": response.cfg_scale,
         "feature_reference_initial_sigma": response.reference_initial_sigma,
+        "feature_reference_initial_sol_evaluations": response.reference_initial_sol_evaluations,
+        "sol_evaluations": sol_evaluations,
         "feature_settings": {
             "block": cfg.feature_block, "grid": cfg.feature_grid, "strength": cfg.feature_strength,
             "references": cfg.feature_references,
@@ -247,7 +252,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     token_count = math.prod(frame.grid) + context.shape[1]
     token_count += sum(math.prod(math.ceil(n / executor.class_obj.patch) for n in ref.shape[-2:]) for ref in refs or ())
     captures = len(executor.class_obj.blocks) * cfg.feature_grid**2 * dim * 2 if cfg.downstream else 0
-    size = 4 * (latent.numel() * (18 + 4 * cfg.directions + 2 * cfg.feature_references + 2 * len(sites)) + 6 * x.numel()
+    size = 4 * (latent.numel() * (18 + 4 * cfg.directions + 2 * cfg.feature_references + 6 * len(sites)) + 6 * x.numel()
                 + token_count * x.shape[0] * dim + 8 * frame.grid[1] * dim + captures)
     point["memory_scope"] = "research_tensor_workspace_excluding_native_forward"
     point["estimated_working_bytes"] = size
@@ -286,7 +291,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
             packed = x.clone()
             packed[row] = new_input
         override = clean_options if replay_frame is None else {**clean_options, FRAME: replay_frame}
-        with torch.no_grad(), isolated_reference(run):
+        with torch.no_grad(), isolated_reference(run, sol_evaluations=sol_evaluations):
             value = executor(packed, timesteps, context, mask, refs, override, **kwargs)
         return value[row]
 
@@ -300,6 +305,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
         point["latent_region"] = {"cell": cfg.latent_cell, "bounds_y0_y1_x0_x1": list(bounds)}
     probe_seed = run.seed
     reference_sigma = response.reference_initial_sigma
+    initial_sol_evaluations = response.reference_initial_sol_evaluations
     try:
         if cfg.frozen_state:
             from safetensors import safe_open
@@ -325,6 +331,18 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     if type(saved_initial) not in (int, float) or not sigma <= saved_initial <= MAX_FLOW_SIGMA:
                         raise ValueError("frozen_reference_sigma_mismatch")
                     reference_sigma = saved_initial
+                    point["feature_reference_sigma_source"] = "export"
+                else:
+                    point["feature_reference_sigma_source"] = "current_run_legacy_export"
+                if run.sol is not None:
+                    saved_ordinal = saved.get("sol_evaluations")
+                    if type(saved_ordinal) is int and saved_ordinal >= 0:
+                        sol_evaluations = saved_ordinal
+                    saved_initial_ordinal = saved.get("feature_reference_initial_sol_evaluations")
+                    if type(saved_initial_ordinal) is int and saved_initial_ordinal >= 0:
+                        initial_sol_evaluations = saved_initial_ordinal
+                point["sol_evaluations"] = sol_evaluations
+                point["feature_reference_initial_sol_evaluations"] = initial_sol_evaluations
                 point["feature_reference_initial_sigma"] = reference_sigma
                 point["probe_seed"] = probe_seed
                 point["frozen_export_id"] = cfg.frozen_state
@@ -479,10 +497,12 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                                 first_options = {**clean_options, "sigmas": torch.full_like(options["sigmas"], first_sigma)}
                                 spend(1)
                                 shadow_forward(executor, replay_run, first_frame, x, torch.full_like(timesteps, first_sigma),
-                                               context, mask, refs, first_options, kwargs, reference_index)
+                                               context, mask, refs, first_options, kwargs, reference_index,
+                                               sol_evaluations=initial_sol_evaluations)
                             spend(1)
                             anchors.append(shadow_forward(executor, replay_run, replay_frame, x, timesteps,
-                                                          context, mask, refs, clean_options, kwargs, reference_index))
+                                                          context, mask, refs, clean_options, kwargs, reference_index,
+                                                          sol_evaluations=sol_evaluations))
                     replay_frame.reference = torch.cat(anchors) if len(anchors) > 1 else anchors[0]
                     slots = replay_frame.reference_slots
                 origin = "live_pooled_reference" if reuse else "reconstructed_first_estimate" if rebuild else "initial_shadow"

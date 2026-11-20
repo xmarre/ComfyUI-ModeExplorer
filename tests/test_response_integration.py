@@ -42,7 +42,7 @@ def test_feature_replay_does_not_change_generation(model, caplog, direction, exp
     patched = configured(model, mode="joint_probe", feature_direction=direction, localization="only_raw", head=0)
     assert torch.equal(native, draw(patched, sigmas=SIGMAS))
     point, = traces(caplog)[-1]["response"]["points"]
-    assert point["auxiliary_dit_calls"] == 9
+    assert point["auxiliary_dit_calls"] == 10
     arm, = point["feature"]
     assert arm["status"] == "completed"
     assert (arm["realized_edit_l2"] > 0) is expected
@@ -144,7 +144,7 @@ def test_feature_reference_budget_and_matching_live_anchor(model, caplog):
     bare = configured(model, mode="feature_replay", feature_references=2, calibration="off")
     assert torch.equal(draw(model, sigmas=SIGMAS), draw(bare, sigmas=SIGMAS))
     point, = traces(caplog)[-1]["response"]["points"]
-    assert point["auxiliary_dit_calls"] == 3
+    assert point["auxiliary_dit_calls"] == 5
     assert len(set(point["feature_reference_slots"])) == 2
 
     primary, = ModeExplorer().apply(model, strength=0.025, fidelity=0.70, adaptive=False)
@@ -161,7 +161,7 @@ def test_active_gate_preserves_native_with_no_improvement_or_amplified_cfg(model
     assert torch.equal(draw(scored, sigmas=SIGMAS), draw(model, sigmas=SIGMAS))
     point, = traces(caplog)[-1]["response"]["points"]
     assert point["baseline_external_score"] == 4
-    assert {item["reason"] for item in point["candidates"]} == {"no_valid_score_improvement"}
+    assert {item["reason"] for item in point["candidates"] if item["arm"] != "baseline"} == {"no_valid_score_improvement"}
     assert torch.equal(draw(scored, sigmas=SIGMAS, cfg=2), draw(model, sigmas=SIGMAS, cfg=2))
     assert traces(caplog)[-1]["response"]["reason"] == "response_steering_requires_native_cfg_one"
 
@@ -211,7 +211,11 @@ def test_sol_response_forward_isolation(model, caplog):
     research = sol.install(configured(model, mode="feature_replay"), sol.Settings(), verbose=True)
     assert torch.equal(draw(baseline, sigmas=SIGMAS), draw(research, sigmas=SIGMAS))
     assert any("Sol-Krea2: model_evaluations=6 " in record.message for record in caplog.records)
-    assert traces(caplog)[-1]["response"]["auxiliary_dit_calls"] == 3
+    response = traces(caplog)[-1]["response"]
+    assert response["auxiliary_dit_calls"] == 4
+    point, = response["points"]
+    assert point["feature_reference_initial_sol_evaluations"] == 0
+    assert point["sol_evaluations"] == 1
     assert sol._ACTIVE.get() is None and sol._EXECUTION.get() is None
 
 
@@ -226,3 +230,125 @@ def test_active_spectrum_uses_all_actual_through_end_of_trajectory(model, caplog
     assert report["forecast"] == 0 and report["actual"] == len(SIGMAS) - 1
     assert traces(caplog)[-1]["response"]["points"][0]["applied"]
     assert not adapter.FORCE_NATIVE_ALL_SAMPLERS.get()
+
+
+@pytest.mark.parametrize("evaluation", [1, 2])
+def test_cold_reference_matches_live_after_first_evaluation(model, caplog, tmp_path, monkeypatch, evaluation):
+    import folder_paths
+    from mode_explorer.nodes import ModeExplorerLoadResponse
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    primary, = ModeExplorer().apply(model, strength=0.025, fidelity=0.70, adaptive=False, reference_budget=3)
+    live = configured(primary, mode="feature_replay", export=True, calibration="off", evaluation=evaluation)
+    draw(live, sigmas=SIGMAS)
+    warm, = traces(caplog)[-1]["response"]["points"]
+    assert warm["feature_reference_origin"] == "live_pooled_reference"
+    assert warm["sigma"] == float(SIGMAS[evaluation])
+    loader = ModeExplorerLoadResponse()
+    expected, sigmas = loader.load(warm["export_id"], "feature_repel_clean")
+    cold = configured(model, mode="feature_replay", export=True, calibration="off", frozen_state=warm["export_id"])
+    draw(cold, sigmas=sigmas)
+    reconstructed, = traces(caplog)[-1]["response"]["points"]
+    assert reconstructed["feature_reference_origin"] == "reconstructed_first_estimate"
+    assert reconstructed["feature_reference_initial_sigma"] == 1.0
+    assert reconstructed["auxiliary_dit_calls"] == reconstructed["auxiliary_dit_rows"] == 4
+    actual, _ = loader.load(reconstructed["export_id"], "feature_repel_clean")
+    assert torch.equal(actual["samples"], expected["samples"])
+
+
+def test_reapplying_primary_node_preserves_response_config(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    research = configured(model)
+    primary, = ModeExplorer().apply(research, strength=0.025, feature_block=1)
+    draw(primary, sigmas=SIGMAS)
+    record = traces(caplog)[-1]
+    assert record["feature_attempts"] == 2 and record["response"]["status"] == "completed"
+    disabled, = ModeExplorer().apply(primary, enabled=False)
+    assert torch.equal(draw(disabled, sigmas=SIGMAS), draw(model, sigmas=SIGMAS))
+    record = traces(caplog)[-1]
+    assert record["feature_attempts"] == 0 and record["response"]["status"] == "completed"
+
+
+def test_external_scorer_sees_exact_exported_vae_baseline(model, caplog, tmp_path, monkeypatch):
+    import numpy as np
+    import folder_paths
+    from mode_explorer.nodes import ModeExplorerLoadResponse
+
+    seen = []
+    def scorer(clean, provenance):
+        assert provenance["scorer_latent_format"] == "comfy_vae_latent"
+        seen.append(clean.detach().clone())
+        return np.float32(1)
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    patched = configured(model, mode="latent_steer", selection="external", scorer=scorer, export=True)
+    assert torch.equal(draw(patched, sigmas=SIGMAS), draw(model, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    vae, _ = ModeExplorerLoadResponse().load(point["export_id"], "baseline_clean")
+    assert len(seen) == 3 and torch.equal(seen[0], vae["samples"])
+    assert point["candidates"][0]["arm"] == point["selected_candidate"] == "baseline"
+    assert point["candidates"][0]["external_scores"] == {"quality": 1.0}
+
+
+def test_packed_cfg_reports_both_rows_per_auxiliary_call(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model, cfg=2, sigmas=SIGMAS)
+    assert torch.equal(native, draw(configured(model), cfg=2, sigmas=SIGMAS))
+    response = traces(caplog)[-1]["response"]
+    assert response["auxiliary_dit_calls"] == 7 and response["auxiliary_dit_rows"] == 14
+    point, = response["points"]
+    assert set(point["branches"]) == {0, 1}
+    assert point["auxiliary_dit_rows"] == 14
+
+
+def test_native_bf16_probe_reports_half_amplitude_rounding(model, caplog):
+    model.model.diffusion_model.bfloat16()
+    model.model.diffusion_model.dtype = torch.bfloat16
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model, sigmas=SIGMAS)
+    patched = configured(model, directions=1, calibration_max_change=0.01)
+    assert torch.equal(native, draw(patched, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["input_dtype"] == "torch.bfloat16"
+    diff, = point["differences"]
+    assert 0.02 < diff["off_axis_fraction"] < 0.25
+    half = diff["half_calibration"]
+    assert half["off_axis_fraction"] > diff["off_axis_fraction"]
+    assert half["rounding_warning"] and half["status"] == "unstable"
+
+
+def test_compares_feature_sites_using_projected_candidates(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    opts = dict(mode="feature_steer", feature_sites="0:0,1:1", feature_pair=False,
+                feature_projection="response_subspace", selection="response_alignment",
+                calibration="off", auxiliary_budget=14, latent_cell=1)
+    draw(configured(model, **opts), sigmas=SIGMAS)
+    point, = traces(caplog)[-1]["response"]["points"]
+    candidates = [entry for entry in point["candidates"] if entry["arm"] != "baseline"]
+    assert {(entry["block"], entry["head"]) for entry in candidates} == {(0, 0), (1, 1)}
+    assert all(0 < info["projected_clean_rms"] <= info["clean_rms"] for info in point["feature"])
+    assert point["latent_region"]["cell"] == 1
+    best = max(candidates, key=lambda entry: entry["response_alignment"])
+    assert point["selected_candidate"] == best["arm"]
+    assert point["auxiliary_dit_calls"] == 10
+
+
+def test_steering_accepts_solver_start_tolerance_above_one(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    sigmas = torch.tensor([1.000005, 0.93, 0.0])
+    steering = configured(model, mode="latent_steer", max_sigma=1.0, min_sigma=0.99)
+    assert torch.isfinite(draw(steering, sigmas=sigmas)).all()
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["sigma"] > 1 and point["applied"]
+
+
+
+def test_reconstruction_preflights_initial_and_current_reference_calls(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    limited = configured(model, mode="feature_replay", auxiliary_budget=2, calibration="off")
+    assert torch.equal(draw(limited, sigmas=SIGMAS), draw(model, sigmas=SIGMAS))
+    trace = traces(caplog)[-1]["response"]
+    assert trace["auxiliary_dit_calls"] == trace["auxiliary_dit_rows"] == 0
+    assert trace["points"][0]["feature"][0]["reason"] == "auxiliary_forward_budget"

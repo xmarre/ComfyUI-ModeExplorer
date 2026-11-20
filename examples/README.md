@@ -14,12 +14,12 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 | [Native refinement](multistage.json) | Guided 1024px composition, latent resize, and a native 1536px second pass. |
 | [Spectrum A/B](spectrum_ab.json) | Guarded versus Full Spectrum at the same seed. Requires the companion Spectrum overlay. |
 | [Spectrum and Scale-Locked](scale_locked_spectrum.json) | Actual Scale-Locked Krea 2 Regenerate with ER-SDE and separate planner and refined outputs. Requires the companion Spectrum overlay and Scale-Locked with stage tags. |
-
 | [Causal directions](causal_directions.json) | Native, sham, repel, reverse and channel-sign renders at a fixed seed. The low-strength controls use strength 0.025, fidelity 0.70 and block 5. |
 | [Latent probe](response_probe.json) | Projected response and local clean/state export at the first matching actual evaluation. |
 | [Frozen feature replay](response_feature_replay.json) | Compare latent responses and a cosine edit at the same native state. Includes later-block measurements. |
 | [Block/head localization](response_localization.json) | Measure a component-only edit on output head 0. Change the block, cell or matched normalization for ablations. |
 | [Response steering](response_steering.json) | Try both signs of the leading projected right singular direction and apply a bounded correction when accepted. |
+| [Response-informed site selection](response_site_selection.json) | Compare two supplied block/head sites using projected clean-output candidates. |
 | [Candidate review](response_candidate_review.json) | Export feature candidates for local VAE decode and human review. |
 | [External quality gate](response_quality_gate.json) | Connect a local validated scorer to enable quality acceptance. An empty scorer input keeps the native path. |
 | [Response with Spectrum](response_spectrum.json) | Diagnose otherwise actual evaluations on the Full arm while retaining the paired Guarded arm. Both use the compatibility overlay. |

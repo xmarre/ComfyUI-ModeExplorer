@@ -184,6 +184,7 @@ class Frame:
     taps: dict | None = None
     tap_from: int = 0
     tap_grid: int = 4
+    sol_evaluations: int | None = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -317,7 +318,7 @@ def verified_sol(options, registered):
 
 
 @contextmanager
-def isolated_reference(run):
+def isolated_reference(run, *, sol_evaluations=None):
     """Do not advance Spectrum or Sol state while evaluating auxiliary inputs."""
     if run.spectrum is None:
         current = capture = None
@@ -340,7 +341,8 @@ def isolated_reference(run):
         if sol is not None:
             # Use the same dense-warmup position and isolated mutable counters.
             # Keep cached device code without sharing per-invocation statistics.
-            aux = sol._Run(owner, state.settings, evaluations=state.evaluations,
+            evaluations = state.evaluations if sol_evaluations is None else sol_evaluations
+            aux = sol._Run(owner, state.settings, evaluations=evaluations,
                            kernel=state.kernel, kernel_failure=state.kernel_failure,
                            kernel_device=state.kernel_device, sparse_verified=set(state.sparse_verified))
             token_sol = sol._ACTIVE.set(aux)
@@ -609,7 +611,8 @@ def reference_slot(settings, seed, index):
     return seed_key(seed, f"feature-trajectory-{index}")
 
 
-def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs, index):
+def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs, index,
+                   *, sol_evaluations=None):
     from comfy.model_management import throw_exception_if_processing_interrupted
 
     throw_exception_if_processing_interrupted()
@@ -641,7 +644,7 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         return tensor[row] if tensor is not None and tensor.shape[0] == x.shape[0] else tensor
 
     run.reference_calls += 1
-    with isolated_reference(run):
+    with isolated_reference(run, sol_evaluations=sol_evaluations):
         velocity = executor(
             shadow, timestep[row], context[row], row_of(mask),
             [row_of(ref) for ref in refs] if refs is not None else None, probe_options, **kwargs,
@@ -736,6 +739,11 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     patch = executor.class_obj.patch
     grid = tuple(math.ceil(size / patch) for size in x.shape[-2:])
     frame = Frame(grid, run.batch, offset, "sample", run, low)
+    if response_active and run.sol is not None:
+        sol, owner = run.sol
+        sol_state = sol._ACTIVE.get()
+        if sol_state is not None and sol_state.owner is owner:
+            frame.sol_evaluations = sol_state.evaluations
     if grid == (1, 1):
         active = False
         run.reasons.add("degenerate_feature_grid")

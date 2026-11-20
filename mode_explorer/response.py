@@ -397,6 +397,11 @@ def get_score(scorer, clean, provenance, process_latent_out):
     scores = {}
     for key in ("quality", "conditioning", "fidelity"):
         number = value.get(key)
-        if isinstance(number, Real) and not isinstance(number, bool) and math.isfinite(number):
-            scores[key] = float(number)
+        if isinstance(number, Real) and not isinstance(number, bool):
+            try:
+                number = float(number)
+            except (OverflowError, TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                scores[key] = number
     return scores if "quality" in scores else None

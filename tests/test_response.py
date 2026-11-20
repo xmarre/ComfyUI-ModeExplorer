@@ -115,7 +115,7 @@ def test_candidate_policy_is_deterministic_and_scorer_fails_closed():
     stronger = [(torch.ones(4) * 0.002, {}), (torch.ones(4) * -0.002, {})]
     selected, score = select_response(stronger, baseline, ResponseSettings(
         selection="external", scorer=lambda candidate, _: float(candidate.mean())), 0, {})
-    assert score == 0 and selected[1] is stronger[0][1]
+    assert score == {"quality": 0} and selected[1] is stronger[0][1]
 
 
 def test_matched_clean_candidate_uses_actual_magnitude():
@@ -129,3 +129,51 @@ def test_matched_clean_candidate_uses_actual_magnitude():
     too_weak = clean_candidate(baseline, torch.full((4,), 0.01), cfg, {})
     assert too_weak[1]["reason"] == "target_exceeds_available_response"
     assert select_response([match, too_weak], baseline, cfg, 0.0, {})[0][1] is match[1]
+
+
+def test_localized_probe_preserves_native_input_outside_cell_and_enforces_trust():
+    from mode_explorer.response import latent_cell_bounds, localize_direction
+
+    x = torch.randn(1, 16, 1, 11, 8, generator=torch.Generator().manual_seed(5)).bfloat16()
+    bounds = latent_cell_bounds(x.shape, 4, 15)
+    assert bounds == (9, 11, 6, 8)
+    field = direction_field(x, "bilinear", 4, 55, 0, 0)
+    unit, = orthonormalize([localize_direction(field, bounds)])
+    pair, metrics, reason = shifted_pair(x, unit, 0.02, "rms", 0.25)
+    assert reason is None
+    assert torch.equal(pair[0][..., :9, :], x[..., :9, :])
+    assert torch.equal(pair[1][..., :, :6], x[..., :, :6])
+    assert metrics["off_axis_fraction"] > 0
+    _, _, reason = shifted_pair(x, unit, 0.02, "rms", 0.015)
+    assert reason == "input_trust_bound"
+
+
+def test_structured_external_gates_require_each_enabled_score():
+    import numpy as np
+
+    baseline = torch.zeros(4)
+    options = ResponseSettings(
+        selection="external", require_conditioning=True, require_fidelity=True,
+        scorer=lambda clean, _: {"quality": np.float32(1 + abs(float(clean.mean()))),
+                                 "conditioning": 0 if clean[0] < 0 else 1, "fidelity": np.float64(1.0)},
+    )
+    left, right = (torch.full((4,), -0.01), {}), (torch.full((4,), 0.01), {})
+    chosen, score = select_response([left, right], baseline, options, 0, {})
+    assert chosen[1] is right[1]
+    assert score == {"quality": 1.0, "conditioning": 1.0, "fidelity": 1.0}
+    assert left[1]["acceptance"] == {"conditioning": "regressed", "fidelity": "passed"}
+
+
+def test_output_projection_returns_clean_displacement_in_output_span():
+    delta = torch.tensor([[2., 3., 4.]])
+    report, projected = output_projection(delta, [torch.tensor([1., 1., 0.])], return_projection=True)
+    torch.testing.assert_close(projected, torch.tensor([[2.5, 2.5, 0.]]))
+    torch.testing.assert_close(torch.tensor(report["residual_energy"]), (delta - projected).square().sum())
+
+
+def test_velocity_for_clean_supports_admitted_upper_tolerance():
+    x, clean = torch.ones(2), torch.zeros(2)
+    sigma = 1.000005
+    torch.testing.assert_close(flow_clean(x, velocity_for_clean(x, clean, sigma), sigma), clean)
+    with pytest.raises(ValueError):
+        velocity_for_clean(x, clean, 1.00002)

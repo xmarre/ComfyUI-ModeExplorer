@@ -199,7 +199,7 @@ class ModeExplorerResponse:
         if has_spectrum(model.model_options, model.wrappers):
             raise RuntimeError("Apply the ModeExplorer Response node before Spectrum.")
         if enabled:
-            block = BLOCK if config.mode in ("latent_probe", "latent_steer") else config.feature_block
+            block = BLOCK if config.mode in ("latent_probe", "latent_steer") else config.sites[0][0]
             ModeExplorer.verify_model(model, block)
             if config.feature_sites:
                 blocks = model.get_model_object("diffusion_model").blocks
