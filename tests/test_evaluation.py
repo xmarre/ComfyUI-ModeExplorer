@@ -72,6 +72,20 @@ def test_low_strength_profiles_match_guided_and_sham():
     }
 
 
+def test_causal_profiles_change_only_direction():
+    profiles = evaluate.load_profiles(Path(evaluate.__file__).with_name("causal_direction_profiles.json"))
+    assert set(profiles) == {"native", "sham", "repel", "reverse", "channel_sign_0", "channel_sign_1", "channel_sign_2"}
+    baseline = profiles["repel"]["settings"]
+    assert baseline["strength"] == 0.025 and baseline["feature_block"] == 5
+    assert profiles["sham"]["settings"] == {**baseline, "sham": True}
+    assert profiles["reverse"]["settings"] == {**baseline, "feature_direction": "reverse"}
+    for trial in range(3):
+        assert profiles[f"channel_sign_{trial}"]["settings"] == {
+            **baseline, "feature_direction": "channel_sign", "direction_trial": trial,
+        }
+    assert all(profile["spectrum"] == "all_actual" for profile in profiles.values())
+
+
 def test_render_reads_native_api_history_image_and_trace(tmp_path, monkeypatch):
     log = tmp_path / "comfy.log"
     log.write_text("previous unrelated log\n")
