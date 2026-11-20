@@ -3,17 +3,19 @@
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+from numbers import Real
 
 import torch
 import torch.nn.functional as F
 
-from .objectives import lift, reference_noise, seed_key
+from .objectives import cell_size, lift, reference_noise, seed_key
 
 BASES = ("gaussian", "coarse", "bilinear", "dct", "reference")
 MODES = ("latent_probe", "feature_replay", "joint_probe", "latent_steer", "feature_steer")
 POLICIES = ("response_rms", "minimum_change", "response_alignment", "external", "export_only")
 LOCALIZATIONS = ("whole", "only_raw", "remove_raw", "only_matched", "remove_matched")
 REPLAY_DIRECTIONS = ("repel", "reverse", "channel_sign", "sham", "tangent", "spatial_random")
+MAX_FLOW_SIGMA = 1.00001
 MAX_STATES = 2
 MAX_EXPORT_BYTES = 64 * 1024**2
 
@@ -54,12 +56,20 @@ class ResponseSettings:
     frozen_state: str = ""
     downstream: bool = False
     scorer: object = None
+    input_limit: float = 0.25
+    calibration_max_change: float = 0.25
+    latent_cell: int = -1
+    feature_sites: str = ""
+    feature_projection: str = "native"
+    require_conditioning: bool = False
+    require_fidelity: bool = False
 
     def __post_init__(self):
         for key, choices in (
             ("mode", MODES), ("basis", BASES), ("norm", ("rms", "l2")),
             ("calibration", ("off", "repeat_and_half")), ("selection", POLICIES),
             ("response_direction", ("singular", "symmetric")),
+            ("feature_projection", ("native", "response_subspace")),
             ("feature_direction", REPLAY_DIRECTIONS), ("localization", LOCALIZATIONS),
         ):
             if getattr(self, key) not in choices:
@@ -68,12 +78,13 @@ class ResponseSettings:
             ("probe_grid", 1, 16), ("directions", 1, 4), ("trial", 0, 65535),
             ("evaluation", -1, 127), ("states", 1, MAX_STATES), ("auxiliary_budget", 0, 48),
             ("memory_mb", 16, 512), ("feature_block", 0, 63), ("feature_grid", 1, 16),
-            ("head", -1, 255), ("cell", -1, 255), ("feature_references", 1, 3),
+            ("latent_cell", -1, 255), ("head", -1, 255), ("cell", -1, 255), ("feature_references", 1, 3),
         ):
             value = getattr(self, key)
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"ModeExplorer response {key} must be an integer in [{low}, {high}].")
         for key, low, high in (
+            ("input_limit", 1e-5, 0.25), ("calibration_max_change", 0.01, 2.0),
             ("displacement", 1e-5, 0.25), ("clean_limit", 1e-5, 0.25),
             ("candidate_gain", 0.01, 1.0), ("candidate_target_rms", 0.0, 0.25), ("feature_strength", 0.0, 1.0),
             ("min_sigma", 0.0, 1.0), ("max_sigma", 0.0, 1.0),
@@ -86,14 +97,33 @@ class ResponseSettings:
             raise ValueError("Frozen-state replay requires a diagnostic or export-only mode.")
         if self.selection == "response_alignment" and self.mode != "feature_steer":
             raise ValueError("Output-response alignment is available for feature steering.")
+        if (self.feature_sites or self.feature_projection != "native") and self.mode != "feature_steer":
+            raise ValueError("Feature site selection and projection require feature steering.")
+        if (self.require_conditioning or self.require_fidelity) and self.selection != "external":
+            raise ValueError("Conditioning and fidelity gates require external selection.")
+        if self.feature_sites:
+            self.sites
         if self.feature_grid not in (2, 4, 6, 8):
             raise ValueError("Use a feature grid of 2, 4, 6, or 8.")
         if self.min_sigma > self.max_sigma:
             raise ValueError("ModeExplorer response sigma bounds are reversed.")
-        if self.localization != "whole" and self.head == self.cell == -1:
+        if self.localization != "whole" and self.head == self.cell == -1 and not self.feature_sites:
             raise ValueError("Select an output head or spatial cell to localize.")
         if self.selection == "external" and self.scorer is not None and not callable(self.scorer):
             raise TypeError("The ModeExplorer response scorer must be callable.")
+
+    @property
+    def sites(self):
+        if not self.feature_sites:
+            return ((self.feature_block, self.head),)
+        try:
+            sites = tuple(tuple(int(n) for n in pair.split(":")) for pair in self.feature_sites.split(","))
+            if (len(sites) > 4 or len(set(sites)) != len(sites)
+                    or any(not 0 <= block <= 63 or not 0 <= head <= 255 for block, head in sites)):
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Enter up to four unique feature sites as block:head pairs.") from exc
+        return sites
 
     @property
     def steers(self):
@@ -122,7 +152,7 @@ def effective_tilt_scale(sigma, noise_scale):
 
 
 def velocity_for_clean(x, clean, sigma):
-    if not 1e-5 <= sigma <= 1:
+    if not 1e-5 <= sigma <= MAX_FLOW_SIGMA:
         raise ValueError("Cannot express a clean correction at this flow sigma.")
     return (x.float() - clean.float()) / sigma
 
@@ -156,6 +186,25 @@ def direction_field(x, basis, grid, seed, trial, index):
         dx = torch.cos(math.pi / width * h[:, None] * v[None, :])
         field = dy @ cells @ dx.T
     return field.reshape(shape).to(x.device)
+
+
+def latent_cell_bounds(shape, grid, cell):
+    height, width = shape[-2:]
+    sy, sx = cell_size(height, width, grid)
+    rows, cols = math.ceil(height / sy), math.ceil(width / sx)
+    if not 0 <= cell < rows * cols:
+        raise ValueError("latent_cell_out_of_range")
+    y, x = divmod(cell, cols)
+    return y * sy, min((y + 1) * sy, height), x * sx, min((x + 1) * sx, width)
+
+
+def localize_direction(value, bounds):
+    if bounds is None:
+        return value
+    y0, y1, x0, x1 = bounds
+    field = torch.zeros_like(value)
+    field[..., y0:y1, x0:x1] = value[..., y0:y1, x0:x1]
+    return field
 
 
 def orthonormalize(vectors):
@@ -234,19 +283,26 @@ def projected_operator(basis, responses):
     }, right[0], eigenvectors[:, -1]
 
 
-def output_projection(delta, responses):
+def output_projection(delta, responses, *, return_projection=False):
     flat = delta.float().flatten()
     basis = orthonormalize(responses)
-    coefficients = [float(torch.dot(flat, q)) for q in basis]
+    weights = [torch.dot(flat, q) for q in basis]
+    coefficients = [float(weight) for weight in weights]
     energy = float(torch.dot(flat, flat))
     projected = min(energy, math.fsum(c*c for c in coefficients))
-    return {
+    report = {
         "output_basis_coefficients": coefficients,
         "cosines": [float(torch.dot(flat, r) / (
             torch.linalg.vector_norm(flat) * torch.linalg.vector_norm(r)).clamp_min(1e-15)) for r in responses],
         "explained_energy_fraction": projected / energy if energy else None,
         "residual_energy": energy - projected,
     }
+    if return_projection:
+        projected_delta = torch.zeros_like(flat)
+        for q, weight in zip(basis, weights):
+            projected_delta.add_(q * weight)
+        return report, projected_delta.reshape_as(delta)
+    return report
 
 
 def clean_candidate(base, delta, settings, info):
@@ -261,13 +317,16 @@ def clean_candidate(base, delta, settings, info):
     return (base + gain * delta, info)
 
 
-def select_response(candidates, baseline, settings, noise_floor, provenance):
+def select_response(candidates, baseline, settings, noise_floor, provenance, process_latent_out=None):
     """Candidate order is stable. External scores are finite, larger-is-better."""
     chosen = None
     best = -math.inf
+    categories = tuple(name for name, enabled in (
+        ("conditioning", settings.require_conditioning), ("fidelity", settings.require_fidelity)
+    ) if enabled)
     baseline_score = None
     if settings.selection == "external" and settings.scorer is not None:
-        baseline_score = get_score(settings.scorer, baseline, provenance)
+        baseline_score = get_score(settings.scorer, baseline, provenance, process_latent_out)
     for clean, info in candidates:
         if "reason" in info:
             continue
@@ -283,11 +342,28 @@ def select_response(candidates, baseline, settings, noise_floor, provenance):
             info["reason"] = "offline_review"
         elif settings.selection == "external" and baseline_score is None:
             info["reason"] = "score_unavailable"
+        elif settings.selection == "external" and any(name not in baseline_score for name in categories):
+            info["reason"] = "baseline_acceptance_metric_unavailable"
         else:
             if settings.selection == "external":
-                score = get_score(settings.scorer, clean, provenance)
-                info["external_score"] = score
-                if score is None or score <= baseline_score:
+                scores = get_score(settings.scorer, clean, provenance, process_latent_out)
+                info["external_scores"] = scores
+                info["external_score"] = scores["quality"] if scores is not None else None
+                acceptance = {
+                    name: ("unavailable" if scores is None or name not in scores
+                           else "regressed" if scores[name] < baseline_score[name] else "passed")
+                    for name in categories
+                }
+                if acceptance:
+                    info["acceptance"] = acceptance
+                if scores is None:
+                    info["reason"] = "invalid_external_score"
+                    continue
+                if any(value != "passed" for value in acceptance.values()):
+                    info["reason"] = "external_acceptance_gate"
+                    continue
+                score = scores["quality"]
+                if score <= baseline_score["quality"]:
                     info["reason"] = "no_valid_score_improvement"
                     continue
             elif settings.selection == "response_alignment":
@@ -305,10 +381,22 @@ def select_response(candidates, baseline, settings, noise_floor, provenance):
     return chosen, baseline_score
 
 
-def get_score(scorer, clean, provenance):
+def get_score(scorer, clean, provenance, process_latent_out):
     try:
-        # Give the local scorer isolated storage and metadata.
-        value = scorer(clean.detach().clone(), deepcopy(provenance))
+        # Give the scorer the same coordinates as VAE Decode and local exports.
+        clean = clean.detach().clone()
+        if process_latent_out is not None:
+            clean = process_latent_out(clean)
+        value = scorer(clean, deepcopy(provenance))
     except (ValueError, TypeError, RuntimeError, OSError):
         return None
-    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
+    if isinstance(value, Real):
+        value = {"quality": value}
+    if not isinstance(value, dict):
+        return None
+    scores = {}
+    for key in ("quality", "conditioning", "fidelity"):
+        number = value.get(key)
+        if isinstance(number, Real) and not isinstance(number, bool) and math.isfinite(number):
+            scores[key] = float(number)
+    return scores if "quality" in scores else None

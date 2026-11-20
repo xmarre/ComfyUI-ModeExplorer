@@ -1048,7 +1048,8 @@ class SamplerWrapper:
                 if run.response is not None:
                     rep = run.response
                     payload["response"] = {
-                        "schema": 1, "auxiliary_dit_calls": rep.forwards, "auxiliary_guider_calls": 0,
+                        "schema": 1, "auxiliary_dit_calls": rep.forwards, "auxiliary_dit_rows": rep.rows,
+                        "auxiliary_guider_calls": 0,
                         "eligible_actual_positive_evaluations": rep.evaluation + 1,
                         "status": ("completed" if any(p["status"] == "completed" for p in rep.points)
                                    else "rejected" if any(p["status"] == "rejected" for p in rep.points) else "skipped"),

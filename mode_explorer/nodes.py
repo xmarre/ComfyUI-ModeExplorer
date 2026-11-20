@@ -7,6 +7,22 @@ from .runtime import (
 )
 
 
+def _remove_modeexplorer_wrappers(clone):
+    from comfy.patcher_extension import WrappersMP
+
+    for kind in (WrappersMP.SAMPLER_SAMPLE, WrappersMP.DIFFUSION_MODEL):
+        clone.remove_wrappers_with_key(kind, KEY)
+    options = clone.model_options["transformer_options"]
+    patches = options.get("patches", {})
+    remaining = [fn for fn in patches.get("attn1_output_patch", ()) if fn is not attention_feature]
+    if remaining:
+        patches["attn1_output_patch"] = remaining
+    else:
+        patches.pop("attn1_output_patch", None)
+        if not patches:
+            options.pop("patches", None)
+
+
 class ModeExplorer:
     CATEGORY = "model_patches/ModeExplorer"
     RETURN_TYPES = ("MODEL",)
@@ -57,10 +73,14 @@ class ModeExplorer:
 
         base_options = model.model_options
         wrapper_types = (WrappersMP.SAMPLER_SAMPLE, WrappersMP.DIFFUSION_MODEL)
-        attached = any(model.get_wrappers(kind, KEY) for kind in wrapper_types)
+        samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+        response = next((wrapper.response for wrapper in samplers
+                         if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
+        attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
         active = enabled and (diagnostics or (strength != 0 and (feature != "native" or initialization)))
         if not active and not attached:
             return (model,)
+        settings = Settings(feature="native")
         if active:
             if "feature_grid" in advanced and isinstance(advanced["feature_grid"], str):
                 advanced["feature_grid"] = int(advanced["feature_grid"])
@@ -68,6 +88,7 @@ class ModeExplorer:
                                 adaptive, similarity, operation, reference_budget, diagnostics,
                                 full_spectrum, **advanced)
             self.verify_model(model, settings.feature_block)
+        if active or response is not None:
             if has_spectrum(base_options, model.wrappers):
                 raise RuntimeError("Apply ModeExplorer before Spectrum: noise optimization must precede Spectrum's sampling session.")
             _, sol = verify_patch_graph(base_options, settings, model.wrappers)
@@ -76,18 +97,9 @@ class ModeExplorer:
 
         clone = model.clone()
         if attached:
-            for kind in wrapper_types:
-                clone.remove_wrappers_with_key(kind, KEY)
-            patches = clone.model_options["transformer_options"].get("patches", {})
-            remaining = [fn for fn in patches.get("attn1_output_patch", ()) if fn is not attention_feature]
-            if remaining:
-                patches["attn1_output_patch"] = remaining
-            else:
-                patches.pop("attn1_output_patch", None)
-                if not patches:
-                    clone.model_options["transformer_options"].pop("patches", None)
-        if active:
-            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings))
+            _remove_modeexplorer_wrappers(clone)
+        if active or response is not None:
+            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
             clone.set_model_attn1_output_patch(attention_feature)
         return (clone,)
@@ -164,6 +176,13 @@ class ModeExplorerResponse:
             "checkpoint_label": ("STRING", {"default": "", "tooltip": "Experiment label for checkpoint and applied weight variants."}),
             "frozen_state": ("STRING", {"default": "", "tooltip": "Optional local response export ID. Exact sigma, conditioning and representable input are required."}),
             "downstream": ("BOOLEAN", {"default": False, "tooltip": "Measure pooled pre-gate attention differences at later blocks. Costs one matched baseline forward."}),
+            "input_limit": number("FLOAT", "input_limit", 0.00001, 0.25, "Maximum realized input displacement RMS across the full latent.", step=0.00001),
+            "calibration_max_change": number("FLOAT", "calibration_max_change", 0.01, 2.0, "Flag a calibrated derivative when the half-amplitude comparison exceeds this relative change.", step=0.01),
+            "latent_cell": number("INT", "latent_cell", -1, 255, "Localize the latent direction to a row-major cell of the probe grid. -1 uses the full latent."),
+            "feature_sites": ("STRING", {"default": "", "tooltip": "Optional comparison of up to four block:head pairs. Example 4:0,5:1."}),
+            "feature_projection": choice("feature_projection", ("native", "response_subspace"), "Project the measured feature-induced clean displacement onto the measured latent-output basis."),
+            "require_conditioning": ("BOOLEAN", {"default": False, "tooltip": "Require an external conditioning metric that does not regress against baseline."}),
+            "require_fidelity": ("BOOLEAN", {"default": False, "tooltip": "Require an external fidelity metric that does not regress against baseline."}),
             "scorer": ("MODEEXPLORER_LOCAL_SCORER", {"tooltip": "Optional local clean-latent scorer. Higher must mean better under its documented metric."}),
         }}
 
@@ -182,6 +201,12 @@ class ModeExplorerResponse:
         if enabled:
             block = BLOCK if config.mode in ("latent_probe", "latent_steer") else config.feature_block
             ModeExplorer.verify_model(model, block)
+            if config.feature_sites:
+                blocks = model.get_model_object("diffusion_model").blocks
+                for site_block, site_head in config.sites:
+                    ModeExplorer.verify_model(model, site_block)
+                    if site_head >= blocks[site_block].attn.heads:
+                        raise ValueError(f"Head {site_head} is outside native block {site_block}.")
             verify_patch_graph(model.model_options, Settings(feature="native"), model.wrappers)
         if not samplers:
             clone, = ModeExplorer().apply(model, feature="native", diagnostics=True)
@@ -189,7 +214,9 @@ class ModeExplorerResponse:
         else:
             settings = samplers[0].settings
             if not enabled and settings.feature == "native" and not (settings.diagnostics or settings.initialization):
-                return ModeExplorer().apply(model, enabled=False)
+                clone = model.clone()
+                _remove_modeexplorer_wrappers(clone)
+                return (clone,)
             clone = model.clone()
         clone.remove_wrappers_with_key(WrappersMP.SAMPLER_SAMPLE, KEY)
         clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, config))
@@ -214,15 +241,16 @@ class ModeExplorerLoadResponse:
     def load(self, export_id, prediction):
         import torch
         from safetensors import safe_open
+        from .response import MAX_FLOW_SIGMA
         from .response_runtime import read_export
 
         info, path = read_export(export_id)
         sigma = info.get("sigma")
-        if type(sigma) not in (int, float) or not 0 < sigma <= 1:
+        if type(sigma) not in (int, float) or not 0 < sigma <= MAX_FLOW_SIGMA:
             raise ValueError("The exported evaluation has no usable flow sigma.")
         with safe_open(path, framework="pt", device="cpu") as package:
             if not prediction.endswith("_clean") or prediction not in package.keys():
                 raise ValueError("Choose an exported predicted-clean tensor.")
             latent = package.get_tensor(prediction)
-        sigmas = torch.tensor([1.0, sigma, 0.0] if sigma < 1 else [1.0, 0.0])
+        sigmas = torch.tensor([1.0, sigma, 0.0] if sigma < 1 else [sigma, 0.0])
         return ({"samples": latent}, sigmas)

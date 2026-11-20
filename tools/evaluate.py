@@ -32,7 +32,8 @@ RESPONSE_CONTROLS = {
     "min_sigma", "max_sigma", "evaluation", "states", "auxiliary_budget", "memory_mb", "clean_limit",
     "candidate_gain", "candidate_target_rms", "selection", "response_direction", "all_actual", "feature_block", "feature_grid",
     "feature_strength", "feature_references", "feature_pair", "feature_direction", "localization", "head", "cell", "export", "checkpoint_label",
-    "frozen_state", "downstream",
+    "frozen_state", "downstream", "input_limit", "calibration_max_change", "latent_cell",
+    "feature_sites", "feature_projection", "require_conditioning", "require_fidelity",
 }
 SPECTRUM_CONTROLS = {
     "preset", "degree", "ridge", "warmup", "tail", "window", "growth", "max_history",
