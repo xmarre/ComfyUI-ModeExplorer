@@ -42,6 +42,7 @@ Small early edits can change pose or local object coherence without large framin
 | **Reference trajectories / selection** | Probe one to three tracks per actual step within the shared budget. Use all measured features jointly or the highest cosine match. |
 | **Reference continuation** | First estimate uses the first predicted clean state. Rolling Euler uses each shadow's latest velocity. The live sampler retains its native update and RNG. |
 | **Feature update / Sham** | Bounded is the lightweight baseline. Verified adds an area-weighted mean constraint, an 8% pooled RMS cap and objective backtracking on pooled features. Sham measures feature proposals without applying them and skips initialization. |
+| **Feature direction / Direction trial** | Experimental causal controls: reverse or channel-sign randomization of the bounded proposal, without changing its pre-rounding cell norms. Default repel. Trial selects an independent deterministic mask. |
 | **Initialization trials** | One to three total proposals after three baseline/reference guider calls. The first uses the original radius. Later proposals back off after rejection. |
 
-See [Research](docs/research.md) for equations and limitations and [Validation](docs/validation.md) for matched comparisons and cost measurements.
+See [Research](docs/research.md) for equations and limitations and [Validation](docs/validation.md) for matched comparisons and cost measurements. See [Causal investigation](docs/mechanism.md) for the norm-matched direction experiment and its limitations.
