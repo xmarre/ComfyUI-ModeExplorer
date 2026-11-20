@@ -5,7 +5,7 @@ import logging
 import math
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial
 from types import FunctionType
@@ -149,6 +149,7 @@ class Run:
     decisions: list = field(default_factory=list)
     points: list[dict] = field(default_factory=list)
     reasons: set[str] = field(default_factory=set)
+    response: object = None
 
 
 @dataclass
@@ -178,6 +179,8 @@ class Frame:
     prepare: object = None
     attempted: bool = False
     reference_slots: list = field(default_factory=list)
+    replay: object = None
+    replay_attention: object = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -506,6 +509,20 @@ def attention_feature(output, options):
             redundancy[:frame.batch], loss,
             shift[:frame.batch].square().mean(dim=(1, 2, 3)).sqrt(),
         )
+    if frame.replay is not None:
+        from .response_runtime import feature_delta
+
+        cfg, stats = frame.replay
+        if cfg.feature_direction == "sham":
+            stats["realized_edit_l2"] = stats["realized_edit_rms"] = 0.0
+            return output
+        if cfg.feature_direction in ("reverse", "channel_sign"):
+            shift = direction_control(shift, cfg.feature_direction, frame.run.seed, cfg.trial)
+        result = output.clone()
+        view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
+        sy, sx = cell_size(height, width, settings.feature_grid)
+        feature_delta(shift, current, output, view, sy, sx, frame)
+        return result
     if settings.sham:
         if trace_edit:
             frame.edit_metrics = pooled_edit_metrics(current, current, pairs, shift, repulsion, frame.batch, areas)
@@ -674,7 +691,8 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             })
         return result
 
-    if not (run.feature_active or run.settings.diagnostics) or spatial_image(x) is None:
+    response_active = run.response is not None and run.response.eligibility is None
+    if not (run.feature_active or run.settings.diagnostics or response_active) or spatial_image(x) is None:
         return forward(arguments)
     branches = options.get("cond_or_uncond", ())
     if 0 not in branches:
@@ -686,7 +704,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         return forward(arguments)
     trace = run.settings.diagnostics and len(run.points) < MAX_POINTS
     may_steer = run.feature_active and (run.batch > 1 or run.reference_calls < run.settings.reference_budget)
-    if not trace and not may_steer:
+    if not trace and not may_steer and not response_active:
         return forward(arguments)
     sigmas = options.get("sigmas")
     if sigmas is None or sigmas.shape != (run.batch,):
@@ -699,7 +717,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         run.reasons.add("nonuniform_sigma")
         return forward(arguments)
     active = may_steer and sigma_eligible(low, run.settings.min_sigma)
-    if not active and not trace:
+    if not active and not trace and not response_active:
         return forward(arguments)
     offset = branches.index(0) * run.batch
     patch = executor.class_obj.patch
@@ -725,7 +743,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             prepare_native_options({FRAME: frame})
     elif active and run.batch > 1:
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)
-    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace:
+    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace and not response_active:
         return forward(arguments)
     try:
         result = forward((*arguments[:-1], {**options, FRAME: frame}))
@@ -741,6 +759,10 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook.")
     if trace:
         record(frame, x, result)
+    if response_active:
+        from .response_runtime import run_response
+
+        return run_response(executor, run, frame, arguments, kwargs, result, actual=True)
     return result
 
 
@@ -856,12 +878,13 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evalua
 
 
 class SamplerWrapper:
-    def __init__(self, settings):
+    def __init__(self, settings, response=None):
         self.settings = settings
+        self.response = response
 
     def __call__(self, executor, model_wrap, sigmas, extra_args, callback, noise,
                  latent_image=None, denoise_mask=None, disable_pbar=False):
-        from comfy.model_sampling import CONST
+        from comfy.model_sampling import CONST, ModelSamplingFlux
         from comfy.samplers import CFGGuider, KSAMPLER
 
         def sample(args=extra_args, initial=noise):
@@ -889,7 +912,7 @@ class SamplerWrapper:
         batch = noise.shape[0]
         active = settings.strength > 0 and (settings.feature != "native" or settings.initialization)
         reasons = set()
-        if active:
+        if active or self.response is not None:
             if spatial_image(noise) is None or not 1 <= batch <= MAX_BATCH:
                 reasons.add("unsupported_latent_shape")
             if not math.isclose(start, 1.0, abs_tol=1e-5):
@@ -927,7 +950,7 @@ class SamplerWrapper:
             LOGGER.info("ModeExplorer sequential feature guidance has zero reference budget (seed=%s)", seed)
             feature_active = False
             reasons.add("zero_reference_budget")
-        if not (feature_active or initialize or settings.diagnostics):
+        if not (feature_active or initialize or settings.diagnostics or self.response is not None):
             return sample()
 
         scale = getattr(sampling, "noise_scale", 1.0)
@@ -935,6 +958,29 @@ class SamplerWrapper:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
                   spectrum=spectrum, sol=sol, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
+        force_native = nullcontext()
+        response = self.response
+        if response is not None:
+            from .response_runtime import ResponseRun, spectrum_all_actual
+
+            eligibility = None
+            if reasons - {"batch_mode_mismatch", "reference_latent_limit", "zero_reference_budget"}:
+                eligibility = "sampler_or_conditioning_unsupported"
+            elif batch != 1:
+                eligibility = "single_image_required"
+            elif (not isinstance(sampling, ModelSamplingFlux)
+                  or getattr(type(sampling), "timestep") is not ModelSamplingFlux.timestep):
+                eligibility = "unverified_flow_timestep"
+            elif response.steers and (feature_active or initialize):
+                eligibility = "use_native_model_for_response_steering"
+            elif response.steers and settings.full_spectrum and spectrum is not None:
+                eligibility = "active_response_requires_all_actual"
+            if eligibility is None and (response.all_actual or response.steers) and spectrum is not None:
+                force_native = spectrum_all_actual(spectrum)
+                if force_native is None:
+                    eligibility = "missing_spectrum_all_actual_contract"
+                    force_native = nullcontext()
+            run.response = ResponseRun(response, model_wrap.inner_model.process_latent_out, eligibility)
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:
@@ -957,12 +1003,13 @@ class SamplerWrapper:
                     run.reasons.add("initialization_euler_churn")
                 else:
                     initial = optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evaluation_sigma)
-            result = sample({**extra_args, "model_options": options}, initial)
+            with force_native:
+                result = sample({**extra_args, "model_options": options}, initial)
             completed = True
             return result
         finally:
             run.shadows.clear()
-            if settings.diagnostics:
+            if settings.diagnostics or run.response is not None:
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
                     "sham": settings.sham, "feature_direction": settings.feature_direction,
@@ -976,4 +1023,13 @@ class SamplerWrapper:
                         if spectrum is not None else "none",
                     "points": run.points, "decisions": run.decisions,
                 }
+                if run.response is not None:
+                    rep = run.response
+                    payload["response"] = {
+                        "schema": 1, "auxiliary_dit_calls": rep.forwards,
+                        "eligible_actual_positive_evaluations": rep.evaluation + 1,
+                        "status": "completed" if any(p["status"] == "completed" for p in rep.points) else "skipped",
+                        "reason": rep.eligibility or ("no_matching_actual_evaluation" if not rep.points else None),
+                        "points": rep.points,
+                    }
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))

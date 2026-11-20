@@ -1,7 +1,7 @@
 """ComfyUI registration and clone ownership."""
 
 from .runtime import (
-    FEATURES, FEATURE_DIRECTIONS, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
+    BLOCK, FEATURES, FEATURE_DIRECTIONS, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
     REFERENCE_SELECTIONS, REFERENCE_SOURCES, SamplerWrapper, Settings, attention_feature,
     diffusion_wrapper, has_spectrum, verify_patch_graph,
 )
@@ -106,3 +106,82 @@ class ModeExplorer:
             raise RuntimeError("ModeExplorer could not verify the native Krea 2 transformer contract.")
         if not 0 <= block < len(dit.blocks) or type(dit.blocks[block]) is not SingleStreamBlock:
             raise ValueError(f"ModeExplorer block {block} is outside the native single-stream range [0, {len(dit.blocks) - 1}].")
+
+
+class ModeExplorerResponse:
+    CATEGORY = ModeExplorer.CATEGORY
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    DESCRIPTION = "Measure frozen-state Krea 2 response or enable bounded experimental steering."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .response import BASES, LOCALIZATIONS, MODES, POLICIES, REPLAY_DIRECTIONS, ResponseSettings
+
+        defaults = ResponseSettings()
+
+        def choice(name, options, tooltip):
+            return (list(options), {"default": getattr(defaults, name), "tooltip": tooltip})
+
+        def number(kind, name, minimum, maximum, tooltip, **extra):
+            return (kind, {"default": getattr(defaults, name), "min": minimum, "max": maximum,
+                           "tooltip": tooltip, **extra})
+
+        return {"required": {
+            "model": ("MODEL",),
+            "enabled": ("BOOLEAN", {"default": True}),
+            "mode": choice("mode", MODES, "Diagnostics leave the sampler result unchanged. Steering is experimental."),
+            "basis": choice("basis", BASES, "Reference uses independent deterministic unit-noise minus the current latent."),
+            "probe_grid": number("INT", "probe_grid", 1, 16, "Maximum probe grid extent per axis."),
+            "directions": number("INT", "directions", 1, 4, "Rank of the requested local probe; two forwards per direction."),
+            "trial": number("INT", "trial", 0, 65535, "Deterministic probe or feature-control draw."),
+            "displacement": number("FLOAT", "displacement", 0.00001, 0.25, "Requested displacement in diffusion-input coordinates.", step=0.00001),
+            "norm": choice("norm", ("rms", "l2"), "RMS is dimension-normalized. L2 is the norm over the entire image latent."),
+            "calibration": choice("calibration", ("off", "repeat_and_half"), "Repeat the baseline and repeat the first valid direction at half amplitude."),
+            "min_sigma": number("FLOAT", "min_sigma", 0.0, 1.0, "Inclusive lower actual flow sigma.", step=0.00001),
+            "max_sigma": number("FLOAT", "max_sigma", 0.0, 1.0, "Inclusive upper actual flow sigma.", step=0.00001),
+            "evaluation": number("INT", "evaluation", -1, 127, "-1 selects by sigma. Other values select a zero-based actual positive dispatch."),
+            "states": number("INT", "states", 1, 2, "Maximum distinct matched states per sampler invocation."),
+            "auxiliary_budget": number("INT", "auxiliary_budget", 0, 48, "Hard limit on extra DiT calls across matched states."),
+            "memory_mb": number("INT", "memory_mb", 16, 512, "Maximum estimated research tensor workspace, excluding the ordinary native forward."),
+        }, "optional": {
+            "clean_limit": number("FLOAT", "clean_limit", 0.00001, 0.25, "RMS trust bound for a clean-prediction correction.", step=0.00001),
+            "candidate_gain": number("FLOAT", "candidate_gain", 0.01, 1.0, "Fraction of each measured clean displacement to propose.", step=0.01),
+            "selection": choice("selection", POLICIES, "Numerical policies rank only displacements. External requires a local validated scorer."),
+            "response_direction": choice("response_direction", ("singular", "symmetric"), "Projected right singular vector or top eigenvector of the symmetric component."),
+            "all_actual": ("BOOLEAN", {"default": False, "tooltip": "Use Spectrum's scoped all-native path for this eligible pass. Steering uses this path."}),
+            "feature_block": number("INT", "feature_block", 0, 63, "Zero-based native single-stream block."),
+            "feature_grid": (["2", "4", "6", "8"], {"default": str(defaults.feature_grid), "tooltip": "Maximum feature cells per axis."}),
+            "feature_strength": number("FLOAT", "feature_strength", 0, 1, "Frozen feature replay strength at fidelity 0.70 and adaptive off.", step=0.001),
+            "feature_direction": choice("feature_direction", REPLAY_DIRECTIONS, "Structured direction or a deterministic causal control."),
+            "localization": choice("localization", LOCALIZATIONS, "Component-only or component-removal. Matched preserves the full proposal L2 before rounding."),
+            "head": number("INT", "head", -1, 255, "Native output-query head index, or -1 for all."),
+            "cell": number("INT", "cell", -1, 255, "Row-major pooled cell index, or -1 for all."),
+            "export": ("BOOLEAN", {"default": False, "tooltip": "Write bounded local predicted-clean latents for VAE decoding and offline review."}),
+            "checkpoint_label": ("STRING", {"default": "", "tooltip": "Experiment label for checkpoint and applied weight variants."}),
+            "scorer": ("MODEEXPLORER_LOCAL_SCORER", {"tooltip": "Optional local clean-latent scorer. Higher must mean better under its documented metric."}),
+        }}
+
+    def apply(self, model, enabled=True, **options):
+        from comfy.patcher_extension import WrappersMP
+        from .response import ResponseSettings
+
+        samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+        if not enabled and not any(getattr(wrapper, "response", None) is not None for wrapper in samplers):
+            return (model,)
+        if "feature_grid" in options:
+            options["feature_grid"] = int(options["feature_grid"])
+        config = ResponseSettings(**options) if enabled else None
+        if enabled:
+            ModeExplorer.verify_model(model, config.feature_block if config.mode != "latent_probe" and config.mode != "latent_steer" else BLOCK)
+            if has_spectrum(model.model_options, model.wrappers):
+                raise RuntimeError("Apply the ModeExplorer Response node before Spectrum.")
+        if not samplers:
+            clone, = ModeExplorer().apply(model, feature="native", diagnostics=True)
+            settings = Settings(feature="native", diagnostics=False)
+        else:
+            settings = samplers[0].settings
+            clone = model.clone()
+        clone.remove_wrappers_with_key(WrappersMP.SAMPLER_SAMPLE, KEY)
+        clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, config))
+        return (clone,)
