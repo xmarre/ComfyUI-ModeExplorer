@@ -6,7 +6,7 @@ Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The 
 
 1. Apply the ModeExplorer PR overlay in ComfyUI Patcher and restart ComfyUI. Apply its companion overlay if using Spectrum.
 2. Load native Krea 2 weights, a Qwen3-VL-4B encoder in Krea 2 mode, and the matching Qwen Image VAE. Apply weight LoRAs upstream.
-3. Connect **MODEL → ModeExplorer → KSampler**. With additional patches use **MODEL → ModeExplorer → optional Sol-Krea2 → Spectrum → sampler**. Place a native/guided switch upstream of Spectrum so each arm shares the same settings.
+3. Connect **MODEL → ModeExplorer → KSampler**. For research use **MODEL → optional ModeExplorer → ModeExplorer Response → optional Sol-Krea2 → optional Spectrum → sampler**. Place a native/guided switch upstream of Spectrum so each arm shares the same settings.
 4. Load an [example workflow](examples/README.md). Match the prompt, model, seed, conditioning and sigma schedule during comparisons.
 
 The core Model Attention Backend can select PyTorch or Comfy Kitchen upstream. A KJ Diffusion Model Loader can also supply its Sage override. ModeExplorer retains the attention backend set by the last selector on the model path.
@@ -46,3 +46,9 @@ Small early edits can change pose or local object coherence without large framin
 | **Initialization trials** | One to three total proposals after three baseline/reference guider calls. The first uses the original radius. Later proposals back off after rejection. |
 
 See [Research](docs/research.md) for equations and limitations and [Validation](docs/validation.md) for matched comparisons and cost measurements. See [Causal investigation](docs/mechanism.md) for the norm-matched direction experiment and its limitations.
+
+## Response experiments
+
+The **ModeExplorer Response (Krea 2)** node measures input and feature response at a frozen denoising state. It supports projected Jacobians, head and cell ablations, local predicted-clean exports, and opt-in response-based steering. One default latent probe spends seven auxiliary DiT forwards. Diagnostics follow the existing actual/forecast route unless the all-actual control is enabled.
+
+Start with the [latent probe workflow](examples/response_probe.json). The [response guide](docs/response.md) describes the measurements, Raw/Turbo pairing, candidate acceptance and GPU experiments. The [response profiles](tools/response_profiles.json) use the existing evaluator and blinded analyzer.

@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import hashlib
 import math
+import re
+import shutil
 from pathlib import Path
 import tempfile
 
@@ -12,6 +14,7 @@ import torch
 from .objectives import cell_size, seed_key
 from .response import (
     MAX_EXPORT_BYTES, differences, direction_field, effective_tilt_scale, flow_clean,
+    velocity_for_clean,
     orthonormalize, output_projection, projected_operator, rms, select_response, shifted_pair,
 )
 
@@ -27,6 +30,7 @@ class ResponseRun:
     exports: int = 0
     points: list = field(default_factory=list)
     last_sigma: float | None = None
+    cfg_scale: float | None = None
 
 
 class ResponseBudget(RuntimeError):
@@ -91,9 +95,11 @@ def feature_delta(shift, current, output, view, sy, sx, frame):
     for iy in range(shift.shape[-2]):
         delta = shift[:, :, iy].to(output.dtype).repeat_interleave(sx, dim=-1)
         row = view[:, iy * sy:(iy + 1) * sy]
-        before = row.float().clone()
-        row.add_(delta[:, :, :width].transpose(1, 2)[:, None])
-        energy += (row.float() - before).square().sum()
+        for strip in row.split(2, dim=1):
+            before = strip.to(dtype=torch.float32, copy=True)
+            strip.add_(delta[:, :, :width].transpose(1, 2)[:, None])
+            before.sub_(strip).square_()
+            energy += before.sum()
     stats["realized_edit_l2"] = float(energy.sqrt())
     stats["realized_edit_rms"] = float((energy / view.numel()).sqrt())
 
@@ -125,6 +131,28 @@ def _tensor_hash(tensor):
     return hashlib.sha256(data).hexdigest()
 
 
+def read_export(export_id):
+    from json import loads
+    import folder_paths
+
+    if not re.fullmatch(r"response-[a-z0-9_]{8}", export_id):
+        raise ValueError("invalid_response_export_id")
+    root = (Path(folder_paths.get_output_directory()) / "modeexplorer_response").resolve()
+    folder = (root / export_id).resolve()
+    if folder.parent != root:
+        raise ValueError("invalid_response_export_path")
+    manifest = (folder / "manifest.json").resolve()
+    data = (folder / "predictions.safetensors").resolve()
+    if manifest.parent != folder or data.parent != folder:
+        raise ValueError("invalid_response_export_files")
+    if manifest.stat().st_size > 512 * 1024 or data.stat().st_size > MAX_EXPORT_BYTES + 65536:
+        raise ValueError("response_export_size_limit")
+    info = loads(manifest.read_text())
+    if not isinstance(info, dict) or info.get("schema") != 1:
+        raise ValueError("unknown_response_export_schema")
+    return info, data
+
+
 def _export(response, tensors, point):
     if not response.config.export:
         return
@@ -132,6 +160,7 @@ def _export(response, tensors, point):
     if size + response.exports > MAX_EXPORT_BYTES:
         point["export_status"] = "export_budget"
         return
+    run_dir = None
     try:
         import folder_paths
         from safetensors.torch import save_file
@@ -157,6 +186,8 @@ def _export(response, tensors, point):
         point["export_id"] = run_dir.name
         response.exports += size
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        if run_dir is not None:
+            shutil.rmtree(run_dir, ignore_errors=True)
         point["export_status"] = f"failed_{type(exc).__name__}"
 
 
@@ -173,7 +204,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
     sigma = frame.sigma
     same_sigma = response.last_sigma == sigma
     response.last_sigma = sigma
-    if (response.states >= cfg.states or same_sigma
+    if (response.states >= cfg.states or (same_sigma and cfg.evaluation < 0)
             or (cfg.evaluation >= 0 and cfg.evaluation != index)
             or not cfg.min_sigma <= sigma <= cfg.max_sigma):
         return velocity
@@ -182,16 +213,22 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
         "schema": 1, "status": "skipped", "evaluation": index, "sigma": sigma,
         "coordinate": "native_krea2_const_diffusion_input", "stage": run.stage,
         "mode": cfg.mode, "basis": cfg.basis, "trial": cfg.trial, "seed": run.seed,
+        "probe_seed": run.seed, "clean_trust_rms": cfg.clean_limit, "candidate_gain": cfg.candidate_gain,
+        "response_direction": cfg.response_direction, "calibration": cfg.calibration,
         "requested_directions": cfg.directions, "probe_grid": cfg.probe_grid, "displacement_norm": cfg.norm,
         "checkpoint_label": cfg.checkpoint_label,
         "noise_scale": run.noise_scale, "effective_tilt_per_unit_displacement": effective_tilt_scale(sigma, run.noise_scale),
-        "selection": cfg.selection,
+        "selection": cfg.selection, "cfg_scale": response.cfg_scale,
+        "feature_settings": {
+            "block": cfg.feature_block, "grid": cfg.feature_grid, "strength": cfg.feature_strength,
+            "reference_source": run.settings.reference_source if run.feature_active else "bank",
+        },
     }
     response.points.append(point)
     x, timesteps, context, mask, refs, options = arguments
     row = slice(frame.offset, frame.offset + 1)
     latent = x[row]
-    wants_latent = cfg.mode in ("latent_probe", "joint_probe", "latent_steer")
+    wants_latent = cfg.mode in ("latent_probe", "joint_probe", "latent_steer") or cfg.selection == "response_alignment"
     wants_feature = cfg.mode in ("feature_replay", "joint_probe", "feature_steer")
     before = response.forwards
 
@@ -200,8 +237,10 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
     dim = executor.class_obj.blocks[cfg.feature_block].attn.wo.in_features if wants_feature else 0
     token_count = math.prod(frame.grid) + context.shape[1]
     token_count += sum(math.prod(math.ceil(n / executor.class_obj.patch) for n in ref.shape[-2:]) for ref in refs or ())
-    size = 4 * (latent.numel() * (16 + 4 * cfg.directions) + 6 * x.numel()
-                + token_count * x.shape[0] * dim * 2)
+    captures = len(executor.class_obj.blocks) * cfg.feature_grid**2 * dim * 2 if cfg.downstream else 0
+    size = 4 * (latent.numel() * (18 + 4 * cfg.directions) + 6 * x.numel()
+                + token_count * x.shape[0] * dim + 8 * frame.grid[1] * dim + captures)
+    point["memory_scope"] = "research_tensor_workspace_excluding_native_forward"
     point["estimated_working_bytes"] = size
     if size > cfg.memory_mb * 1024**2:
         point["reason"] = "research_memory_budget"
@@ -211,16 +250,17 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
         return velocity
 
     clean_options = {k: v for k, v in options.items() if k != FRAME}
+    override = options.get("optimized_attention_override")
+    backend = getattr(override, "__qualname__", type(override).__qualname__) if override is not None else "native_selector"
     point.update(input_dtype=str(x.dtype), velocity_dtype=str(velocity.dtype),
                  timestep=float(timesteps.flatten()[frame.offset]),
-                 backend=type(options.get("optimized_attention_override")).__name__
-                 if options.get("optimized_attention_override") is not None else "native_selector",
+                 backend=backend,
                  conditioning_sha256=_tensor_hash(context[row]),
                  attention_mask_sha256=_tensor_hash(mask),
                  reference_latent_sha256=[_tensor_hash(ref) for ref in refs or ()],
                  native_input_sha256=_tensor_hash(latent), branches=list(options.get("cond_or_uncond", ())))
-    if cfg.scorer is not None and cfg.selection == "external" and hasattr(cfg.scorer, "name"):
-        point["scorer"] = str(cfg.scorer.name)
+    if cfg.scorer is not None and cfg.selection == "external":
+        point["scorer"] = getattr(cfg.scorer, "__qualname__", type(cfg.scorer).__qualname__)
 
     def spend(count):
         throw_exception_if_processing_interrupted()
@@ -231,7 +271,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
     def predict(new_input, replay_frame=None):
         spend(1)
         packed = x
-        if new_input is not latent:
+        if cfg.frozen_state or new_input is not latent:
             packed = x.clone()
             packed[row] = new_input
         override = clean_options if replay_frame is None else {**clean_options, FRAME: replay_frame}
@@ -239,8 +279,39 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
             value = executor(packed, timesteps, context, mask, refs, override, **kwargs)
         return value[row]
 
+    probe_seed = run.seed
     try:
-        base_velocity = predict(latent) if frame.attempted else velocity[row]
+        if cfg.frozen_state:
+            from safetensors import safe_open
+
+            try:
+                saved, data = read_export(cfg.frozen_state)
+                matched = ("sigma", "timestep", "conditioning_sha256", "attention_mask_sha256",
+                           "reference_latent_sha256", "branches", "noise_scale", "cfg_scale")
+                if any(saved.get(key) != point.get(key) for key in matched):
+                    raise ValueError("frozen_sigma_or_conditioning_mismatch")
+                with safe_open(data, framework="pt", device="cpu") as package:
+                    saved_latent = package.get_tensor("frozen_native_input")
+                if saved_latent.shape != latent.shape:
+                    raise ValueError("frozen_shape_mismatch")
+                latent = saved_latent.to(device=latent.device, dtype=latent.dtype)
+                if not torch.equal(latent.float().cpu(), saved_latent):
+                    raise ValueError("frozen_input_rounding_mismatch")
+                probe_seed = saved.get("probe_seed", saved.get("seed"))
+                if type(probe_seed) is not int:
+                    raise ValueError("frozen_probe_seed_missing")
+                point["probe_seed"] = probe_seed
+                point["frozen_export_id"] = cfg.frozen_state
+                point["native_input_sha256"] = _tensor_hash(latent)
+            except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                point.update(status="rejected", reason=str(exc) if isinstance(exc, ValueError) else "frozen_input_unavailable")
+                return velocity
+
+        baseline_taps = {} if wants_feature and cfg.downstream else None
+        baseline_frame = Frame(frame.grid, 1, frame.offset, "response_capture", run, sigma, taps=baseline_taps,
+                               tap_from=cfg.feature_block, tap_grid=cfg.feature_grid)
+        needs_baseline = frame.attempted or bool(cfg.frozen_state) or baseline_taps is not None
+        base_velocity = predict(latent, baseline_frame if baseline_taps is not None else None) if needs_baseline else velocity[row]
         base_clean = flow_clean(latent, base_velocity, sigma)
         if not bool(torch.isfinite(base_clean).all()):
             point.update(status="rejected", reason="nonfinite_baseline")
@@ -252,14 +323,14 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
             if not math.isfinite(noise_floor):
                 point.update(status="rejected", reason="nonfinite_repeat")
                 return velocity
-        point.update(baseline_reused=not frame.attempted, repeat_rms=noise_floor if cfg.calibration != "off" else None,
+        point.update(baseline_reused=not needs_baseline, repeat_rms=noise_floor if cfg.calibration != "off" else None,
                      differences=[], feature=[], candidates=[])
         tensors = {"frozen_native_input": latent.float(), "baseline_clean": base_clean} if cfg.export else {}
         basis, responses = [], []
         coefficients = None
         if wants_latent:
             proposals = orthonormalize(
-                direction_field(latent, cfg.basis, cfg.probe_grid, run.seed, cfg.trial, i)
+                direction_field(latent, cfg.basis, cfg.probe_grid, probe_seed, cfg.trial, i)
                 for i in range(cfg.directions)
             )
             for i, unit in enumerate(proposals):
@@ -281,7 +352,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                 metrics.update(first_order_rms=rms(derivative), curvature_rms=rms(curvature),
                                odd_signal_rms=signal * 0.5, even_signal_rms=rms((plus - base_clean) + (minus - base_clean)) * 0.5,
                                cancellation_or_repeat_limited=signal <= max(4 * noise_floor, 1e-8))
-                if cfg.calibration != "off" and i == 0 and response.forwards + 2 <= cfg.auxiliary_budget:
+                if cfg.calibration != "off" and not basis and response.forwards + 2 <= cfg.auxiliary_budget:
                     half, half_metrics, half_reason = shifted_pair(latent, unit, cfg.displacement * 0.5, cfg.norm, 0.25)
                     metrics["half_calibration"] = {**half_metrics, "reason": half_reason}
                     if half is not None:
@@ -290,6 +361,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                                                flow_clean(hn, predict(hn), sigma), base_clean, ha, hb)
                         stability = rms(other - derivative) / max(rms(derivative), 1e-15)
                         metrics["half_calibration"]["relative_first_order_change"] = stability
+                if cfg.steers and metrics["cancellation_or_repeat_limited"]:
+                    metrics.update(status="rejected", reason="response_below_repeat_floor")
+                    continue
                 basis.append(unit)
                 responses.append(derivative.flatten())
             if basis:
@@ -326,20 +400,22 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                 reference_selection="all", feature_update="bounded", sham=False,
                 feature_direction="repel", direction_trial=cfg.trial % 32,
             )
-            # Settings validates production grids; replay may use any supported grid.
-            replay_run = Run(replay_cfg, run.seed, run.start, run.noise_scale, 1, tuple(latent.shape),
+            replay_run = Run(replay_cfg, probe_seed, run.start, run.noise_scale, 1, tuple(latent.shape),
                              True, spectrum=run.spectrum, sol=run.sol, stage=run.stage)
             replay_frame = Frame(frame.grid, 1, frame.offset, "response", replay_run, sigma)
             if response.forwards + 1 + len(directions) <= cfg.auxiliary_budget:
                 spend(1)
-                replay_frame.reference = shadow_forward(executor, replay_run, replay_frame, x, timesteps,
-                                                        context, mask, refs, clean_options, kwargs, 0)
+                with torch.no_grad():
+                    replay_frame.reference = shadow_forward(executor, replay_run, replay_frame, x, timesteps,
+                                                            context, mask, refs, clean_options, kwargs, 0)
                 point["feature_reference_slots"] = replay_frame.reference_slots
                 for direction in directions:
                     info = {"arm": direction, "block": cfg.feature_block, "grid": cfg.feature_grid}
                     replay_frame.replay = (replace(cfg, feature_direction=direction), info)
                     replay_frame.replay_attention = executor.class_obj.blocks[cfg.feature_block].attn
                     replay_frame.seen = False
+                    replay_frame.taps = {} if baseline_taps is not None else None
+                    replay_frame.tap_from, replay_frame.tap_grid = cfg.feature_block, cfg.feature_grid
                     try:
                         v = predict(latent, replay_frame)
                     except ValueError as exc:
@@ -355,15 +431,28 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
                         info.update(status="completed", velocity_rms=rms(dv), clean_rms=rms(delta))
                         edit = info.get("realized_edit_l2", 0.0)
                         info["clean_per_edit_l2"] = float(torch.linalg.vector_norm(delta)) / edit if edit else None
+                        if baseline_taps is not None:
+                            info["later_block_pooled_attention_rms"] = {
+                                str(block): rms(value - baseline_taps[block])
+                                for block, value in replay_frame.taps.items() if block in baseline_taps
+                            }
                         if responses:
                             info.update(output_projection(delta, responses))
                         if cfg.mode == "feature_steer" and direction != "sham":
-                            candidates.append((base_clean + cfg.candidate_gain * delta, {"arm": direction}))
+                            candidates.append((base_clean + cfg.candidate_gain * delta, {
+                                "arm": direction, "response_alignment": info.get("explained_energy_fraction"),
+                            }))
                         if cfg.export and bool(torch.isfinite(clean).all()):
                             tensors[f"feature_{direction}_clean"] = clean
                     point["feature"].append(info)
             else:
                 point["feature"].append({"status": "skipped", "reason": "auxiliary_forward_budget"})
+        realized = {}
+        if cfg.steers:
+            for index, (clean, info) in enumerate(candidates):
+                corrected = velocity_for_clean(latent, clean, sigma).to(velocity.dtype)
+                realized[info["arm"]] = corrected
+                candidates[index] = (flow_clean(latent, corrected, sigma), info)
         selected, score = select_response(candidates, base_clean, cfg, noise_floor, point)
         point["baseline_external_score"] = score
         point["candidates"].extend(info for _, info in candidates)
@@ -371,7 +460,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity, actual):
         if not cfg.steers or selected is None:
             point["applied"] = False
         else:
-            corrected = (base_velocity.float() - (selected[0] - base_clean) / sigma).to(velocity.dtype)
+            corrected = realized[selected[1]["arm"]]
             actual_change = rms(sigma * (corrected.float() - base_velocity.float()))
             point["applied_clean_displacement_rms"] = actual_change
             point["applied"] = 1e-8 < actual_change <= cfg.clean_limit

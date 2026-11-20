@@ -1,5 +1,7 @@
 # Validation
 
+The [response guide](response.md#gpu-experiments) adds frozen-state Raw/Turbo comparisons, local scorer validation, and a bounded experiment sequence.
+
 ## CPU scope
 
 The tests use independent autograd references, a synthetic nonlinear initialization response, and the native ComfyUI backend with randomly initialized tiny Krea 2 weights. They cover sampler entry points, split/combined CFG, reference token slices, weight patches, disabled parity, Euler and ER-SDE, route accounting, staged Scale-Locked isolation, and the actual core Model Attention Backend and KJ diffusion loader overrides. The tests use CPU attention stand-ins for Kitchen and Sage kernels. The workflow tests check saved widget order, links and ComfyUI backend input validation. [CI](../.github/workflows/validation.yml) pins the integration sources.

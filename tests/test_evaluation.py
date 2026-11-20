@@ -138,13 +138,13 @@ def test_paired_fingerprints_and_edit_measurements():
     assert not analyze.paired_trajectory(guided, native)
 
 
-def test_defect_transition_counts_exclude_missing_scores():
+def test_defect_transition_counts_report_missing_separately():
     native = [{"seed": i, "id": f"n{i}"} for i in range(5)]
     guided = [{"seed": i, "id": f"g{i}"} for i in range(5)]
     ratings = {f"n{i}": {"anatomy_defect": v} for i, v in enumerate([1, 0, 1, 0, 1])}
     ratings.update({f"g{i}": {"anatomy_defect": v} for i, v in enumerate([0, 1, 1, 0, None])})
     assert analyze.defect_transitions(guided, native, ratings, "anatomy_defect") == {
-        "recovered": 1, "introduced": 1, "persistent": 1, "both_clear": 1,
+        "recovered": 1, "introduced": 1, "persistent": 1, "both_clear": 1, "missing": 1,
     }
 
 
@@ -176,3 +176,21 @@ def test_paired_analysis_and_blinded_assets(tmp_path):
     assert metrics["layout_edge_distance"]["mean_paired_delta"] > 0
     assert metrics["human_composition_distance"]["paired_prompt_bootstrap_95"] == [1.0, 1.0]
     assert metrics["quality"]["mean_paired_delta"] == 0
+
+
+def test_response_profile_and_offline_embeddings(tmp_path):
+    from types import SimpleNamespace
+
+    profiles = evaluate.load_profiles(Path(evaluate.__file__).with_name("response_profiles.json"))
+    args = SimpleNamespace(model="krea2", encoder="enc", vae="vae", weight_dtype="default",
+                           model_lora=None, identity_lora=None, negative="", width=1024, height=768,
+                           steps=8, cfg=1, sampler="euler", scheduler="simple", diagnostics=False,
+                           variants=profiles)
+    graph = evaluate.graph(args, "latent_steer", "prompt", 91, name="response")
+    assert graph["16"]["class_type"] == "ModeExplorerResponseKrea2"
+    assert graph["16"]["inputs"]["mode"] == "latent_steer"
+    assert graph["8"]["inputs"]["model"] == ["16", 0]
+    path = tmp_path / "embeddings.json"
+    path.write_text('{"dino_v2":{"a":[1,0],"b":[0,1]}}')
+    result = analyze.embedding_metrics([{"id": "a"}, {"id": "b"}], analyze.load_embeddings(path))
+    assert result == {"dino_v2_cosine_distance": 1.0, "dino_v2_vendi": 2.0}

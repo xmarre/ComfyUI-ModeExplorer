@@ -1,5 +1,7 @@
 # Research and numerical contracts
 
+The [response guide](response.md) derives the posterior tilt relationship in the native Krea 2 coordinates and describes its use in local probes and feature replay.
+
 Native ComfyUI Krea 2 Raw and Turbo use a single-stream DiT and the constant flow prediction contract. Krea's [reference inference code](https://github.com/krea-ai/krea-2/blob/main/sampling.py) uses velocity, device-generated Gaussian noise and Euler. ComfyUI usually draws noise on CPU and runs the requested solver. Krea's guidance uses v_cond + g(v_cond − v_uncond), equivalent to ComfyUI CFG of 1 + g. Turbo distillation, CFG and solver steps are separate experimental variables.
 
 | Source | Paper mechanism and adaptation |

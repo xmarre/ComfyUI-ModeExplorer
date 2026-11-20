@@ -1,5 +1,7 @@
 # Causal investigation of weak feature guidance
 
+Use the [response guide](response.md) for frozen-input feature replay, tangent and spatial controls, causal localization and downstream measurements.
+
 ModeExplorer's bounded feature edit can change a fixed seed's composition and local detail. The objective reduces similarity between independently initialized same-conditioned feature representations. It does not measure intra-image anatomical ambiguity, correctness, aesthetics, or texture. Exploratory visual observations are motivation for a mechanism study, not evidence of a general quality improvement.
 
 ## Exact intervention and competing explanations

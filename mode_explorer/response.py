@@ -1,5 +1,6 @@
 """Bounded empirical response measurements in native Krea 2 flow coordinates."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 
@@ -10,7 +11,7 @@ from .objectives import lift, reference_noise, seed_key
 
 BASES = ("gaussian", "coarse", "bilinear", "dct", "reference")
 MODES = ("latent_probe", "feature_replay", "joint_probe", "latent_steer", "feature_steer")
-POLICIES = ("response_rms", "minimum_change", "external", "export_only")
+POLICIES = ("response_rms", "minimum_change", "response_alignment", "external", "export_only")
 LOCALIZATIONS = ("whole", "only_raw", "remove_raw", "only_matched", "remove_matched")
 REPLAY_DIRECTIONS = ("repel", "reverse", "channel_sign", "sham", "tangent", "spatial_random")
 MAX_STATES = 2
@@ -47,6 +48,8 @@ class ResponseSettings:
     cell: int = -1
     export: bool = False
     checkpoint_label: str = ""
+    frozen_state: str = ""
+    downstream: bool = False
     scorer: object = None
 
     def __post_init__(self):
@@ -74,6 +77,10 @@ class ResponseSettings:
         ):
             if not low <= getattr(self, key) <= high:
                 raise ValueError(f"ModeExplorer response {key} must be in [{low}, {high}].")
+        if self.frozen_state and self.steers:
+            raise ValueError("Frozen-state replay requires a diagnostic or export-only mode.")
+        if self.selection == "response_alignment" and self.mode != "feature_steer":
+            raise ValueError("Output-response alignment is available for feature steering.")
         if self.feature_grid not in (2, 4, 6, 8):
             raise ValueError("Use a feature grid of 2, 4, 6, or 8.")
         if self.min_sigma > self.max_sigma:
@@ -257,6 +264,11 @@ def select_response(candidates, baseline, settings, noise_floor, provenance):
                 if score is None or score <= baseline_score:
                     info["reason"] = "no_valid_score_improvement"
                     continue
+            elif settings.selection == "response_alignment":
+                score = info.get("response_alignment")
+                if score is None or not math.isfinite(score):
+                    info["reason"] = "response_alignment_unavailable"
+                    continue
             else:
                 score = -change if settings.selection == "minimum_change" else change
             if score > best:
@@ -270,7 +282,7 @@ def select_response(candidates, baseline, settings, noise_floor, provenance):
 def get_score(scorer, clean, provenance):
     try:
         # Give the local scorer isolated storage and metadata.
-        value = scorer(clean.detach().clone(), dict(provenance))
-    except (ValueError, TypeError):
+        value = scorer(clean.detach().clone(), deepcopy(provenance))
+    except (ValueError, TypeError, RuntimeError, OSError):
         return None
     return float(value) if type(value) in (int, float) and math.isfinite(value) else None

@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageOps
 GROUPS = ("composition_group", "camera_group", "pose_group", "layout_group")
 DEFECT_RATINGS = ("artifact", "anatomy_defect", "relation_defect")
 RATINGS = (*GROUPS, "prompt_adherence", "quality", "artifact", "identity",
-           "anatomy_defect", "relation_defect", "detail_quality")
+           "anatomy_defect", "relation_defect", "detail_quality", "source_appearance")
 
 
 def describe(path):
@@ -196,7 +196,52 @@ def paired_trajectory(rows, baseline_rows):
             for sigma, values in by_sigma.items()}
 
 
-def metrics(root, rows, ratings, perceptual, keep_traces):
+def embedding_metrics(rows, spaces):
+    result = {}
+    for name, vectors in spaces.items():
+        if any(row["id"] not in vectors for row in rows) or len(rows) < 2:
+            result.update({f"{name}_cosine_distance": None, f"{name}_vendi": None})
+            continue
+        unit_vectors = np.stack([vectors[row["id"]] for row in rows])
+        gram = unit_vectors @ unit_vectors.T
+        scores = np.linalg.eigvalsh(gram / len(rows)).clip(0)
+        probabilities = scores[scores > 0] / scores.sum()
+        result[f"{name}_cosine_distance"] = float((1 - gram[np.triu_indices(len(rows), 1)]).mean())
+        result[f"{name}_vendi"] = float(np.exp(-(probabilities * np.log(probabilities)).sum()))
+    return result
+
+
+def load_embeddings(path):
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or not set(raw) <= {"dino_v2", "dreamsim"}:
+        raise ValueError("Use dino_v2 or dreamsim embedding maps keyed by blinded IDs.")
+    result = {}
+    for space, vectors in raw.items():
+        if not isinstance(vectors, dict) or not vectors:
+            raise ValueError("Each embedding map must contain the image vectors.")
+        values = {key: np.asarray(value, dtype=np.float64) for key, value in vectors.items()}
+        dimensions = {vec.shape for vec in values.values()}
+        if len(dimensions) != 1 or any(
+            v.ndim != 1 or not len(v) or not np.isfinite(v).all()
+            or not np.isfinite(np.linalg.norm(v)) or np.linalg.norm(v) <= 0 for v in values.values()
+        ):
+            raise ValueError("Embedding vectors must be finite, nonzero and share a dimension in each space.")
+        result[space] = {key: vector / np.linalg.norm(vector) for key, vector in values.items()}
+    return result
+
+
+def within_seed_composition(runs, ratings):
+    groups = defaultdict(list)
+    for row in runs:
+        label = ratings.get(row["id"], {}).get("composition_group")
+        groups[(row["prompt_id"], row["seed"])].append(label)
+    return [{"prompt_id": prompt_id, "seed": seed,
+             "rated_arms": sum(bool(label) for label in labels),
+             "distinct_compositions": len({label for label in labels if label})}
+            for (prompt_id, seed), labels in sorted(groups.items())]
+
+
+def metrics(root, rows, ratings, perceptual, keep_traces, embeddings=None):
     paths = [root / row["image"] for row in rows]
     features = [describe(path) for path in paths]
     result = {
@@ -206,9 +251,20 @@ def metrics(root, rows, ratings, perceptual, keep_traces):
         "sampled_peak_device_mib": average(row["sampled_peak_device_mib"] for row in rows),
         "total_dit_calls": average(sum(trace[k] for k in (
             "native_dit_calls", "feature_reference_dit_calls", "initialization_dit_calls",
-        )) for row in rows if (trace := row["trace"])),
+        )) + trace.get("response", {}).get("auxiliary_dit_calls", 0)
+                                   for row in rows if (trace := row["trace"])),
     }
     result["lpips"] = perceptual(paths) if perceptual is not None else None
+    response = [(row["trace"] or {}).get("response") for row in rows]
+    response = [item for item in response if item is not None]
+    if response:
+        result["response_completion_fraction"] = average(item["status"] == "completed" for item in response)
+        result["response_auxiliary_dit_calls"] = average(item["auxiliary_dit_calls"] for item in response)
+        points = [p for item in response for p in item["points"] if p["status"] == "completed"]
+        result["response_applied_fraction"] = average(p.get("applied", False) for p in points)
+        operators = [p["projected_response"] for p in points if "projected_response" in p]
+        for key in ("symmetry_error", "negative_spectral_mass", "effective_rank"):
+            result[f"response_{key}"] = average(operator[key] for operator in operators)
     review = [ratings.get(row["id"], {}) for row in rows]
     for group in GROUPS:
         names = [score.get(group) for score in review]
@@ -236,6 +292,8 @@ def metrics(root, rows, ratings, perceptual, keep_traces):
     for key in RATINGS[len(GROUPS):]:
         values = [score.get(key) for score in review]
         result[key] = average(values) if all(value is not None for value in values) else None
+    if embeddings:
+        result.update(embedding_metrics(rows, embeddings))
     if keep_traces:
         result.update(trajectory(rows))
     return result
@@ -256,11 +314,12 @@ def forecast_route_signature(run):
 
 def defect_transitions(rows, baseline_rows, ratings, key):
     reference = {row["seed"]: ratings.get(row["id"], {}).get(key) for row in baseline_rows}
-    counts = dict(recovered=0, introduced=0, persistent=0, both_clear=0)
+    counts = dict(recovered=0, introduced=0, persistent=0, both_clear=0, missing=0)
     for row in rows:
         before = reference.get(row["seed"])
         after = ratings.get(row["id"], {}).get(key)
         if before not in (0, 1) or after not in (0, 1):
+            counts["missing"] += 1
             continue
         label = {(1, 0): "recovered", (0, 1): "introduced",
                  (1, 1): "persistent", (0, 0): "both_clear"}[before, after]
@@ -268,25 +327,31 @@ def defect_transitions(rows, baseline_rows, ratings, key):
     return counts
 
 
-def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
+def analyze(root, runs, baseline, ratings, perceptual, keep_traces, embeddings=None):
     summaries = {}
     methods = partition(runs, "method")
     baseline_prompts = partition(methods[baseline], "prompt_id")
     baseline_cache = {}
     for method, group in methods.items():
         compared, n_seeds = {}, 0
-        defects = {key: dict(recovered=0, introduced=0, persistent=0, both_clear=0) for key in DEFECT_RATINGS}
+        defects = {key: dict(recovered=0, introduced=0, persistent=0, both_clear=0, missing=0)
+                   for key in DEFECT_RATINGS}
+        defect_prompt_deltas = {key: [] for key in DEFECT_RATINGS}
         for prompt_id, rows in partition(group, "prompt_id").items():
             native = baseline_prompts.get(prompt_id, [])
             matched = {r["seed"] for r in native} & {r["seed"] for r in rows}
-            if len(matched) < 2:
+            if not matched:
                 continue
             rows = [r for r in rows if r["seed"] in matched]
             native = [r for r in native if r["seed"] in matched]
             for key in DEFECT_RATINGS:
-                for label, count in defect_transitions(rows, native, ratings, key).items():
+                transitions = defect_transitions(rows, native, ratings, key)
+                for label, count in transitions.items():
                     defects[key][label] += count
-            data = metrics(root, rows, ratings, perceptual, keep_traces)
+                assessed = len(matched) - transitions["missing"]
+                if assessed:
+                    defect_prompt_deltas[key].append((transitions["introduced"] - transitions["recovered"]) / assessed)
+            data = metrics(root, rows, ratings, perceptual, keep_traces, embeddings)
             reference_routes = {row["seed"]: forecast_route_signature(row) for row in native}
             routes = [(forecast_route_signature(row), reference_routes[row["seed"]]) for row in rows]
             route_match = average(a == b for a, b in routes if a is not None and b is not None)
@@ -295,7 +360,7 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
             if method == baseline:
                 baseline_cache[cache_key] = data
             if cache_key not in baseline_cache:
-                baseline_cache[cache_key] = metrics(root, native, ratings, perceptual, keep_traces)
+                baseline_cache[cache_key] = metrics(root, native, ratings, perceptual, keep_traces, embeddings)
             ref = baseline_cache[cache_key]
             for key, value in data.items():
                 compared.setdefault(key, []).append((value, ref.get(key)))
@@ -303,7 +368,13 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
                 for key, value in paired_trajectory(rows, native).items():
                     compared.setdefault(key, []).append((value, 0.0))
             n_seeds += len(matched)
-        summaries[method] = {"matched_seed_pairs": n_seeds, "metrics": {}, "defect_transitions": defects}
+        summaries[method] = {
+            "matched_seed_pairs": n_seeds, "metrics": {}, "defect_transitions": defects,
+            "paired_defect_rate_delta": {
+                key: {"mean": average(deltas), "paired_prompt_bootstrap_95": bootstrap(deltas),
+                      "matched_prompts": len(deltas)} for key, deltas in defect_prompt_deltas.items()
+            },
+        }
         for key, records in compared.items():
             deltas = [a - b for a, b in records if a is not None and b is not None]
             summaries[method]["metrics"][key] = {
@@ -322,6 +393,7 @@ def main():
     p.add_argument("--review", action="store_true", help="Generate blinded contact sheets and a blank scoring CSV.")
     p.add_argument("--ratings", type=Path, help="A filled review CSV.")
     p.add_argument("--lpips-device", help="Optional LPIPS AlexNet calculation on the given torch device (cpu or cuda).")
+    p.add_argument("--embeddings", type=Path, help="Optional local per-image DINOv2 or DreamSim vectors for cosine and Vendi metrics.")
     p.add_argument("--trajectory", action="store_true", help="Compare pooled features and conditional x0 by actual sigma.")
     p.add_argument("--stage", choices=("final", "planner"), default="final")
     args = p.parse_args()
@@ -337,7 +409,11 @@ def main():
         review_assets(args.output, manifest, runs, args.stage)
     ratings = load_ratings(args.ratings)
     engine = perceptual_engine(args.lpips_device) if args.lpips_device else None
-    report = analyze(args.output, runs, args.baseline, ratings, engine, args.trajectory)
+    report = analyze(args.output, runs, args.baseline, ratings, engine, args.trajectory,
+                     load_embeddings(args.embeddings) if args.embeddings else None)
+    if ratings:
+        composition = args.output / f"within_seed_composition_{args.stage}.json"
+        composition.write_text(json.dumps(within_seed_composition(runs, ratings), indent=2) + "\n")
     filename = "summary.json" if args.stage == "final" else "summary_planner.json"
     (args.output / filename).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
 

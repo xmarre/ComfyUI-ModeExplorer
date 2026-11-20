@@ -27,6 +27,13 @@ PROFILE_CONTROLS = {
     "feature_direction", "direction_trial",
     "reference_budget", "strength", "fidelity", "min_sigma", "adaptive", "similarity", "diagnostics",
 }
+RESPONSE_CONTROLS = {
+    "mode", "basis", "probe_grid", "directions", "trial", "displacement", "norm", "calibration",
+    "min_sigma", "max_sigma", "evaluation", "states", "auxiliary_budget", "memory_mb", "clean_limit",
+    "candidate_gain", "selection", "response_direction", "all_actual", "feature_block", "feature_grid",
+    "feature_strength", "feature_direction", "localization", "head", "cell", "export", "checkpoint_label",
+    "frozen_state", "downstream",
+}
 SPECTRUM_CONTROLS = {
     "preset", "degree", "ridge", "warmup", "tail", "window", "growth", "max_history",
     "storage", "budget_mb", "debug", "bootstrap", "extrapolation_guard_enabled",
@@ -47,13 +54,18 @@ def load_profiles(path):
     for label, cfg in profiles.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", label) or not isinstance(cfg, dict):
             raise ValueError(f"Invalid profile {label!r}.")
-        if (set(cfg) - {"method", "settings", "spectrum", "spectrum_settings"}
+        if (set(cfg) - {"method", "settings", "spectrum", "spectrum_settings", "response", "model", "steps", "cfg"}
                 or cfg.get("method") not in METHODS
                 or cfg.get("spectrum", "off") not in {"off", "guarded", "full", "all_actual"}
                 or not isinstance(cfg.get("settings", {}), dict)
                 or not isinstance(cfg.get("spectrum_settings", {}), dict)
                 or set(cfg.get("settings", {})) - PROFILE_CONTROLS
-                or set(cfg.get("spectrum_settings", {})) - SPECTRUM_CONTROLS):
+                or set(cfg.get("spectrum_settings", {})) - SPECTRUM_CONTROLS
+                or not isinstance(cfg.get("response", {}), dict)
+                or set(cfg.get("response", {})) - RESPONSE_CONTROLS
+                or ("model" in cfg and (not isinstance(cfg["model"], str) or not cfg["model"]))
+                or ("steps" in cfg and (type(cfg["steps"]) is not int or not 1 <= cfg["steps"] <= 10000))
+                or ("cfg" in cfg and (type(cfg["cfg"]) not in (int, float) or not 0 <= cfg["cfg"] <= 100))):
             raise ValueError(f"Invalid options for profile {label!r}.")
     return profiles
 
@@ -63,17 +75,19 @@ def graph(args, method, prompt, seed, *, name):
     mode = profile["method"]
     feature, initialization = METHODS[mode]
     spectrum = profile.get("spectrum", "off")
+    checkpoint = profile.get("model", args.model)
+    steps, cfg = profile.get("steps", args.steps), profile.get("cfg", args.cfg)
     def node(kind, **inputs):
         return {"class_type": kind, "inputs": inputs}
 
     g = {
-        "1": node("UNETLoader", unet_name=args.model, weight_dtype=args.weight_dtype),
+        "1": node("UNETLoader", unet_name=checkpoint, weight_dtype=args.weight_dtype),
         "2": node("CLIPLoader", clip_name=args.encoder, type="krea2", device="default"),
         "3": node("VAELoader", vae_name=args.vae),
         "4": node("CLIPTextEncode", clip=["2", 0], text=prompt),
         "5": node("CLIPTextEncode", clip=["2", 0], text=args.negative),
         "6": node("EmptyLatentImage", width=args.width, height=args.height, batch_size=1),
-        "8": node("KSampler", model=["7", 0], seed=seed, steps=args.steps, cfg=args.cfg,
+        "8": node("KSampler", model=["7", 0], seed=seed, steps=steps, cfg=cfg,
                   sampler_name=args.sampler, scheduler=args.scheduler, positive=["4", 0], negative=["5", 0],
                   latent_image=["6", 0], denoise=1.0),
         "9": node("VAEDecode", samples=["8", 0], vae=["3", 0]),
@@ -95,6 +109,16 @@ def graph(args, method, prompt, seed, *, name):
         )
         g["7"]["inputs"].update(profile.get("settings", {}))
         model_input = ["7", 0]
+    if "response" in profile:
+        controls = {
+            "mode": "latent_probe", "basis": "bilinear", "probe_grid": 4, "directions": 2, "trial": 0,
+            "displacement": 0.02, "norm": "rms", "calibration": "repeat_and_half",
+            "min_sigma": 0.82, "max_sigma": 0.99999, "evaluation": -1, "states": 1,
+            "auxiliary_budget": 12, "memory_mb": 128, "checkpoint_label": checkpoint,
+        }
+        controls.update(profile["response"])
+        g["16"] = node("ModeExplorerResponseKrea2", model=model_input, enabled=True, **controls)
+        model_input = ["16", 0]
     if spectrum != "off":
         settings = {"enabled": True, "preset": getattr(args, "spectrum_preset", "turbo"),
                     "degree": 1, "ridge": 0.01, "warmup": 2, "tail": 1,
@@ -245,6 +269,8 @@ def parse_args():
     p.add_argument("--planner-megapixels", type=float, help="Run the real Scale-Locked node and export both planner and final images.")
     p.add_argument("--composition-lock-sigma", type=float, default=0.60)
     p.add_argument("--seed-count", type=int, choices=range(2, 17), default=16)
+    p.add_argument("--panel", type=Path, help="Local JSON with explicit case categories/prompts and optional seeds.")
+    p.add_argument("--panel-purpose", choices=("pilot", "held_out"), default="held_out")
     p.add_argument("--category", action="append", help="Restrict the prompt panel to this category.")
     p.add_argument("--repeats", type=int, choices=(1, 2, 3), default=1,
                    help="Repeat each same-seed job. Use a dedicated server with --cache-none and a readable --server-log.")
@@ -292,7 +318,26 @@ def main():
     with (args.out / "runs.jsonl").open("x", encoding="utf-8") as records:
         gallery = args.out / "images"
         gallery.mkdir()
-        prompts = json.loads(Path(__file__).with_name("prompts.json").read_text())
+        seeds = SEEDS[:2 if args.smoke else args.seed_count]
+        if args.panel:
+            panel = json.loads(args.panel.read_text())
+            if not isinstance(panel, dict) or set(panel) - {"prompts", "seeds"}:
+                raise ValueError("A local panel must contain prompts and may include seeds.")
+            prompts = panel.get("prompts")
+            if not isinstance(prompts, list) or not prompts or any(
+                not isinstance(row, list) or len(row) != 2 or not all(isinstance(item, str) and item for item in row)
+                for row in prompts
+            ):
+                raise ValueError("Local panel prompts must be [category, text] pairs.")
+            seeds = panel.get("seeds", seeds)
+            if (not isinstance(seeds, list) or not seeds
+                    or any(type(seed) is not int or not 0 <= seed < 2**64 for seed in seeds)
+                    or len(seeds) != len(set(seeds))):
+                raise ValueError("Local panel seeds must be distinct unsigned 64-bit integers.")
+            if args.smoke:
+                seeds = seeds[:2]
+        else:
+            prompts = json.loads(Path(__file__).with_name("prompts.json").read_text())
         if args.identity_lora:
             prompts += [["identity", f"Photograph of {args.identity_trigger} {setting}."] for setting in IDENTITY]
         if args.category:
@@ -302,7 +347,7 @@ def main():
         if not prompts:
             raise ValueError("The selected categories produced an empty prompt panel.")
         manifest = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-        manifest["seeds"] = SEEDS[:2 if args.smoke else args.seed_count]
+        manifest["seeds"] = seeds
         manifest["prompts"] = prompts
         (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         for method in args.methods:
@@ -318,6 +363,9 @@ def main():
                     result.update(
                         id=tag, method=method, prompt_id=i, category=category, seed=seed,
                         image=relative.as_posix(),
+                        checkpoint=workflow["1"]["inputs"]["unet_name"],
+                        weight_dtype=workflow["1"]["inputs"]["weight_dtype"],
+                        steps=workflow["8"]["inputs"]["steps"], cfg=workflow["8"]["inputs"]["cfg"],
                     )
                     if args.planner_megapixels is not None:
                         result["planner_image"] = relative.with_name(relative.stem + "_planner.png").as_posix()

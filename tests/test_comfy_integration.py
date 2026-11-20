@@ -297,9 +297,9 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     if scale_locked:
         assert asyncio.run(nodes.load_custom_node(scale_locked))
     for path in sorted((root / "examples").glob("*.json")):
-        if path.name == "spectrum_ab.json" and not spectrum_available:
+        if path.name in ("spectrum_ab.json", "response_spectrum.json") and not spectrum_available:
             continue
-        if path.name == "scale_locked_spectrum.json" and not (scale_locked and spectrum_available):
+        if path.name in ("scale_locked_spectrum.json", "response_scale_locked.json") and not (scale_locked and spectrum_available):
             continue
         graph = json.loads(path.read_text())
         node_map = {node["id"]: node for node in graph["nodes"]}

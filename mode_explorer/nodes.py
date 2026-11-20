@@ -159,6 +159,8 @@ class ModeExplorerResponse:
             "cell": number("INT", "cell", -1, 255, "Row-major pooled cell index, or -1 for all."),
             "export": ("BOOLEAN", {"default": False, "tooltip": "Write bounded local predicted-clean latents for VAE decoding and offline review."}),
             "checkpoint_label": ("STRING", {"default": "", "tooltip": "Experiment label for checkpoint and applied weight variants."}),
+            "frozen_state": ("STRING", {"default": "", "tooltip": "Optional local response export ID. Exact sigma, conditioning and representable input are required."}),
+            "downstream": ("BOOLEAN", {"default": False, "tooltip": "Measure pooled pre-gate attention differences at later blocks. Costs one matched baseline forward."}),
             "scorer": ("MODEEXPLORER_LOCAL_SCORER", {"tooltip": "Optional local clean-latent scorer. Higher must mean better under its documented metric."}),
         }}
 
@@ -172,16 +174,52 @@ class ModeExplorerResponse:
         if "feature_grid" in options:
             options["feature_grid"] = int(options["feature_grid"])
         config = ResponseSettings(**options) if enabled else None
+        if has_spectrum(model.model_options, model.wrappers):
+            raise RuntimeError("Apply the ModeExplorer Response node before Spectrum.")
         if enabled:
-            ModeExplorer.verify_model(model, config.feature_block if config.mode != "latent_probe" and config.mode != "latent_steer" else BLOCK)
-            if has_spectrum(model.model_options, model.wrappers):
-                raise RuntimeError("Apply the ModeExplorer Response node before Spectrum.")
+            block = BLOCK if config.mode in ("latent_probe", "latent_steer") else config.feature_block
+            ModeExplorer.verify_model(model, block)
+            verify_patch_graph(model.model_options, Settings(feature="native"), model.wrappers)
         if not samplers:
             clone, = ModeExplorer().apply(model, feature="native", diagnostics=True)
             settings = Settings(feature="native", diagnostics=False)
         else:
             settings = samplers[0].settings
+            if not enabled and settings.feature == "native" and not (settings.diagnostics or settings.initialization):
+                return ModeExplorer().apply(model, enabled=False)
             clone = model.clone()
         clone.remove_wrappers_with_key(WrappersMP.SAMPLER_SAMPLE, KEY)
         clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, config))
         return (clone,)
+
+
+
+class ModeExplorerLoadResponse:
+    CATEGORY = ModeExplorer.CATEGORY
+    RETURN_TYPES = ("LATENT", "SIGMAS")
+    RETURN_NAMES = ("predicted_clean", "matched_sigma_schedule")
+    FUNCTION = "load"
+    DESCRIPTION = "Load a private response export for ordinary VAE Decode and frozen-state replay."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "export_id": ("STRING", {"default": ""}),
+            "prediction": ("STRING", {"default": "baseline_clean", "tooltip": "Clean tensor name in the local export."}),
+        }}
+
+    def load(self, export_id, prediction):
+        import torch
+        from safetensors import safe_open
+        from .response_runtime import read_export
+
+        info, path = read_export(export_id)
+        sigma = info.get("sigma")
+        if type(sigma) not in (int, float) or not 0 < sigma <= 1:
+            raise ValueError("The exported evaluation has no usable flow sigma.")
+        with safe_open(path, framework="pt", device="cpu") as package:
+            if not prediction.endswith("_clean") or prediction not in package.keys():
+                raise ValueError("Choose an exported predicted-clean tensor.")
+            latent = package.get_tensor(prediction)
+        sigmas = torch.tensor([1.0, sigma, 0.0] if sigma < 1 else [1.0, 0.0])
+        return ({"samples": latent}, sigmas)

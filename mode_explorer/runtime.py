@@ -181,6 +181,9 @@ class Frame:
     reference_slots: list = field(default_factory=list)
     replay: object = None
     replay_attention: object = None
+    taps: dict | None = None
+    tap_from: int = 0
+    tap_grid: int = 4
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -460,7 +463,15 @@ def pooled_edit_metrics(before, after, pairs, proposal, repulsion, live, areas=N
 
 def attention_feature(output, options):
     frame = options.get(FRAME)
-    if frame is None or options.get("block_type") != "single" or options.get("block_index") != frame.run.settings.feature_block:
+    if frame is None or options.get("block_type") != "single":
+        return output
+    block = options.get("block_index")
+    if frame.taps is not None and block > frame.tap_from:
+        height, width = frame.grid
+        start, end = token_slice(options, output.shape[1], height * width)
+        frame.taps[block] = token_pool(output[frame.offset:frame.offset + frame.batch, start:end],
+                                       height, width, frame.tap_grid)
+    if frame.phase == "response_capture" or block != frame.run.settings.feature_block:
         return output
     if frame.seen:
         raise RuntimeError("ModeExplorer received the same Krea 2 attention callback twice in one forward.")
@@ -971,6 +982,8 @@ class SamplerWrapper:
             elif (not isinstance(sampling, ModelSamplingFlux)
                   or getattr(type(sampling), "timestep") is not ModelSamplingFlux.timestep):
                 eligibility = "unverified_flow_timestep"
+            elif response.steers and response.selection == "external" and response.scorer is None:
+                eligibility = "score_unavailable"
             elif response.steers and (feature_active or initialize):
                 eligibility = "use_native_model_for_response_steering"
             elif response.steers and settings.full_spectrum and spectrum is not None:
@@ -980,7 +993,8 @@ class SamplerWrapper:
                 if force_native is None:
                     eligibility = "missing_spectrum_all_actual_contract"
                     force_native = nullcontext()
-            run.response = ResponseRun(response, model_wrap.inner_model.process_latent_out, eligibility)
+            run.response = ResponseRun(response, model_wrap.inner_model.process_latent_out, eligibility,
+                                       cfg_scale=getattr(model_wrap, "cfg", None))
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:
@@ -1026,9 +1040,10 @@ class SamplerWrapper:
                 if run.response is not None:
                     rep = run.response
                     payload["response"] = {
-                        "schema": 1, "auxiliary_dit_calls": rep.forwards,
+                        "schema": 1, "auxiliary_dit_calls": rep.forwards, "auxiliary_guider_calls": 0,
                         "eligible_actual_positive_evaluations": rep.evaluation + 1,
-                        "status": "completed" if any(p["status"] == "completed" for p in rep.points) else "skipped",
+                        "status": ("completed" if any(p["status"] == "completed" for p in rep.points)
+                                   else "rejected" if any(p["status"] == "rejected" for p in rep.points) else "skipped"),
                         "reason": rep.eligibility or ("no_matching_actual_evaluation" if not rep.points else None),
                         "points": rep.points,
                     }
