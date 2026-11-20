@@ -1,0 +1,7 @@
+{
+  "native": {"method": "native", "spectrum": "all_actual"},
+  "cosine_actual": {"method": "cosine", "spectrum": "all_actual", "settings": {"adaptive": false}},
+  "cosine_guarded": {"method": "cosine", "spectrum": "guarded", "settings": {"adaptive": false}},
+  "cosine_full": {"method": "cosine", "spectrum": "full", "settings": {"adaptive": false}},
+  "cosine_full_sham": {"method": "cosine", "spectrum": "full", "settings": {"adaptive": false, "sham": true}}
+}
