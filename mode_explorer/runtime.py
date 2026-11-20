@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .objectives import (
+    cell_areas,
     cell_size,
     feature_shift,
     initial_direction,
@@ -21,6 +22,7 @@ from .objectives import (
     seed_key,
     select_candidate,
     token_pool,
+    unit_rows,
 )
 
 LOGGER = logging.getLogger("ModeExplorer")
@@ -36,6 +38,11 @@ MAX_INITIALIZATION_SECONDS = 45
 MAX_INITIALIZATION_NOISE_BYTES = 32 * 1024**2
 FEATURES = ("native", "feature_cosine", "feature_volume")
 OPERATIONS = ("auto", "sequential", "batch")
+REFERENCE_SOURCES = ("bank", "per_seed")
+REFERENCE_SELECTIONS = ("all", "closest")
+REFERENCE_CONTINUATIONS = ("first_estimate", "rolling_euler")
+FEATURE_UPDATES = ("bounded", "verified")
+FEATURE_GRIDS = (2, 4, 6, 8)
 CONDITION_FLAGS = frozenset({
     "area", "mask", "control", "hooks", "gligen", "start_percent", "end_percent",
     "timestep_start", "timestep_end", "default",
@@ -58,13 +65,25 @@ class Settings:
     # Forecasted evaluations cannot receive attention guidance.
     full_spectrum: bool = False
     initialization_trials: int = 3
+    feature_block: int = BLOCK
+    feature_grid: int = 4
+    cosine_temperature: float = 0.5
+    volume_bandwidth: float = 0.55
+    volume_median: bool = False
+    reference_source: str = "bank"
+    reference_bank_size: int = 8
+    reference_trajectories: int = 1
+    reference_selection: str = "all"
+    reference_continuation: str = "first_estimate"
+    feature_update: str = "bounded"
 
     def __post_init__(self):
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
             raise ValueError("ModeExplorer received an unknown feature or batch mode")
         for key, low, high in (
             ("strength", 0, 1), ("fidelity", 0, 1), ("min_sigma", 0.5, 1),
-            ("similarity", 0, 0.99),
+            ("similarity", 0, 0.99), ("cosine_temperature", 0.1, 2),
+            ("volume_bandwidth", 0.25, 1.25),
         ):
             if not low <= getattr(self, key) <= high:
                 raise ValueError(f"ModeExplorer {key} must be in [{low}, {high}]")
@@ -72,6 +91,22 @@ class Settings:
             raise ValueError("ModeExplorer reference_budget must be an integer in [0, 4]")
         if type(self.initialization_trials) is not int or not 1 <= self.initialization_trials <= 3:
             raise ValueError("ModeExplorer initialization_trials must be an integer in [1, 3]")
+        for key, low, high in (
+            ("feature_block", 0, 63), ("reference_bank_size", 2, 256),
+            ("reference_trajectories", 1, 3),
+        ):
+            value = getattr(self, key)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"ModeExplorer {key} must be an integer in [{low}, {high}]")
+        for key, choices in (
+            ("feature_grid", FEATURE_GRIDS), ("reference_source", REFERENCE_SOURCES),
+            ("reference_selection", REFERENCE_SELECTIONS), ("reference_continuation", REFERENCE_CONTINUATIONS),
+            ("feature_update", FEATURE_UPDATES),
+        ):
+            if getattr(self, key) not in choices:
+                raise ValueError(f"ModeExplorer received an unknown {key}")
+        if self.reference_source == "bank" and self.reference_trajectories > self.reference_bank_size:
+            raise ValueError("ModeExplorer reference bank must fit all trajectories")
         if type(self.full_spectrum) is not bool:
             raise ValueError("ModeExplorer full_spectrum must be a boolean")
 
@@ -94,11 +129,21 @@ class Run:
     feature_attempts: int = 0
     spectrum_forecasts: int = 0
     spectrum: object = None
-    shadow_noise: torch.Tensor | None = None
-    shadow_clean: torch.Tensor | None = None
-    shadow_start: float | None = None
+    shadows: dict = field(default_factory=dict)
+    stage: str = "standalone"
+    decisions: list = field(default_factory=list)
     points: list[dict] = field(default_factory=list)
     reasons: set[str] = field(default_factory=set)
+
+
+@dataclass
+class Shadow:
+    noise: torch.Tensor
+    first_sigma: float
+    sigma: float
+    clean: torch.Tensor | None = None
+    latent: torch.Tensor | None = None
+    velocity: torch.Tensor | None = None
 
 
 @dataclass
@@ -114,6 +159,7 @@ class Frame:
     pooled: torch.Tensor | None = None
     metrics: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     seen: bool = False
+    prepare: object = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -160,7 +206,7 @@ def verified_spectrum(tree):
                        for var in (getattr(runtime, "CURRENT", None), getattr(adapter, "CAPTURE", None))
                        for method in ("get", "set", "reset"))):
         raise RuntimeError("ModeExplorer could not verify Spectrum's scoped state contract.")
-    return owner, runtime.CURRENT, adapter.CAPTURE
+    return owner, runtime.CURRENT, adapter.CAPTURE, getattr(adapter, "MODE_EXPLORER_DEFERRED_PROBES", False) is True
 
 
 @contextmanager
@@ -169,7 +215,7 @@ def isolated_spectrum_reference(run):
     if run.spectrum is None:
         yield
         return
-    owner, current, capture = run.spectrum
+    owner, current, capture, _ = run.spectrum
     session = current.get()
     if session is not None and session.binding is not owner:
         raise RuntimeError("ModeExplorer encountered a foreign Spectrum session.")
@@ -185,7 +231,7 @@ def isolated_spectrum_reference(run):
 def spectrum_forecast_count(run):
     if run.spectrum is None:
         return None
-    owner, current, _ = run.spectrum
+    owner, current, _, _ = run.spectrum
     session = current.get()
     return session.counts["forecast"] if session is not None and session.binding is owner else None
 
@@ -248,7 +294,7 @@ def equal_condition_pairs(batch: int, offset: int, context, attention_mask, ref_
 
 def attention_feature(output, options):
     frame = options.get(FRAME)
-    if frame is None or options.get("block_type") != "single" or options.get("block_index") != BLOCK:
+    if frame is None or options.get("block_type") != "single" or options.get("block_index") != frame.run.settings.feature_block:
         return output
     if frame.seen:
         raise RuntimeError("ModeExplorer received the same Krea 2 attention callback twice in one forward.")
@@ -257,21 +303,35 @@ def attention_feature(output, options):
     start, end = token_slice(options, output.shape[1], height * width)
     numbers = frame.offset, frame.offset + frame.batch
     image = output[numbers[0]:numbers[1], start:end]
-    current = token_pool(image, height, width)
+    settings = frame.run.settings
+    current = token_pool(image, height, width, settings.feature_grid)
     if frame.phase == "anchor":
         frame.pooled = current
         return output
 
-    settings = frame.run.settings
     if settings.diagnostics and len(frame.run.points) < MAX_POINTS:
         frame.pooled = current
-    if frame.pairs is None:
-        return output
+    pairs = frame.pairs
     if frame.reference is not None:
-        current = torch.cat((current, frame.reference), dim=0)
+        reference = frame.reference
+        if settings.reference_selection == "closest" and len(reference) > 1:
+            joined = torch.cat((current, reference), dim=0)
+            unit, _, valid = unit_rows((joined - joined.mean(dim=(-1, -2), keepdim=True)).flatten(1))
+            sim = (unit[1:] @ unit[0]).masked_fill(~valid[1:, 0], -torch.inf)
+            reference = reference.index_select(0, sim.argmax().reshape(1))
+        current = torch.cat((current, reference), dim=0)
+        pairs = ~torch.eye(len(current), device=output.device, dtype=torch.bool)
+    if pairs is None:
+        return output
+    areas = None
+    if settings.feature_update == "verified":
+        areas = cell_areas(height, width, *current.shape[-2:], settings.feature_grid, output.device)
+    frame.run.feature_attempts += 1
     shift, redundancy, loss = feature_shift(
-        current, frame.pairs, settings.feature, settings.strength, settings.fidelity,
-        settings.adaptive, settings.similarity,
+        current, pairs, settings.feature, settings.strength, settings.fidelity,
+        settings.adaptive, settings.similarity, temperature=settings.cosine_temperature,
+        bandwidth=settings.volume_bandwidth, median_bandwidth=settings.volume_median,
+        live=frame.batch, areas=areas,
     )
     if settings.diagnostics and len(frame.run.points) < MAX_POINTS:
         frame.metrics = (
@@ -280,12 +340,11 @@ def attention_feature(output, options):
         )
     result = output.clone()
     view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
-    sy, sx = cell_size(height, width)
-    # Broadcasting per cell avoids materializing a second full attention tensor.
+    sy, sx = cell_size(height, width, settings.feature_grid)
+    # Expand a single coarse cell row over width, with no full-size delta tensor.
     for iy in range(shift.shape[-2]):
-        for ix in range(shift.shape[-1]):
-            delta = shift[:frame.batch, :, iy, ix].to(output.dtype)[:, None, None, :]
-            view[:, iy * sy:(iy + 1) * sy, ix * sx:(ix + 1) * sx].add_(delta)
+        delta = shift[:frame.batch, :, iy].to(output.dtype).repeat_interleave(sx, dim=-1)
+        view[:, iy * sy:(iy + 1) * sy].add_(delta[:, :, :width].transpose(1, 2)[:, None])
     return result
 
 
@@ -324,7 +383,8 @@ def record(frame, x, velocity):
     rows = slice(frame.offset, frame.offset + frame.batch)
     x0 = x[rows].float() - frame.sigma * velocity[rows].float()
     point = {
-        "kind": "trajectory", "sigma": frame.sigma,
+        "kind": "trajectory", "sigma": frame.sigma, "block": frame.run.settings.feature_block,
+        "grid": list(frame.pooled.shape[-2:]),
         "attention": summary(frame.pooled - frame.pooled.mean(dim=(-1, -2), keepdim=True)),
         "conditional_x0": summary(pool(spatial_image(x0))),
     }
@@ -334,24 +394,36 @@ def record(frame, x, velocity):
     frame.run.points.append(point)
 
 
-def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs):
+def reference_slot(settings, seed, index):
+    if settings.reference_source == "bank":
+        return 2 + (seed_key(seed, "single-reference-assignment") + index) % settings.reference_bank_size
+    return seed_key(seed, f"feature-trajectory-{index}")
+
+
+def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs, index):
     from comfy.model_management import throw_exception_if_processing_interrupted
 
     throw_exception_if_processing_interrupted()
     row = slice(frame.offset, frame.offset + 1)
-    if run.shadow_noise is None:
-        slot = seed_key(run.seed, "single-reference-assignment") % 8
-        run.shadow_noise = reference_noise(x[row], slot + 2).float() * run.noise_scale
-        run.shadow_start = frame.sigma
-    shadow = frame.sigma * run.shadow_noise
-    if run.shadow_clean is not None:
-        shadow = shadow + (1 - frame.sigma / run.shadow_start) * run.shadow_clean
+    settings = run.settings
+    state = run.shadows.get(index)
+    rolling = settings.reference_continuation == "rolling_euler"
+    if state is None:
+        noise = reference_noise(x[row], reference_slot(settings, run.seed, index)).float() * run.noise_scale
+        state = Shadow(noise, frame.sigma, frame.sigma)
+        run.shadows[index] = state
+    if rolling and state.latent is not None:
+        shadow = state.latent + (frame.sigma - state.sigma) * state.velocity
+    else:
+        initial_sigma = run.start if rolling else frame.sigma
+        shadow = initial_sigma * state.noise
+        if state.clean is not None:
+            shadow = shadow + (1 - frame.sigma / state.first_sigma) * state.clean
     shadow = shadow.to(x.dtype)
     anchor = Frame(frame.grid, 1, 0, "anchor", run, frame.sigma)
-    positive_index = frame.offset  # single-sample frames have one row per CFG chunk
     probe_options = {
         **options, FRAME: anchor, "cond_or_uncond": [0],
-        "uuids": options.get("uuids", [None] * x.shape[0])[positive_index:positive_index + 1],
+        "uuids": options.get("uuids", [None] * x.shape[0])[frame.offset:frame.offset + 1],
     }
 
     def row_of(tensor):
@@ -365,9 +437,26 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         )
     if not anchor.seen:
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook during the reference forward.")
-    if run.shadow_clean is None:
-        run.shadow_clean = shadow.float() - frame.sigma * velocity.float()
+    if rolling:
+        state.latent, state.velocity, state.sigma = shadow.float(), velocity.float(), frame.sigma
+    elif state.clean is None:
+        state.clean = shadow.float() - frame.sigma * velocity.float()
     return anchor.pooled
+
+
+def guidance_pending(model_options, sigma):
+    run = model_options.get("transformer_options", {}).get(RUN)
+    return (type(run) is Run and run.feature_active and run.phase == "sample"
+            and sigma_eligible(sigma, run.settings.min_sigma)
+            and (run.batch > 1 or run.reference_calls < run.settings.reference_budget))
+
+
+def prepare_native_options(options):
+    """Run pending reference probes immediately before a qualified actual DiT."""
+    frame = options.get(FRAME)
+    if type(frame) is Frame and frame.prepare is not None:
+        prepare, frame.prepare = frame.prepare, None
+        prepare()
 
 
 def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_latents=None,
@@ -383,6 +472,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         return executor(*arguments, **kwargs)
     run.native_dit_calls += 1
     before_forecast = spectrum_forecast_count(run)
+    prior_refs = run.reference_calls
 
     def forward(args):
         result = executor(*args, **kwargs)
@@ -390,6 +480,12 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         if before_forecast is not None and after is not None and after > before_forecast:
             run.spectrum_forecasts += after - before_forecast
             run.native_dit_calls -= 1
+        if run.settings.diagnostics and len(run.decisions) < 256:
+            run.decisions.append({
+                "route": "forecast" if before_forecast is not None and after is not None and after > before_forecast else "actual",
+                "branches": list(options.get("cond_or_uncond", ())),
+                "reference_calls": run.reference_calls - prior_refs,
+            })
         return result
 
     if not (run.feature_active or run.settings.diagnostics) or spatial_image(x) is None:
@@ -423,20 +519,27 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     patch = executor.class_obj.patch
     grid = tuple(math.ceil(size / patch) for size in x.shape[-2:])
     frame = Frame(grid, run.batch, offset, "sample", run, low)
-    if active and run.batch == 1 and run.reference_calls < run.settings.reference_budget:
-        # Use the first eligible actual evaluation even if the solver adjusts its
-        # initial sigma. Do not extrapolate the shadow above its start.
-        if run.shadow_start is None or low <= run.shadow_start:
-            frame.reference = shadow_forward(
-                executor, run, frame, x, timesteps, context, attention_mask,
-                ref_latents, options, kwargs,
-            )
-            frame.pairs = ~torch.eye(2, device=x.device, dtype=torch.bool)
+    if grid == (1, 1):
+        active = False
+        run.reasons.add("degenerate_feature_grid")
+    if active and run.batch == 1:
+        def prepare():
+            remaining = run.settings.reference_budget - run.reference_calls
+            indices = range(min(run.settings.reference_trajectories, remaining))
+            references = [
+                shadow_forward(executor, run, frame, x, timesteps, context, attention_mask,
+                               ref_latents, options, kwargs, index)
+                for index in indices
+                if index not in run.shadows or low <= run.shadows[index].sigma
+            ]
+            if references:
+                frame.reference = torch.cat(references, dim=0)
+        frame.prepare = prepare
+        if run.spectrum is None or not run.spectrum[3]:
+            prepare_native_options({FRAME: frame})
     elif active and run.batch > 1:
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)
-    if frame.pairs is not None:
-        run.feature_attempts += 1
-    if frame.pairs is None and not trace:
+    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace:
         return forward(arguments)
     result = forward((*arguments[:-1], {**options, FRAME: frame}))
     if not frame.seen:
@@ -619,7 +722,7 @@ class SamplerWrapper:
         if not math.isfinite(scale) or scale <= 0:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
-                  spectrum=spectrum, reasons=reasons)
+                  spectrum=spectrum, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:
@@ -646,10 +749,10 @@ class SamplerWrapper:
             completed = True
             return result
         finally:
-            run.shadow_noise = run.shadow_clean = None
+            run.shadows.clear()
             if settings.diagnostics:
                 payload = {
-                    "seed": run.seed, "completed": completed, "batch": batch,
+                    "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
                     "seconds": time.perf_counter() - begin, "reasons": sorted(run.reasons),
                     "native_dit_calls": run.native_dit_calls, "feature_reference_dit_calls": run.reference_calls,
                     "initialization_dit_calls": run.initialization_dit_calls,
@@ -657,6 +760,6 @@ class SamplerWrapper:
                     "feature_attempts": run.feature_attempts, "spectrum_forecast_calls": run.spectrum_forecasts,
                     "spectrum_policy": ("full" if settings.full_spectrum else "guarded")
                         if spectrum is not None else "none",
-                    "points": run.points,
+                    "points": run.points, "decisions": run.decisions,
                 }
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))

@@ -21,26 +21,31 @@ def reference_noise(like: torch.Tensor, slot: int) -> torch.Tensor:
     return sample.to(device=like.device, dtype=like.dtype).expand_as(like)
 
 
-def cell_size(height: int, width: int) -> tuple[int, int]:
-    return math.ceil(height / 4), math.ceil(width / 4)
+def cell_size(height: int, width: int, grid: int = 4) -> tuple[int, int]:
+    return math.ceil(height / grid), math.ceil(width / grid)
 
 
-def pool(images: torch.Tensor) -> torch.Tensor:
-    extent = cell_size(*images.shape[-2:])
+def pool(images: torch.Tensor, grid: int = 4) -> torch.Tensor:
+    extent = cell_size(*images.shape[-2:], grid)
     return F.avg_pool2d(images, extent, stride=extent, ceil_mode=True).float()
 
 
-def token_pool(tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    return pool(tokens.transpose(1, 2).unflatten(-1, (height, width)))
+def token_pool(tokens: torch.Tensor, height: int, width: int, grid: int = 4) -> torch.Tensor:
+    return pool(tokens.transpose(1, 2).unflatten(-1, (height, width)), grid)
 
 
-def lift(cells: torch.Tensor, height: int, width: int, *, adjoint: bool = False) -> torch.Tensor:
+def cell_areas(height: int, width: int, rows: int, cols: int, grid: int, device):
+    sy, sx = cell_size(height, width, grid)
+    ny = (height - sy * torch.arange(rows, device=device)).clamp(max=sy)
+    nx = (width - sx * torch.arange(cols, device=device)).clamp(max=sx)
+    return ny[:, None] * nx[None, :]
+
+
+def lift(cells: torch.Tensor, height: int, width: int, *, adjoint: bool = False, grid: int = 4) -> torch.Tensor:
     """Broadcast cell offsets, or divide by the actual cell area for the pooling adjoint."""
-    sy, sx = cell_size(height, width)
+    sy, sx = cell_size(height, width, grid)
     if adjoint:
-        ny = (height - sy * torch.arange(cells.shape[-2], device=cells.device)).clamp(max=sy)
-        nx = (width - sx * torch.arange(cells.shape[-1], device=cells.device)).clamp(max=sx)
-        cells = cells / (ny[:, None] * nx[None, :])
+        cells = cells / cell_areas(height, width, *cells.shape[-2:], grid, cells.device)
     return cells.repeat_interleave(sy, dim=-2).repeat_interleave(sx, dim=-1)[..., :height, :width]
 
 
@@ -58,6 +63,7 @@ def objective(
     eligible: torch.Tensor,
     style: str,
     bandwidth: float | torch.Tensor = 0.55,
+    temperature: float | torch.Tensor = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return descent direction, strongest eligible cosine, and objective per cohort.
 
@@ -70,9 +76,9 @@ def objective(
         cosine = (unit @ unit.transpose(-1, -2)).clamp(-1, 1)
         nearest = cosine.masked_fill(~eligible, -1).amax(dim=-1, keepdim=True)
         if style == "feature_cosine":
-            logits = (cosine / 0.5).masked_fill(~eligible, -torch.inf)
+            logits = (cosine / temperature).masked_fill(~eligible, -torch.inf)
             weights = logits.flatten(-2).softmax(dim=-1).unflatten(-1, cosine.shape[-2:]).nan_to_num()
-            grad_unit = (2 / 0.5) * (weights @ unit)
+            grad_unit = 2 * ((weights / temperature) @ unit)
             count = eligible.sum(dim=(-1, -2)).clamp_min(1)
             loss = logits.flatten(-2).logsumexp(dim=-1) - count.log()
             loss = torch.where(eligible.any(dim=-1).any(dim=-1), loss, 0)
@@ -88,8 +94,8 @@ def objective(
             factor = torch.where(ok, factor, identity)
             inverse_factor = torch.linalg.solve_triangular(factor, identity.expand_as(factor), upper=False)
             inv = inverse_factor.transpose(-1, -2) @ inverse_factor
-            weights = inv * kernel
-            grad_unit = (2 / bw2) * (weights.sum(dim=-1, keepdim=True) * unit - weights @ unit)
+            weights = inv * kernel / bw2
+            grad_unit = 2 * (weights.sum(dim=-1, keepdim=True) * unit - weights @ unit)
             grad_unit = torch.where(ok, grad_unit, 0)
             loss = -2 * factor.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)
         else:
@@ -106,14 +112,36 @@ def feature_shift(
     fidelity: float,
     adaptive: bool,
     threshold: float,
+    *, temperature: float = 0.5, bandwidth: float = 0.55,
+    median_bandwidth: bool = False, live: int | None = None,
+    areas: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    centered = features - features.mean(dim=(-1, -2), keepdim=True)
-    direction, nearest, loss = objective(centered.flatten(1), eligible, style)
-    _, size, _ = unit_rows(centered.flatten(1))
+    def center(values):
+        if areas is None:
+            return values - values.mean(dim=(-1, -2), keepdim=True)
+        return values - (values * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum()
+
+    centered = center(features).flatten(1)
+    # The gradient for one competitor has a fixed direction. Keep its
+    # established magnitude, including the existing saturation function.
+    if temperature != 0.5 or bandwidth != 0.55 or median_bandwidth:
+        unit, _, valid = unit_rows(centered)
+        peers = (eligible & valid & valid.T).sum(dim=-1) >= 2
+        collective = peers[:, None] & peers[None, :]
+        if style == "feature_cosine":
+            temperature = torch.where(collective, temperature, 0.5)
+        else:
+            if median_bandwidth:
+                distances = (2 - 2 * (unit @ unit.T).clamp(-1, 1)).clamp_min(0).sqrt()
+                distances = distances.masked_fill(~(eligible & collective & valid & valid.T), torch.nan)
+                bandwidth = distances.nanmedian().nan_to_num(nan=0.55).clamp(0.25, 1.25)
+            bandwidth = torch.where(collective, bandwidth, 0.55)
+    direction, nearest, loss = objective(centered, eligible, style, bandwidth, temperature)
+    _, size, _ = unit_rows(centered)
     relative = (direction * size).reshape_as(features)
     # Pullback through centering. A common per-sample scale preserves the
     # coarse-grid channel means while respecting the tightest local bound.
-    relative = relative - relative.mean(dim=(-1, -2), keepdim=True)
+    relative = center(relative)
     magnitude = torch.linalg.vector_norm(relative.flatten(1), dim=-1, keepdim=True)
     direction = relative / magnitude.clamp_min(EPS)[..., None, None]
     cell_norm = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
@@ -123,7 +151,27 @@ def feature_shift(
     if adaptive:
         rate = rate * ((nearest - threshold) / (1.0 - threshold)).clamp(0, 1)
     limit = (anchor_norm / cell_norm.clamp_min(EPS)).amin(dim=(-1, -2), keepdim=True)
-    return direction * limit * rate[..., None, None], nearest.squeeze(-1), loss
+    shift = direction * limit * rate[..., None, None]
+    if areas is not None:
+        # Verify a small, area-weighted feature edit against the actual pooled
+        # objective. Moving reference rows would certify a different edit.
+        if live is not None:
+            shift[live:] = 0
+        dims = (-1, -2, -3)
+        anchor_energy = (features.nan_to_num().square() * areas).sum(dim=dims)
+        shift_energy = (shift.square() * areas).sum(dim=dims)
+        multiplier = (0.08 * (anchor_energy / shift_energy.clamp_min(EPS)).sqrt()).clamp(max=1)
+        shift = shift * multiplier[:, None, None, None]
+        result = torch.zeros_like(shift)
+        accepted = torch.zeros_like(loss, dtype=torch.bool)
+        for scale in (1.0, 0.5, 0.25):
+            proposed = shift * scale
+            _, _, actual_loss = objective(center(features + proposed).flatten(1), eligible, style, bandwidth, temperature)
+            passes = torch.isfinite(actual_loss) & (actual_loss < loss - EPS)
+            result = torch.where(passes & ~accepted, proposed, result)
+            accepted = accepted | passes
+        shift = result
+    return shift, nearest.squeeze(-1), loss
 
 
 def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: float | torch.Tensor) -> torch.Tensor:
