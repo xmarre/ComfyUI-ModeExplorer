@@ -2,7 +2,7 @@
 
 ## CPU scope
 
-The tests use independent autograd references, a synthetic nonlinear initialization response, and the native ComfyUI backend with randomly initialized tiny Krea 2 weights. They cover sampler entry points, split/combined CFG, reference token slices, weight patches, disabled parity, Euler and ER-SDE, route accounting, and staged Scale-Locked isolation. The workflow tests check saved widget order, links and ComfyUI backend input validation. [CI](../.github/workflows/validation.yml) pins the integration sources.
+The tests use independent autograd references, a synthetic nonlinear initialization response, and the native ComfyUI backend with randomly initialized tiny Krea 2 weights. They cover sampler entry points, split/combined CFG, reference token slices, weight patches, disabled parity, Euler and ER-SDE, route accounting, staged Scale-Locked isolation, and the KJ diffusion loader’s Sage override using a CPU attention stand-in. The workflow tests check saved widget order, links and ComfyUI backend input validation. [CI](../.github/workflows/validation.yml) pins the integration sources.
 
 Full-checkpoint perceptual quality, optimum block and grid, memory peaks, and runtime require production measurements.
 

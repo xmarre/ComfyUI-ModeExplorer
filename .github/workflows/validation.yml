@@ -50,6 +50,11 @@ jobs:
           repository: xmarre/ComfyUI-ScaleLockedResidualDiffusion
           ref: 129484bd676be55e3af0f2ea7fa6ae60e4a4ec5b
           path: .scale-locked
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-KJNodes
+          ref: ef7156d3590dc6cdcc9a13799c9f2a025612f03c
+          path: .kjnodes
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -61,5 +66,6 @@ jobs:
         env:
           PYTHONPATH: "${{ github.workspace }}/.comfyui:${{ github.workspace }}/.spectrum:${{ github.workspace }}/.sol:${{ github.workspace }}"
           MODEEXPLORER_SCALE_LOCKED: "${{ github.workspace }}/.scale-locked"
+          MODEEXPLORER_KJNODES: "${{ github.workspace }}/.kjnodes"
         run: python -m pytest -q tests
 

@@ -264,3 +264,61 @@ def test_live_spectrum_mismatch_keeps_native_guidance(caplog, model, monkeypatch
     assert report["forecast"] == 0 and report["actual"] == len(SIGMAS) - 1
     assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_kj_loader_sage_override_preserves_guidance_and_spectrum(caplog, model, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    import sys
+    from types import ModuleType
+
+    kj_root = os.environ.get("MODEEXPLORER_KJNODES")
+    if not kj_root:
+        pytest.skip("KJNodes checkout is optional")
+    path = Path(kj_root) / "nodes/model_optimization_nodes.py"
+    spec = importlib.util.spec_from_file_location("test_kj.nodes.model_optimization_nodes", path)
+    kj = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, kj)
+    spec.loader.exec_module(kj)
+
+    calls = []
+
+    def sageattn(q, k, v, is_causal=False, attn_mask=None, tensor_layout="NHD"):
+        calls.append(tensor_layout)
+        if tensor_layout == "NHD":
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask, is_causal=is_causal)
+        return out.transpose(1, 2) if tensor_layout == "NHD" else out
+
+    backend = ModuleType("sageattention")
+    backend.sageattn = sageattn
+    monkeypatch.setitem(sys.modules, "sageattention", backend)
+    monkeypatch.setattr(kj.folder_paths, "get_full_path_or_raise", lambda *args: str(path))
+    monkeypatch.setattr(kj, "_load_diffusion_model_kj", lambda *a, **kw: model.clone())
+    monkeypatch.setattr(kj, "args", type("Args", (), {"fast": set()})())
+    loaded, = kj.DiffusionModelLoaderKJ().patch_and_load("tiny", "default", "default", False, "auto", False)
+    override = loaded.model_options["transformer_options"]["optimized_attention_override"]
+
+    caplog.set_level(logging.INFO)
+    guided, = ModeExplorer().apply(loaded, adaptive=False, diagnostics=True)
+    assert guided.model_options["transformer_options"]["optimized_attention_override"] is override
+    assert not torch.equal(draw(loaded, sigmas=SIGMAS), draw(guided, sigmas=SIGMAS))
+    assert logs(caplog, "MODEEXPLORER_TRACE ")[-1]["feature_reference_dit_calls"] == 2
+    calls.clear()
+
+    result = draw(spectrum(guided), sigmas=SIGMAS)
+    assert torch.isfinite(result).all() and calls
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert report["fallback"] is None and report["forecast"] > 0
+    assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
+
+    foreign = loaded.clone()
+
+    def unrelated(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    unrelated.__name__ = override.__name__
+    foreign.model_options["transformer_options"]["optimized_attention_override"] = unrelated
+    with pytest.raises(RuntimeError, match="unrecognized optimized_attention_override"):
+        ModeExplorer().apply(foreign)

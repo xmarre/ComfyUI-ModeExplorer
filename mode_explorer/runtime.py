@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
+from types import FunctionType
 from dataclasses import dataclass, field
 
 import torch
@@ -218,6 +219,30 @@ def verified_spectrum(tree):
     return owner, runtime.CURRENT, adapter.CAPTURE, matches
 
 
+def is_kj_loader_sage(override):
+    """Recognize the actual KJ diffusion loader's Sage output dispatcher."""
+    if not isinstance(override, FunctionType):
+        return False
+    module = sys.modules.get(override.__module__)
+    if (module is None or not module.__name__.endswith(".nodes.model_optimization_nodes")
+            or override.__globals__ is not vars(module)):
+        return False
+    loader = getattr(module, "DiffusionModelLoaderKJ", None)
+    load = getattr(loader, "patch_and_load", None)
+    factory = getattr(module, "get_sage_func", None)
+    if (not isinstance(load, FunctionType) or not isinstance(factory, FunctionType)
+            or not any(code is override.__code__ for code in load.__code__.co_consts)
+            or override.__name__ != "attention_override_sage"
+            or override.__code__.co_freevars != ("new_attention",)):
+        return False
+    try:
+        attention = getattr(override.__closure__[0].cell_contents, "__wrapped__", None)
+    except ValueError:  # empty closure cell
+        return False
+    return (isinstance(attention, FunctionType) and attention.__globals__ is vars(module)
+            and any(code is attention.__code__ for code in factory.__code__.co_consts))
+
+
 def verified_sol(options, registered):
     trans = options.get("transformer_options", {})
     override = trans.get("optimized_attention_override")
@@ -226,8 +251,11 @@ def verified_sol(options, registered):
     outer = tree.get("outer_sample", {}).get(SOL_KEY, ())
     diffusion = tree.get("diffusion_model", {}).get(SOL_KEY, ())
     if marker is None and not outer and not diffusion:
-        if override is not None:
-            raise RuntimeError("ModeExplorer requires native or verified Sol-Krea2 attention.")
+        if override is not None and not is_kj_loader_sage(override):
+            raise RuntimeError(
+                "ModeExplorer found an unrecognized optimized_attention_override. "
+                "Use native attention, the supported KJ diffusion loader Sage settings, or verified Sol-Krea2."
+            )
         return None
     module = sys.modules.get("sol_h3.krea2")
     owner = getattr(override, "_sol_krea2_owner", None)
