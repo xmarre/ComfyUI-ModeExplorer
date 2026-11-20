@@ -97,6 +97,27 @@ def test_discovery_and_clone_ownership(model):
     assert torch.equal(draw(model), draw(disabled))
 
 
+def test_milli_strength_widget_and_runtime(model, caplog):
+    from comfy.patcher_extension import WrappersMP
+
+    node = ModeExplorer()
+    kind, spec = node.INPUT_TYPES()["required"]["strength"]
+    assert kind == "FLOAT"
+    assert spec == {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.001}
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    shifts = []
+    for strength in (0.022, 0.024):
+        patched, = node.apply(model, strength=strength, adaptive=False, diagnostics=True)
+        sampler, = patched.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+        assert sampler.settings.strength == strength
+        draw(patched)
+        points = [p for p in traces(caplog)[-1]["points"] if "shift_rms" in p]
+        assert points[0]["edit_applied"]
+        shifts.append(points[0]["shift_rms"][0])
+    assert 0 < shifts[0] < shifts[1]
+
+
 def run_key_absent(model):
     return RUN not in model.model_options.get("transformer_options", {})
 

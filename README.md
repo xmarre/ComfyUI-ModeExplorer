@@ -17,7 +17,7 @@ The core Model Attention Backend can select PyTorch or Comfy Kitchen upstream. A
 | --- | --- |
 | **Enabled** | Off returns the unpatched MODEL or removes an existing ModeExplorer patch from a clone. |
 | **Feature** | Native, cosine or RBF volume. Select Native with Initialization enabled for initialization-only. |
-| **Strength / Fidelity** | Defaults 0.45 and 0.55. Strength scales the feature and noise proposals. Fidelity tightens the activation and predicted-clean trust regions. |
+| **Strength / Fidelity** | Defaults 0.45 and 0.55. Strength scales the feature and noise proposals; the widget supports 0.001 increments with automatic frontend float precision. Fidelity tightens the activation and predicted-clean trust regions. |
 | **Min sigma** | Absolute minimum flow sigma for feature guidance. Applies to the first full-noise empty-latent pass. Tagged Scale-Locked high-resolution passes bypass ModeExplorer. |
 | **Adaptive / Similarity** | Adaptive scales the edit from zero at the similarity threshold toward its maximum at cosine 1. Fixed mode keeps the fidelity bound. |
 | **Operation** | Auto selects sequential for one image and batch for 2–8. Batch guides equally conditioned positive rows with zero auxiliary feature forwards. |

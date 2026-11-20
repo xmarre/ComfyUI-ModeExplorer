@@ -20,7 +20,7 @@ class ModeExplorer:
             "enabled": ("BOOLEAN", {"default": True}),
             "feature": (list(FEATURES), {"default": Settings.feature}),
             "initialization": ("BOOLEAN", {"default": Settings.initialization, "tooltip": "Scores up to three noise proposals. Maximum six extra guider calls and twelve actual transformer forwards."}),
-            "strength": ("FLOAT", {"default": Settings.strength, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "strength": ("FLOAT", {"default": Settings.strength, "min": 0.0, "max": 1.0, "step": 0.001}),
             "fidelity": ("FLOAT", {"default": Settings.fidelity, "min": 0.0, "max": 1.0, "step": 0.01}),
             "min_sigma": ("FLOAT", {"default": Settings.min_sigma, "min": 0.5, "max": 1.0, "step": 0.01, "tooltip": "Absolute flow sigma. Only the initial empty-latent pass is eligible."}),
             "adaptive": ("BOOLEAN", {"default": Settings.adaptive, "tooltip": "Scale a feature edit by redundancy above the similarity threshold."}),
