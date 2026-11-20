@@ -1,0 +1,8 @@
+{
+  "native": {"method": "native"},
+  "latent_steer": {"method": "native", "response": {"mode": "latent_steer"}},
+  "feature_repel": {"method": "native", "response": {"mode": "feature_steer", "feature_pair": false, "candidate_gain": 1.0}},
+  "feature_reverse": {"method": "native", "response": {"mode": "feature_steer", "feature_pair": false, "feature_direction": "reverse", "candidate_gain": 1.0}},
+  "feature_tangent": {"method": "native", "response": {"mode": "feature_steer", "feature_direction": "tangent", "candidate_gain": 1.0}},
+  "feature_spatial": {"method": "native", "response": {"mode": "feature_steer", "feature_direction": "spatial_random", "candidate_gain": 1.0}}
+}

@@ -1,0 +1,41 @@
+{
+  "last_node_id": 14,
+  "last_link_id": 15,
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.66, "offset": [10, 20]}},
+  "version": 0.4,
+  "nodes": [
+    {"id": 1, "type": "UNETLoader", "pos": [30, 30], "size": [290, 100], "flags": {}, "order": 0, "mode": 0, "inputs": [], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [3], "slot_index": 0}], "properties": {"Node name for S&R": "UNETLoader"}, "widgets_values": ["krea2_turbo_fp8_scaled.safetensors", "default"]},
+    {"id": 2, "type": "CLIPLoader", "pos": [30, 200], "size": [290, 100], "flags": {}, "order": 1, "mode": 0, "inputs": [], "outputs": [{"name": "CLIP", "type": "CLIP", "links": [1], "slot_index": 0}], "properties": {"Node name for S&R": "CLIPLoader"}, "widgets_values": ["qwen3vl_4b_fp8_scaled.safetensors", "krea2", "default"]},
+    {"id": 3, "type": "VAELoader", "pos": [30, 370], "size": [290, 100], "flags": {}, "order": 2, "mode": 0, "inputs": [], "outputs": [{"name": "VAE", "type": "VAE", "links": [9, 13], "slot_index": 0}], "properties": {"Node name for S&R": "VAELoader"}, "widgets_values": ["qwen_image_vae.safetensors"]},
+    {"id": 4, "type": "CLIPTextEncode", "pos": [370, 210], "size": [325, 135], "flags": {}, "order": 3, "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 1}], "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [2, 5], "slot_index": 0}], "properties": {"Node name for S&R": "CLIPTextEncode"}, "widgets_values": ["A documentary photograph of someone waiting for a ferry on a misty morning."]},
+    {"id": 5, "type": "ConditioningZeroOut", "pos": [370, 400], "size": [290, 100], "flags": {}, "order": 4, "mode": 0, "inputs": [{"name": "conditioning", "type": "CONDITIONING", "link": 2}], "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [6], "slot_index": 0}], "properties": {"Node name for S&R": "ConditioningZeroOut"}},
+    {"id": 6, "type": "EmptyLatentImage", "pos": [30, 535], "size": [290, 100], "flags": {}, "order": 5, "mode": 0, "inputs": [], "outputs": [{"name": "LATENT", "type": "LATENT", "links": [7], "slot_index": 0}], "properties": {"Node name for S&R": "EmptyLatentImage"}, "widgets_values": [1536, 1536, 1]},
+    {"id": 7, "type": "ModeExplorerKrea2", "pos": [710, 30], "size": [290, 690], "flags": {}, "order": 6, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 3}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [4], "slot_index": 0}], "properties": {"Node name for S&R": "ModeExplorerKrea2"}, "widgets_values": [true, "feature_cosine", false, 0.025, 0.7, 0.82, false, 0.5, "auto", 2, true, false, 5, "4", 0.5, 0.55, false, "bank", 8, 1, "all", "first_estimate", "bounded", false, 3, "repel", 0], "title": "ModeExplorer \u00b7 Planner guidance"},
+    {"id": 8, "type": "Krea2TurboFlowAlignedRegenerate", "pos": [2000, 40], "size": [385, 850], "flags": {}, "order": 8, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 11}, {"name": "positive", "type": "CONDITIONING", "link": 5}, {"name": "negative", "type": "CONDITIONING", "link": 6}, {"name": "latent_image", "type": "LATENT", "link": 7}, {"name": "spectral_calibration", "type": "SLRD_SPECTRUM", "link": null}], "outputs": [{"name": "output", "type": "LATENT", "links": [8], "slot_index": 0}, {"name": "lowres_planner", "type": "LATENT", "links": [12], "slot_index": 1}, {"name": "denoised_output", "type": "LATENT", "links": [], "slot_index": 2}], "properties": {"Node name for S&R": "Krea2TurboFlowAlignedRegenerate"}, "widgets_values": [12345, "fixed", 1.0, 0.0, 0.0, 12, 0.6, 4.0, "", 1.0, "er_sde", "simple", "ER-SDE", 3, 1.0, 1.0, 1.0, 0.2, 0.35, 1.0, 3, 4, false, true, true, "trajectory", 0.65, "log", 0.0, 0.2, "interpolate", "", 0.01, "manual", 0.25, "off"], "title": "Scale-Locked \u00b7 Krea 2"},
+    {"id": 9, "type": "VAEDecode", "pos": [2310, 40], "size": [290, 100], "flags": {}, "order": 9, "mode": 0, "inputs": [{"name": "samples", "type": "LATENT", "link": 8}, {"name": "vae", "type": "VAE", "link": 9}], "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [10], "slot_index": 0}], "properties": {"Node name for S&R": "VAEDecode"}},
+    {"id": 10, "type": "SaveImage", "pos": [2655, 40], "size": [290, 280], "flags": {}, "order": 10, "mode": 0, "inputs": [{"name": "images", "type": "IMAGE", "link": 10}], "outputs": [], "properties": {"Node name for S&R": "SaveImage"}, "widgets_values": ["modeexplorer/scale_locked_final"]},
+    {"id": 11, "type": "SpectrumApplyKrea2", "pos": [1580, 210], "size": [330, 490], "flags": {}, "order": 7, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 15}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [11], "slot_index": 0}], "properties": {"Node name for S&R": "SpectrumApplyKrea2"}, "widgets_values": [true, "turbo", 1, 0.01, 2, 1, 1, 0.0, 8, "vram", 4096, true, false, true, 0.5, "off", "all"], "title": "Spectrum \u00b7 Planner and refinement"},
+    {"id": 12, "type": "VAEDecode", "pos": [2360, 445], "size": [290, 100], "flags": {}, "order": 11, "mode": 0, "inputs": [{"name": "samples", "type": "LATENT", "link": 12}, {"name": "vae", "type": "VAE", "link": 13}], "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [14], "slot_index": 0}], "properties": {"Node name for S&R": "VAEDecode"}, "title": "Decode planner"},
+    {"id": 13, "type": "SaveImage", "pos": [2700, 445], "size": [290, 280], "flags": {}, "order": 12, "mode": 0, "inputs": [{"name": "images", "type": "IMAGE", "link": 14}], "outputs": [], "properties": {"Node name for S&R": "SaveImage"}, "widgets_values": ["modeexplorer/scale_locked_planner"]},
+    {"id": 14, "type": "ModeExplorerResponseKrea2", "pos": [1070, 30], "size": [380, 690], "flags": {}, "order": 6, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 4}, {"name": "scorer", "type": "MODEEXPLORER_LOCAL_SCORER", "link": null}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [15], "slot_index": 0}], "properties": {"Node name for S&R": "ModeExplorerResponseKrea2"}, "widgets_values": [true, "latent_probe", "bilinear", 4, 2, 0, 0.02, "rms", "repeat_and_half", 0.82, 0.99999, -1, 2, 20, 128, 0.06, 0.5, 0.0, "minimum_change", "singular", false, 5, "4", 0.025, 1, true, "repel", "whole", -1, -1, true, "Turbo", "", false], "title": "ModeExplorer Response (Krea 2)"}
+  ],
+  "links": [
+    [1, 2, 0, 4, 0, "CLIP"],
+    [2, 4, 0, 5, 0, "CONDITIONING"],
+    [3, 1, 0, 7, 0, "MODEL"],
+    [4, 7, 0, 14, 0, "MODEL"],
+    [5, 4, 0, 8, 1, "CONDITIONING"],
+    [6, 5, 0, 8, 2, "CONDITIONING"],
+    [7, 6, 0, 8, 3, "LATENT"],
+    [8, 8, 0, 9, 0, "LATENT"],
+    [9, 3, 0, 9, 1, "VAE"],
+    [10, 9, 0, 10, 0, "IMAGE"],
+    [11, 11, 0, 8, 0, "MODEL"],
+    [12, 8, 1, 12, 0, "LATENT"],
+    [13, 3, 0, 12, 1, "VAE"],
+    [14, 12, 0, 13, 0, "IMAGE"],
+    [15, 14, 0, 11, 0, "MODEL"]
+  ]
+}
