@@ -1,0 +1,71 @@
+name: Validation
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: c8abeb00ad2736b649ca2fceb8395e25072c7ea3
+          path: .comfyui
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r .comfyui/requirements.txt pytest
+      - name: Test native Krea 2 integration
+        env:
+          PYTHONPATH: "${{ github.workspace }}/.comfyui:${{ github.workspace }}"
+        run: python -m pytest -q tests
+  spectrum-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: 7ad7adb38f6cbb6c2b0713d3bd44c3fb2b9c8ebe
+          path: .comfyui
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-Spectrum-Krea2
+          ref: d2a16c717dae594f9ba79ed78a629308b5357e4f
+          path: .spectrum
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-Sol-H3
+          ref: 32a356f3a0ae62a5cf3eec82c010f48f5e93391a
+          path: .sol
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-ScaleLockedResidualDiffusion
+          ref: 129484bd676be55e3af0f2ea7fa6ae60e4a4ec5b
+          path: .scale-locked
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-KJNodes
+          ref: ef7156d3590dc6cdcc9a13799c9f2a025612f03c
+          path: .kjnodes
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r .comfyui/requirements.txt pytest
+      - name: Validate native sampling, companion state isolation and workflow schemas
+        env:
+          PYTHONPATH: "${{ github.workspace }}/.comfyui:${{ github.workspace }}/.spectrum:${{ github.workspace }}/.sol:${{ github.workspace }}"
+          MODEEXPLORER_SCALE_LOCKED: "${{ github.workspace }}/.scale-locked"
+          MODEEXPLORER_KJNODES: "${{ github.workspace }}/.kjnodes"
+        run: python -m pytest -q tests
+
