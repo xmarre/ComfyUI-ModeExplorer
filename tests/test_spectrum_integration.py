@@ -219,3 +219,48 @@ def test_sol_spectrum_and_modeexplorer_share_one_pipeline(caplog, model):
     assert trace["feature_reference_dit_calls"] == 2 and trace["initialization_dit_calls"] >= 4
     assert any(f"Sol-Krea2: model_evaluations={report['actual']} " in record.message for record in caplog.records)
     assert CURRENT.get() is None and sol._ACTIVE.get() is None
+
+
+@pytest.mark.parametrize("full", [False, True], ids=["guarded", "full"])
+def test_spectrum_rejected_outer_wrapper_keeps_native_guidance(caplog, model, full):
+    from comfy.patcher_extension import WrappersMP
+
+    def observe(executor, *args, **kwargs):
+        return executor(*args, **kwargs)
+
+    caplog.set_level(logging.INFO)
+    wrapped = model.clone()
+    wrapped.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, "test_outer_observer", observe)
+    guided, = ModeExplorer().apply(wrapped, adaptive=False, diagnostics=True, full_spectrum=full)
+    native = draw(wrapped, sigmas=SIGMAS)
+    expected = draw(guided, sigmas=SIGMAS)
+    assert not torch.equal(native, expected)
+    assert logs(caplog, "MODEEXPLORER_TRACE ")[-1]["feature_reference_dit_calls"] == 2
+
+    actual = draw(spectrum(guided), sigmas=SIGMAS)
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert "external transformer patches or wrappers are active" in report["fallback"]
+    assert report["forecast"] == 0 and report["actual"] == len(SIGMAS) - 1
+    assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
+    assert "reference_prepare_unavailable" not in trace["reasons"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert CURRENT.get() is None
+
+
+def test_live_spectrum_mismatch_keeps_native_guidance(caplog, model, monkeypatch):
+    from comfyui_spectrum_krea2 import adapter
+
+    caplog.set_level(logging.INFO)
+    guided, = ModeExplorer().apply(model, adaptive=False, diagnostics=True, full_spectrum=True)
+    expected = draw(guided, sigmas=SIGMAS)
+    # Initial patch qualification succeeds, but the live adapter rejects dispatch.
+    monkeypatch.setattr(adapter, "matches", lambda policy, options: False)
+    actual = draw(spectrum(guided), sigmas=SIGMAS)
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert report["mode_explorer_spectrum_policy"] == "full"
+    assert "external transformer modifications are active" in report["actual_reasons"]
+    assert report["forecast"] == 0 and report["actual"] == len(SIGMAS) - 1
+    assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

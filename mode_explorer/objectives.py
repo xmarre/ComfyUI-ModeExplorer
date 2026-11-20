@@ -150,8 +150,8 @@ def feature_shift(
     direction, nearest, loss = objective(centered, eligible, style, bandwidth, temperature)
     _, size, _ = unit_rows(centered)
     relative = (direction * size).reshape_as(features)
-    # Pullback through centering. A common per-sample scale preserves the
-    # coarse-grid channel means while respecting the tightest local bound.
+    # Center the proposed update to enforce its mean constraint. A common
+    # per-sample scale preserves that constraint and the tightest local bound.
     relative = center(relative)
     magnitude = torch.linalg.vector_norm(relative.flatten(1), dim=-1, keepdim=True)
     direction = relative / magnitude.clamp_min(EPS)[..., None, None]

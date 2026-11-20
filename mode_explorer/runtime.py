@@ -214,7 +214,8 @@ def verified_spectrum(tree):
                        for var in (getattr(runtime, "CURRENT", None), getattr(adapter, "CAPTURE", None))
                        for method in ("get", "set", "reset"))):
         raise RuntimeError("ModeExplorer could not verify Spectrum's scoped state contract.")
-    return owner, runtime.CURRENT, adapter.CAPTURE, getattr(adapter, "MODE_EXPLORER_DEFERRED_PROBES", False) is True
+    matches = getattr(adapter, "matches", None) if getattr(adapter, "MODE_EXPLORER_DEFERRED_PROBES", False) is True else None
+    return owner, runtime.CURRENT, adapter.CAPTURE, matches
 
 
 def verified_sol(options, registered):
@@ -291,6 +292,19 @@ def spectrum_forecast_count(run):
     owner, current, _, _ = run.spectrum
     session = current.get()
     return session.counts["forecast"] if session is not None and session.binding is owner else None
+
+
+def spectrum_can_prepare(run, options):
+    if run.spectrum is None:
+        return False
+    owner, current, _, matches = run.spectrum
+    session = current.get()
+    if not callable(matches) or session is None or session.binding is not owner:
+        return False
+    policy = session.patch_policy
+    mode = getattr(policy, "mode_explorer", None)
+    # Mirror the adapter's native dispatch gate, including live options.
+    return mode is not None and mode.prepare_native is prepare_native_options and matches(policy, options)
 
 
 def verify_patch_graph(options, settings, registered=None):
@@ -610,7 +624,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             if references:
                 frame.reference = torch.cat(references, dim=0)
         frame.prepare = prepare
-        if run.spectrum is None or not run.spectrum[3]:
+        if not spectrum_can_prepare(run, options):
             prepare_native_options({FRAME: frame})
     elif active and run.batch > 1:
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)

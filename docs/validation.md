@@ -32,3 +32,5 @@ Use group IDs consistently within each prompt for composition, camera, pose and 
 | Conservative | Cosine, strength 0.30, fidelity 0.70, min sigma 0.85, Adaptive on, similarity 0.70, guarded Spectrum, Initialization off. |
 | Balanced comparison | Default cosine, block 1, grid 4, budget 2, first-estimate continuation, guarded Spectrum. Compare Adaptive on and off independently. |
 | Experimental collective | Budget 4, two per-seed references, all selection, rolling Euler and verified update. Compare fixed versus median volume bandwidth, then vary block or grid separately. |
+
+The provisional presets are starting configurations. To measure a reference or continuation change, hold the feature update mode and strength fixed. Test the verified pooled update in its own arm because its RMS cap can change the applied edit size.

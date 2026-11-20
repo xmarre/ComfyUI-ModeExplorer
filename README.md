@@ -20,9 +20,9 @@ Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The 
 | **Adaptive / Similarity** | Adaptive scales the edit from zero at the similarity threshold toward its maximum at cosine 1. Fixed mode keeps the fidelity bound. |
 | **Operation** | Auto selects sequential for one image and batch for 2–8. Batch guides equally conditioned positive rows with zero auxiliary feature forwards. |
 | **Reference budget** | Zero to four auxiliary positive transformer forwards per sequential sample across the invocation. The budget can run out before reaching Min sigma. |
-| **Initialization** | At most six auxiliary guider calls and twelve transformer forwards. Accepts a trial only when measured log-volume increases inside the predicted-clean trust region. The 45-second deadline stops new auxiliary launches and allows an in-flight call to finish. |
+| **Initialization** | At most six auxiliary guider calls and twelve transformer forwards. Accepts a trial only when measured log-volume increases inside the predicted-clean trust region. The 45-second deadline stops new auxiliary launches and allows an in-flight call to finish. Hitting the deadline can change which initialization candidates are evaluated at a fixed seed. |
 | **Diagnostics** | Logs stage, native and auxiliary costs, measured feature shifts and each initialization trial. |
-| **Full Spectrum** | Off by default. Guarded mode forces eligible early guidance to use actual forwards and clears history at the feature boundary. Full mode retains Spectrum eligibility and history. With the companion overlay, forecasts spend zero references. |
+| **Full Spectrum** | Off by default. Guarded mode forces eligible early guidance to use actual forwards and clears history at the feature boundary. Full mode retains Spectrum eligibility and history. With the companion overlay, forecasts spend zero references. If Spectrum rejects the patch graph or a live dispatch, eligible native evaluations still receive ModeExplorer guidance. |
 
 ## Optional controls
 
@@ -33,7 +33,7 @@ Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The 
 | **Reference source / bank size** | The default eight-slot bank remains available. Enlarge it or use independently derived per-seed tracks. |
 | **Reference trajectories / selection** | Probe one to three tracks per actual step within the shared budget. Use all measured features jointly or the highest cosine match. |
 | **Reference continuation** | First estimate uses the first predicted clean state. Rolling Euler uses each shadow's latest velocity. The live sampler retains its native update and RNG. |
-| **Feature update / Sham** | Bounded is the lightweight baseline. Verified adds an area-weighted mean constraint, an 8% pooled RMS cap and measured objective backtracking. Sham measures feature proposals without applying them and skips initialization. |
-| **Initialization trials** | One to three trials after three baseline/reference guider calls. One trial gives the original budget envelope. |
+| **Feature update / Sham** | Bounded is the lightweight baseline. Verified adds an area-weighted mean constraint, an 8% pooled RMS cap and objective backtracking on pooled features. Sham measures feature proposals without applying them and skips initialization. |
+| **Initialization trials** | One to three total proposals after three baseline/reference guider calls. The first uses the original radius. Later proposals back off after rejection. |
 
 See [Research](docs/research.md) for equations and limitations and [Validation](docs/validation.md) for matched comparisons and cost measurements.
