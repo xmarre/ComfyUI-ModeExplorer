@@ -243,6 +243,30 @@ def is_kj_loader_sage(override):
             and any(code is attention.__code__ for code in factory.__code__.co_consts))
 
 
+def is_core_attention_backend(override):
+    """Recognize the built-in selector's dense PyTorch or Kitchen override."""
+    if not isinstance(override, FunctionType):
+        return False
+
+    from comfy.ldm.modules import attention
+    from comfy.model_patcher import ModelPatcher
+
+    setter = getattr(ModelPatcher, "set_model_optimized_attention", None)
+    if (not isinstance(setter, FunctionType) or override.__globals__ is not setter.__globals__
+            or not any(code is override.__code__ for code in setter.__code__.co_consts)
+            or override.__code__.co_freevars != ("optimized_attention",)):
+        return False
+    try:
+        backend = override.__closure__[0].cell_contents
+    except ValueError:  # empty closure cell
+        return False
+    if backend is not attention.attention_pytorch:
+        kitchen = getattr(attention, "attention_comfy_kitchen_int8", None)
+        if kitchen is None or backend is not kitchen:
+            return False
+    return getattr(override, "container_function", None) is getattr(backend, "container_function", None)
+
+
 def verified_sol(options, registered):
     trans = options.get("transformer_options", {})
     override = trans.get("optimized_attention_override")
@@ -251,10 +275,10 @@ def verified_sol(options, registered):
     outer = tree.get("outer_sample", {}).get(SOL_KEY, ())
     diffusion = tree.get("diffusion_model", {}).get(SOL_KEY, ())
     if marker is None and not outer and not diffusion:
-        if override is not None and not is_kj_loader_sage(override):
+        if override is not None and not (is_core_attention_backend(override) or is_kj_loader_sage(override)):
             raise RuntimeError(
                 "ModeExplorer found an unrecognized optimized_attention_override. "
-                "Use native attention, the supported KJ diffusion loader Sage settings, or verified Sol-Krea2."
+                "Use the core PyTorch or Kitchen backend, a supported KJ diffusion loader, or verified Sol-Krea2."
             )
         return None
     module = sys.modules.get("sol_h3.krea2")

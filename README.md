@@ -9,7 +9,7 @@ Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The 
 3. Connect **MODEL → ModeExplorer → KSampler**. With additional patches use **MODEL → ModeExplorer → optional Sol-Krea2 → Spectrum → sampler**. Place a native/guided switch upstream of Spectrum so each arm shares the same settings.
 4. Load an [example workflow](examples/README.md). Match the prompt, model, seed, conditioning and sigma schedule during comparisons.
 
-A KJ Diffusion Model Loader can supply its Sage attention override upstream. ModeExplorer retains the loader’s attention backend.
+The core Model Attention Backend can select PyTorch or Comfy Kitchen upstream. A KJ Diffusion Model Loader can also supply its Sage override. ModeExplorer retains the attention backend set by the last selector on the model path.
 
 ## Main controls
 

@@ -322,3 +322,41 @@ def test_kj_loader_sage_override_preserves_guidance_and_spectrum(caplog, model, 
     foreign.model_options["transformer_options"]["optimized_attention_override"] = unrelated
     with pytest.raises(RuntimeError, match="unrecognized optimized_attention_override"):
         ModeExplorer().apply(foreign)
+
+
+@pytest.mark.parametrize("backend", ["pytorch attention", "comfy kitchen attention"])
+def test_core_attention_selector_preserves_guidance_and_spectrum(caplog, model, monkeypatch, backend):
+    from comfy.ldm.modules import attention
+    from comfy_extras.nodes_model_advanced import ModelAttentionBackend
+
+    calls = []
+
+    def prequantize(q, k, v, *, scale, attn_mask):
+        return q, k, v, scale, attn_mask
+
+    def from_prequantized(args):
+        q, k, v, scale, mask = args
+        calls.append(True)
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+
+    monkeypatch.setitem(attention.REGISTERED_ATTENTION_FUNCTIONS, "comfy_kitchen_int8",
+                        attention.attention_comfy_kitchen_int8)
+    monkeypatch.setattr(attention.comfy_kitchen, "prequantize_int8_attention", prequantize)
+    monkeypatch.setattr(attention.comfy_kitchen, "int8_attention_from_prequantized", from_prequantized)
+
+    patched, = ModelAttentionBackend.execute(model, backend).result
+    override = patched.model_options["transformer_options"]["optimized_attention_override"]
+    caplog.set_level(logging.INFO)
+    guided, = ModeExplorer().apply(patched, adaptive=False, diagnostics=True)
+    assert guided.model_options["transformer_options"]["optimized_attention_override"] is override
+    native = draw(patched, sigmas=SIGMAS)
+    assert not torch.equal(native, draw(guided, sigmas=SIGMAS))
+    calls.clear()
+
+    result = draw(spectrum(guided), sigmas=SIGMAS)
+    assert torch.isfinite(result).all()
+    assert bool(calls) == (backend == "comfy kitchen attention")
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert report["fallback"] is None and report["forecast"] > 0
+    assert trace["feature_reference_dit_calls"] == trace["feature_attempts"] == 2
