@@ -1,6 +1,6 @@
 # ComfyUI-ModeExplorer
 
-Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The node takes and returns a standard ComfyUI MODEL. Use it to measure whether camera position, framing, pose and subject arrangement vary more across seeds under the same prompt. Full-checkpoint anatomy, likeness, prompt adherence and composition effects remain to be measured.
+Experimental early-flow diversity guidance for native Krea 2 Raw and Turbo. The node takes and returns a standard ComfyUI MODEL. Use it to measure whether camera position, framing, pose and subject arrangement vary more across seeds under the same prompt. Preliminary full-checkpoint paired observations motivate testing very weak guidance for structural and semantic coherence. Population-level anatomy, likeness, prompt adherence and diversity effects remain unmeasured.
 
 ## Setup
 
@@ -25,6 +25,12 @@ The core Model Attention Backend can select PyTorch or Comfy Kitchen upstream. A
 | **Initialization** | At most six auxiliary guider calls and twelve transformer forwards. Accepts a trial only when measured log-volume increases inside the predicted-clean trust region. The 45-second deadline stops new auxiliary launches and allows an in-flight call to finish. Hitting the deadline can change which initialization candidates are evaluated at a fixed seed. |
 | **Diagnostics** | Logs stage, native and auxiliary costs, measured feature shifts and each initialization trial. |
 | **Full Spectrum** | Off by default. Guarded mode forces eligible early guidance to use actual forwards and clears history at the feature boundary. Full mode retains Spectrum eligibility and history. With the companion overlay, forecasts spend zero references. If Spectrum rejects the patch graph or a live dispatch, eligible native evaluations still receive ModeExplorer guidance. |
+
+## Low-strength starting configuration
+
+For a conservative sequential experiment, try cosine guidance at strength **0.03**, fidelity **0.70**, adaptive off and reference budget **2**. Use block 1, grid 4, a single reference trajectory from the default eight-slot bank, first-estimate continuation and the bounded update. Keep initialization off, min sigma 0.82 and guarded Spectrum when installed.
+
+Small early edits can change pose or local object coherence without large framing changes. This is a provisional experiment, not an anatomy correction guarantee or a replacement for the node defaults. Compare against native and sham controls across independent seeds. The [low-strength comparison profile](tools/low_strength_profiles.json) and [validation guide](docs/validation.md) provide a matched starting point.
 
 ## Optional controls
 

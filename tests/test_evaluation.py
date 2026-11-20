@@ -41,6 +41,37 @@ def test_graph_native_and_sequential_mode():
     assert controlled["13"]["inputs"]["sa_pece_forecast_policy"] == "off"
 
 
+def test_low_strength_profiles_match_guided_and_sham():
+    args = Namespace(
+        model="model", encoder="encoder", vae="vae", weight_dtype="default", width=1024, height=768,
+        steps=13, cfg=1.0, sampler="euler", scheduler="simple", negative="", strength=0.45,
+        fidelity=0.55, fixed=False, similarity=0.70, reference_budget=4, min_sigma=0.90, diagnostics=True,
+        model_lora=None, model_lora_strength=1.0, identity_lora=None, lora_strength=1.0,
+    )
+    args.variants = evaluate.load_profiles(Path(evaluate.__file__).with_name("low_strength_profiles.json"))
+    assert set(args.variants) == {"native", "low_strength", "low_strength_sham"}
+    native, guided, sham = (
+        evaluate.graph(args, arm, "prompt", 42, name="matched")
+        for arm in ("native", "low_strength", "low_strength_sham")
+    )
+    active = guided["7"]["inputs"]
+    assert active["feature"] == "feature_cosine" and not active["initialization"]
+    assert active["strength"] == 0.03 and active["fidelity"] == 0.70
+    assert active["min_sigma"] == 0.82 and not active["adaptive"]
+    assert active["reference_budget"] == 2 and active["reference_trajectories"] == 1
+    assert active["feature_block"] == 1 and active["feature_grid"] == 4
+    assert active["reference_bank_size"] == 8 and active["reference_source"] == "bank"
+    assert not active["full_spectrum"] and not active["sham"]
+    assert sham["7"]["inputs"] == {**active, "sham": True}
+    assert native["7"]["inputs"]["feature"] == "native" and not native["7"]["inputs"]["initialization"]
+    assert guided["13"] == sham["13"] == native["13"]
+    assert guided["13"]["inputs"]["extrapolation_guard_scope"] == "planner_only"
+    assert guided["8"] == sham["8"] == native["8"]
+    assert {k: v for k, v in guided.items() if k != "7"} == {
+        k: v for k, v in sham.items() if k != "7"
+    }
+
+
 def test_render_reads_native_api_history_image_and_trace(tmp_path, monkeypatch):
     log = tmp_path / "comfy.log"
     log.write_text("previous unrelated log\n")
