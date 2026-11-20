@@ -161,6 +161,30 @@ def test_single_native_flow_changes_is_reproducible_and_bounded(caplog, model, c
     assert run_key_absent(patched)
 
 
+def test_causal_direction_controls_native_sampling(caplog, model):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    outputs = {}
+    reports = {}
+    for direction, sham in (("repel", False), ("reverse", False), ("channel_sign", False), ("repel", True)):
+        patched, = ModeExplorer().apply(model, adaptive=False, diagnostics=True,
+                                         strength=0.2, feature_direction=direction, sham=sham)
+        key = "sham" if sham else direction
+        outputs[key] = draw(patched)
+        reports[key] = traces(caplog)[-1]
+        assert reports[key]["feature_direction"] == direction
+        assert reports[key]["feature_reference_dit_calls"] == 2
+        assert reports[key]["native_dit_calls"] == 5
+        assert torch.equal(outputs[key], draw(patched))
+    assert torch.equal(outputs["sham"], draw(model))
+    assert not torch.equal(outputs["repel"], outputs["reverse"])
+    assert not torch.equal(outputs["repel"], outputs["channel_sign"])
+    first = {key: next(p for p in report["points"] if "shift_rms" in p) for key, report in reports.items()}
+    assert first["repel"]["shift_rms"] == first["reverse"]["shift_rms"] == first["channel_sign"]["shift_rms"]
+    assert first["sham"]["applied_pooled_shift_rms"] == [0.0]
+    assert first["repel"]["reference_slots"] == first["channel_sign"]["reference_slots"]
+    assert first["repel"]["nearest_cosine"] == first["reverse"]["nearest_cosine"]
+
+
 def test_same_condition_batch_guidance_and_distinct_prompt_isolation(caplog, model):
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     patched, = ModeExplorer().apply(model, operation="batch", adaptive=False, diagnostics=True)

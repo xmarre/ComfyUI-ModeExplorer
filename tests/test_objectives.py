@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from mode_explorer.objectives import (
-    RIDGE, cell_areas, feature_shift, initial_direction, lift, noise_candidate, objective, pool,
+    RIDGE, cell_areas, direction_control, feature_shift, initial_direction, lift, noise_candidate, objective, pool,
     reference_noise, seed_key, select_candidate, token_pool,
 )
 from mode_explorer.runtime import (
@@ -93,6 +93,64 @@ def test_hook_preserves_cfg_text_ref_and_input(dtype):
     assert token_slice(options, 18, 9) == (4, 13)
     with pytest.raises(RuntimeError, match="token slice"):
         token_slice(options, 18, 8)
+
+
+def test_direction_controls_preserve_cell_norms_and_rng():
+    x = torch.randn(2, 64, 4, 4, generator=torch.Generator().manual_seed(137))
+    shift = feature_shift(x, ~torch.eye(2, dtype=torch.bool), "feature_cosine",
+                          0.025, 0.70, False, 0.70)[0]
+    state = torch.random.get_rng_state()
+    assert direction_control(shift, "repel", 42, 0) is shift
+    assert torch.equal(direction_control(shift, "reverse", 42, 0), -shift)
+    first = direction_control(shift, "channel_sign", 42, 0)
+    assert torch.equal(state, torch.random.get_rng_state())
+    assert torch.equal(first.abs(), shift.abs())
+    assert torch.equal(first, direction_control(shift, "channel_sign", 42, 0))
+    assert not torch.equal(first, direction_control(shift, "channel_sign", 42, 1))
+    assert not torch.equal(first, shift)
+    torch.testing.assert_close(first.mean((-2, -1)), torch.zeros_like(first.mean((-2, -1))), atol=1e-7, rtol=0)
+    for value in (shift, -shift, first):
+        torch.testing.assert_close(value.norm(dim=1), shift.norm(dim=1), atol=0, rtol=0)
+    with pytest.raises(ValueError, match="bounded feature update"):
+        Settings(feature_direction="reverse", feature_update="verified")
+    with pytest.raises(ValueError, match="direction_trial"):
+        Settings(direction_trial=32)
+    with pytest.raises(ValueError, match="feature_direction"):
+        Settings(feature_direction="unknown")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_direction_control_hook_telemetry_and_scope(dtype):
+    generator = torch.Generator().manual_seed(62)
+    original = torch.randn(2, 18, 64, generator=generator).to(dtype)
+    reference = token_pool(original[0:1, 4:13], 3, 3)
+    def edit(mode, sham=False):
+        settings = Settings(adaptive=False, strength=0.2, fidelity=0.7,
+                            diagnostics=True, feature_direction=mode, sham=sham)
+        run = Run(settings, 42, 1.0, 1.0, 1, (1, 16, 5, 6), True)
+        frame = Frame((3, 3), 1, 1, "sample", run, 0.94, reference=reference)
+        options = {FRAME: frame, "block_type": "single", "block_index": BLOCK,
+                   "img_slice": [4, 18], "reference_image_num_tokens": [3, 2]}
+        changed = attention_feature(original, options)
+        assert torch.equal(changed[:1], original[:1])
+        assert torch.equal(changed[:, :4], original[:, :4])
+        assert torch.equal(changed[:, 13:], original[:, 13:])
+        assert run.feature_attempts == 1
+        return changed, frame
+    repel, a = edit("repel")
+    reverse, b = edit("reverse")
+    randomized, c = edit("channel_sign")
+    unchanged, d = edit("repel", sham=True)
+    assert torch.equal(unchanged, original)
+    assert not torch.equal(repel, reverse) and not torch.equal(repel, randomized)
+    assert torch.equal(a.metrics[2], b.metrics[2]) and torch.equal(a.metrics[2], c.metrics[2])
+    assert a.edit_metrics["nearest_cosine_after"].item() < a.metrics[0].item()
+    assert b.edit_metrics["nearest_cosine_after"].item() > b.metrics[0].item()
+    assert a.edit_metrics["proposal_direction_cosine"].item() == pytest.approx(1)
+    assert b.edit_metrics["proposal_direction_cosine"].item() == pytest.approx(-1)
+    assert d.edit_metrics["applied_pooled_shift_rms"].item() == 0
+    assert d.edit_metrics["nearest_cosine_after"].item() == pytest.approx(d.metrics[0].item())
+    assert all(frame.edit_metrics["applied_pooled_shift_rms"].item() > 0 for frame in (a, b, c))
 
 
 def test_rng_reference_and_priors():
