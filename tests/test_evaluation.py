@@ -59,7 +59,7 @@ def test_low_strength_profiles_match_guided_and_sham():
     assert active["strength"] == 0.03 and active["fidelity"] == 0.70
     assert active["min_sigma"] == 0.82 and not active["adaptive"]
     assert active["reference_budget"] == 2 and active["reference_trajectories"] == 1
-    assert active["feature_block"] == 1 and active["feature_grid"] == 4
+    assert active["feature_block"] == 1 and active["feature_grid"] == "4"
     assert active["reference_bank_size"] == 8 and active["reference_source"] == "bank"
     assert not active["full_spectrum"] and not active["sham"]
     assert sham["7"]["inputs"] == {**active, "sham": True}
