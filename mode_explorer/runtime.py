@@ -6,6 +6,7 @@ import math
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from dataclasses import dataclass, field
 
@@ -28,6 +29,7 @@ from .objectives import (
 LOGGER = logging.getLogger("ModeExplorer")
 KEY = "mode_explorer_krea2"
 STAGE = "spectrum_krea2_stage"
+SOL_KEY = "sol_krea2_sparse_attention_v1"
 RUN = f"{KEY}.run"
 FRAME = f"{KEY}.frame"
 BLOCK = 1  # second single-stream block, zero-indexed
@@ -36,6 +38,7 @@ MAX_POINTS = 12
 MAX_INITIALIZATION_DIT = 12
 MAX_INITIALIZATION_SECONDS = 45
 MAX_INITIALIZATION_NOISE_BYTES = 32 * 1024**2
+MAX_REFERENCE_STATE_BYTES = 64 * 1024**2
 FEATURES = ("native", "feature_cosine", "feature_volume")
 OPERATIONS = ("auto", "sequential", "batch")
 REFERENCE_SOURCES = ("bank", "per_seed")
@@ -76,6 +79,7 @@ class Settings:
     reference_selection: str = "all"
     reference_continuation: str = "first_estimate"
     feature_update: str = "bounded"
+    sham: bool = False
 
     def __post_init__(self):
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
@@ -107,8 +111,8 @@ class Settings:
                 raise ValueError(f"ModeExplorer received an unknown {key}")
         if self.reference_source == "bank" and self.reference_trajectories > self.reference_bank_size:
             raise ValueError("ModeExplorer reference bank must fit all trajectories")
-        if type(self.full_spectrum) is not bool:
-            raise ValueError("ModeExplorer full_spectrum must be a boolean")
+        if any(type(value) is not bool for value in (self.full_spectrum, self.volume_median, self.sham)):
+            raise ValueError("ModeExplorer full_spectrum, volume_median and sham must be booleans")
 
 
 @dataclass
@@ -129,6 +133,7 @@ class Run:
     feature_attempts: int = 0
     spectrum_forecasts: int = 0
     spectrum: object = None
+    sol: object = None
     shadows: dict = field(default_factory=dict)
     stage: str = "standalone"
     decisions: list = field(default_factory=list)
@@ -160,6 +165,7 @@ class Frame:
     metrics: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     seen: bool = False
     prepare: object = None
+    reference_slots: list = field(default_factory=list)
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -209,23 +215,72 @@ def verified_spectrum(tree):
     return owner, runtime.CURRENT, adapter.CAPTURE, getattr(adapter, "MODE_EXPLORER_DEFERRED_PROBES", False) is True
 
 
+def verified_sol(options, registered):
+    trans = options.get("transformer_options", {})
+    override = trans.get("optimized_attention_override")
+    marker = trans.get(SOL_KEY)
+    tree = registered if registered is not None else wrappers(options)
+    outer = tree.get("outer_sample", {}).get(SOL_KEY, ())
+    diffusion = tree.get("diffusion_model", {}).get(SOL_KEY, ())
+    if marker is None and not outer and not diffusion:
+        if override is not None:
+            raise RuntimeError("ModeExplorer requires native or verified Sol-Krea2 attention.")
+        return None
+    module = sys.modules.get("sol_h3.krea2")
+    owner = getattr(override, "_sol_krea2_owner", None)
+    if (module is None or owner is None or len(outer) != 1 or len(diffusion) != 1
+            or type(outer[0]) is not getattr(module, "_SamplingScope", None)
+            or type(diffusion[0]) is not getattr(module, "_DiffusionScope", None)
+            or outer[0].owner is not owner or diffusion[0].owner is not owner
+            or getattr(override, "__code__", None) not in module._override.__code__.co_consts
+            or not isinstance(getattr(module, "_ACTIVE", None), ContextVar)
+            or not isinstance(getattr(module, "_EXECUTION", None), ContextVar)
+            or type(outer[0].settings) is not module.Settings):
+        raise RuntimeError("ModeExplorer could not verify Sol-Krea2 callback ownership.")
+    settings = outer[0].settings
+    if marker != {"api": 1, **vars(settings)}:
+        raise RuntimeError("ModeExplorer could not verify Sol-Krea2 settings.")
+    ordered = list(tree.get("diffusion_model", {}))
+    if KEY in ordered and ordered.index(KEY) > ordered.index(SOL_KEY):
+        raise RuntimeError("Apply ModeExplorer before Sol-Krea2 so auxiliary passes can use an isolated attention scope.")
+    return module, owner
+
+
 @contextmanager
-def isolated_spectrum_reference(run):
-    """Auxiliary DiT passes cannot advance Spectrum or enter its feature history."""
+def isolated_reference(run):
+    """Do not advance Spectrum or Sol state while evaluating auxiliary inputs."""
     if run.spectrum is None:
-        yield
-        return
-    owner, current, capture, _ = run.spectrum
-    session = current.get()
-    if session is not None and session.binding is not owner:
-        raise RuntimeError("ModeExplorer encountered a foreign Spectrum session.")
-    token_session = current.set(None)
-    token_capture = capture.set(None)
+        current = capture = None
+    else:
+        owner, current, capture, _ = run.spectrum
+        session = current.get()
+        if session is not None and session.binding is not owner:
+            raise RuntimeError("ModeExplorer encountered a foreign Spectrum session.")
+    if run.sol is None:
+        sol = None
+    else:
+        sol, owner = run.sol
+        state = sol._ACTIVE.get()
+        if state is None or state.owner is not owner:
+            raise RuntimeError("ModeExplorer lost the verified Sol-Krea2 sampling scope.")
+    token_session = current.set(None) if current is not None else None
+    token_capture = capture.set(None) if capture is not None else None
+    token_sol = None
     try:
+        if sol is not None:
+            # Use the same dense-warmup position and isolated mutable counters.
+            # Keep cached device code without sharing per-invocation statistics.
+            aux = sol._Run(owner, state.settings, evaluations=state.evaluations,
+                           kernel=state.kernel, kernel_failure=state.kernel_failure,
+                           kernel_device=state.kernel_device, sparse_verified=set(state.sparse_verified))
+            token_sol = sol._ACTIVE.set(aux)
         yield
     finally:
-        capture.reset(token_capture)
-        current.reset(token_session)
+        if token_sol is not None:
+            sol._ACTIVE.reset(token_sol)
+        if capture is not None:
+            capture.reset(token_capture)
+            current.reset(token_session)
 
 
 def spectrum_forecast_count(run):
@@ -238,6 +293,7 @@ def spectrum_forecast_count(run):
 
 def verify_patch_graph(options, settings, registered=None):
     spectrum = None
+    sol = verified_sol(options, registered)
     for tree in (wrappers(options), registered or {}):
         verified = verified_spectrum(tree)
         if verified is not None:
@@ -246,7 +302,7 @@ def verify_patch_graph(options, settings, registered=None):
             spectrum = verified
         for name in ("sampler_sample", "predict_noise", "calc_cond_batch", "apply_model", "diffusion_model"):
             for key, value in tree.get(name, {}).items():
-                if value and key != KEY and not (key == "spectrum_krea2"
+                if value and key != KEY and not (sol is not None and key == SOL_KEY and name == "diffusion_model") and not (key == "spectrum_krea2"
                     and name in ("sampler_sample", "predict_noise", "diffusion_model")):
                     raise RuntimeError(f"ModeExplorer needs the native {name} path except for verified Spectrum.")
     tr = options.get("transformer_options", {})
@@ -262,7 +318,7 @@ def verify_patch_graph(options, settings, registered=None):
         fn is not attention_feature for functions in tr["patches"].values() for fn in functions
     ):
         raise RuntimeError("ModeExplorer needs the native attention path. Use a separate MODEL branch for other transformer patches.")
-    return spectrum
+    return spectrum, sol
 
 
 def token_slice(options: dict, total: int, count: int) -> tuple[int, int]:
@@ -338,6 +394,8 @@ def attention_feature(output, options):
             redundancy[:frame.batch], loss,
             shift[:frame.batch].square().mean(dim=(1, 2, 3)).sqrt(),
         )
+    if settings.sham:
+        return output
     result = output.clone()
     view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
     sy, sx = cell_size(height, width, settings.feature_grid)
@@ -390,7 +448,8 @@ def record(frame, x, velocity):
     }
     if frame.metrics is not None:
         cosine, loss, rms = frame.metrics
-        point.update(nearest_cosine=as_list(cosine), objective=as_list(loss), shift_rms=as_list(rms))
+        point.update(nearest_cosine=as_list(cosine), objective=as_list(loss), shift_rms=as_list(rms),
+                     edit_applied=not frame.run.settings.sham, reference_slots=frame.reference_slots)
     frame.run.points.append(point)
 
 
@@ -408,8 +467,10 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
     settings = run.settings
     state = run.shadows.get(index)
     rolling = settings.reference_continuation == "rolling_euler"
+    slot = reference_slot(settings, run.seed, index)
+    frame.reference_slots.append(slot)
     if state is None:
-        noise = reference_noise(x[row], reference_slot(settings, run.seed, index)).float() * run.noise_scale
+        noise = reference_noise(x[row], slot).float() * run.noise_scale
         state = Shadow(noise, frame.sigma, frame.sigma)
         run.shadows[index] = state
     if rolling and state.latent is not None:
@@ -430,7 +491,7 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         return tensor[row] if tensor is not None and tensor.shape[0] == x.shape[0] else tensor
 
     run.reference_calls += 1
-    with isolated_spectrum_reference(run):
+    with isolated_reference(run):
         velocity = executor(
             shadow, timestep[row], context[row], row_of(mask),
             [row_of(ref) for ref in refs] if refs is not None else None, probe_options, **kwargs,
@@ -541,7 +602,14 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)
     if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace:
         return forward(arguments)
-    result = forward((*arguments[:-1], {**options, FRAME: frame}))
+    try:
+        result = forward((*arguments[:-1], {**options, FRAME: frame}))
+        if frame.prepare is not None and frame.seen:
+            run.reasons.add("reference_prepare_unavailable")
+    finally:
+        # Forecasts and interrupted forwards leave a pending closure. Release
+        # its latent, context and executor immediately instead of waiting for GC.
+        frame.prepare = None
     if not frame.seen:
         if before_forecast is not None and spectrum_forecast_count(run) > before_forecast:
             return result
@@ -579,7 +647,7 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evalua
         check_initialization_budget(run)
         run.initialization_guider_calls += 1
         x = sampling.noise_scaling(sigma, raw_noise, latent_image, True)
-        with isolated_spectrum_reference(run):
+        with isolated_reference(run):
             return model_wrap(x, sigma_batch, model_options=options, seed=run.seed).float()
 
     selected = noise
@@ -607,7 +675,18 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evalua
                 break
             candidate = torch.where(changed.reshape(broadcast), candidate, noise)
             before = run.initialization_dit_calls
-            candidate_clean = spatial_image(estimate(candidate))
+            prior_guider = run.initialization_guider_calls
+            try:
+                candidate_clean = spatial_image(estimate(candidate))
+            except InitializationLimit as exc:
+                if run.settings.diagnostics:
+                    attempts.append({
+                        "rms_budget": as_list(radius), "volume_gain": None, "relative_clean_shift": None,
+                        "status": [str(exc) if attempted else "inactive" for attempted in changed.tolist()],
+                        "guider_calls": run.initialization_guider_calls - prior_guider,
+                        "dit_calls": run.initialization_dit_calls - before,
+                    })
+                raise
             _, passed, gain, relative = select_candidate(
                 spatial_image(noise), spatial_image(candidate), clean, candidate_clean,
                 refs, volume, bandwidth, run.settings.fidelity,
@@ -665,7 +744,7 @@ class SamplerWrapper:
         model_options = extra_args["model_options"]
         if model_options.get(STAGE) == "highres" or getattr(model_wrap, "model_options", {}).get(STAGE) == "highres":
             return sample()
-        spectrum = verify_patch_graph(model_options, settings)
+        spectrum, sol = verify_patch_graph(model_options, settings)
         if type(executor.class_obj) is not KSAMPLER:
             raise RuntimeError("ModeExplorer requires the native ComfyUI KSAMPLER container.")
         if model_options.get("multigpu_clones") or model_options.get("context_handler") is not None:
@@ -711,6 +790,12 @@ class SamplerWrapper:
         if active and not reasons and not batch_allowed:
             reasons.add("batch_mode_mismatch")
             LOGGER.info("ModeExplorer skipped batch_mode_mismatch (seed=%s)", seed)
+        reference_state_tensors = 3 if settings.reference_continuation == "rolling_euler" else 2
+        reference_bytes = (4 * noise.numel() * reference_state_tensors
+                           * min(settings.reference_trajectories, settings.reference_budget))
+        if feature_active and batch == 1 and reference_bytes > MAX_REFERENCE_STATE_BYTES:
+            feature_active = False
+            reasons.add("reference_latent_limit")
         if feature_active and batch == 1 and settings.reference_budget == 0:
             LOGGER.info("ModeExplorer sequential feature guidance has zero reference budget (seed=%s)", seed)
             feature_active = False
@@ -722,7 +807,7 @@ class SamplerWrapper:
         if not math.isfinite(scale) or scale <= 0:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
-                  spectrum=spectrum, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
+                  spectrum=spectrum, sol=sol, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:
@@ -733,7 +818,7 @@ class SamplerWrapper:
         completed = False
         try:
             initial = noise
-            if initialize:
+            if initialize and not settings.sham:
                 from comfy.k_diffusion import sampling as native_solvers
 
                 solver = executor.class_obj.sampler_function
@@ -753,6 +838,7 @@ class SamplerWrapper:
             if settings.diagnostics:
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
+                    "sham": settings.sham,
                     "seconds": time.perf_counter() - begin, "reasons": sorted(run.reasons),
                     "native_dit_calls": run.native_dit_calls, "feature_reference_dit_calls": run.reference_calls,
                     "initialization_dit_calls": run.initialization_dit_calls,

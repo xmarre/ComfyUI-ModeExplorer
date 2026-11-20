@@ -57,7 +57,7 @@ def schedule():
 
 @torch.inference_mode()
 def draw(model, seed=55, *, batch=1, cfg=1.0, sigmas=None, mixed=False, reference=False, stage=None,
-         zero_noise=False, latent=None, mask=None, guider_basic=False, split_cfg=False):
+         zero_noise=False, latent=None, mask=None, guider_basic=False, split_cfg=False, sampler="euler"):
     x = torch.zeros(batch, 16, 1, 7, 11) if latent is None else latent
     p, n = conditions(batch, mixed=mixed, reference=reference, split_cfg=split_cfg)
     guider = Guider_Basic(model) if guider_basic else comfy.samplers.CFGGuider(model)
@@ -69,7 +69,7 @@ def draw(model, seed=55, *, batch=1, cfg=1.0, sigmas=None, mixed=False, referenc
     if stage:
         guider.model_options = {**guider.model_options, STAGE: stage}
     noise = torch.zeros_like(x) if zero_noise else comfy.sample.prepare_noise(x, seed)
-    return guider.sample(noise, x, comfy.samplers.ksampler("euler"), schedule() if sigmas is None else sigmas,
+    return guider.sample(noise, x, comfy.samplers.ksampler(sampler), schedule() if sigmas is None else sigmas,
                          denoise_mask=mask, disable_pbar=True, seed=seed)
 
 
@@ -233,6 +233,8 @@ def test_public_sampler_nodes_fix_standard_empty_latent(entry, model):
 def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     import execution
     import folder_paths
+    import os
+    from importlib.util import find_spec
 
     installed = {
         "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors"],
@@ -242,7 +244,18 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     monkeypatch.setattr(folder_paths, "get_filename_list", lambda key: installed.get(key, []))
     root = Path(__file__).resolve().parents[1]
     assert asyncio.run(nodes.load_custom_node(str(root)))
+    spectrum_available = find_spec("comfyui_spectrum_krea2") is not None
+    if spectrum_available:
+        from comfyui_spectrum_krea2.nodes import NODE_CLASS_MAPPINGS
+        monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "SpectrumApplyKrea2", NODE_CLASS_MAPPINGS["SpectrumApplyKrea2"])
+    scale_locked = os.environ.get("MODEEXPLORER_SCALE_LOCKED")
+    if scale_locked:
+        assert asyncio.run(nodes.load_custom_node(scale_locked))
     for path in sorted((root / "examples").glob("*.json")):
+        if path.name == "spectrum_ab.json" and not spectrum_available:
+            continue
+        if path.name == "scale_locked_spectrum.json" and not (scale_locked and spectrum_available):
+            continue
         graph = json.loads(path.read_text())
         node_map = {node["id"]: node for node in graph["nodes"]}
         assert len(node_map) == len(graph["nodes"])
@@ -258,7 +271,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
             for name, spec in inputs.items():
                 if name not in ports:
                     widget_inputs[name] = next(values)
-                    if len(spec) > 1 and spec[1].get("control_after_generate"):
+                    if name in ("seed", "noise_seed") or (len(spec) > 1 and spec[1].get("control_after_generate")):
                         next(values)
             assert next(values, None) is None, (path.name, item["type"])
             api[str(item["id"])] = {"class_type": item["type"], "inputs": widget_inputs}
@@ -318,3 +331,42 @@ def test_full_spectrum_is_an_opt_in_noop_without_spectrum(model):
     assert not torch.equal(draw(model), draw(opted))
     with pytest.raises(ValueError, match="full_spectrum must be a boolean"):
         node.apply(model, full_spectrum=1)
+
+
+@pytest.mark.parametrize("block", [0, 2])
+def test_optional_blocks_and_multiple_scoped_references(caplog, model, block):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    guided, = ModeExplorer().apply(
+        model, adaptive=False, diagnostics=True, feature_block=block,
+        feature_grid="6", reference_trajectories=2, reference_budget=4,
+        reference_source="per_seed", reference_selection="closest",
+        reference_continuation="rolling_euler", feature_update="verified",
+    )
+    result = draw(guided, cfg=3.5, split_cfg=True, reference=True)
+    assert torch.equal(result, draw(guided, cfg=3.5, split_cfg=True, reference=True))
+    assert not torch.equal(draw(model, cfg=3.5, split_cfg=True, reference=True), result)
+    report = traces(caplog)[-1]
+    assert report["feature_reference_dit_calls"] == 4
+    points = [p for p in report["points"] if "shift_rms" in p]
+    assert len(points) == 2 and {p["block"] for p in points} == {block}
+    assert len(set(points[0]["reference_slots"])) == 2
+    assert points[0]["reference_slots"] == points[1]["reference_slots"]
+    with pytest.raises(ValueError, match="native single-stream range"):
+        ModeExplorer().apply(model, feature_block=3)
+    assert ModeExplorer().apply(model, enabled=False, feature_block=64)[0] is model
+
+
+def test_optional_sol_isolation(caplog, model):
+    sol = pytest.importorskip("sol_h3.krea2")
+
+    caplog.set_level(logging.INFO)
+    guided, = ModeExplorer().apply(model, adaptive=False, diagnostics=True, initialization=True)
+    joint = sol.install(guided, sol.Settings(), verbose=True)
+    assert torch.isfinite(draw(joint)).all()
+    last = traces(caplog)[-1]
+    assert last["feature_reference_dit_calls"] == 2
+    assert last["initialization_dit_calls"] >= 4
+    assert any("Sol-Krea2: model_evaluations=5 " in record.message for record in caplog.records)
+    assert sol._ACTIVE.get() is None and sol._EXECUTION.get() is None
+    with pytest.raises(RuntimeError, match="before the verified Sol"):
+        ModeExplorer().apply(sol.install(model, sol.Settings()))

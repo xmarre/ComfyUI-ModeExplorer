@@ -42,6 +42,7 @@ class ModeExplorer:
             "reference_selection": (list(REFERENCE_SELECTIONS), {"default": Settings.reference_selection, "tooltip": "Use all measured references jointly, or the highest cosine match."}),
             "reference_continuation": (list(REFERENCE_CONTINUATIONS), {"default": Settings.reference_continuation, "tooltip": "Rolling Euler updates the reference with its own latest velocity. Skipped evaluations produce a larger Euler interval."}),
             "feature_update": (list(FEATURE_UPDATES), {"default": Settings.feature_update, "tooltip": "Verified adds an area-weighted mean constraint, an 8% global RMS cap, and pooled objective backtracking."}),
+            "sham": ("BOOLEAN", {"default": False, "tooltip": "Measure feature proposals and reference cost without editing attention. Initialization is skipped."}),
             "initialization_trials": ("INT", {"default": Settings.initialization_trials, "min": 1, "max": 3, "tooltip": "Maximum noise proposals after three baseline/reference guider predictions."}),
         }}
 
@@ -67,7 +68,9 @@ class ModeExplorer:
             self.verify_model(model, settings.feature_block)
             if has_spectrum(base_options, model.wrappers):
                 raise RuntimeError("Apply ModeExplorer before Spectrum: noise optimization must precede Spectrum's sampling session.")
-            verify_patch_graph(base_options, settings, model.wrappers)
+            _, sol = verify_patch_graph(base_options, settings, model.wrappers)
+            if sol is not None and not attached:
+                raise RuntimeError("Apply ModeExplorer before the verified Sol-Krea2 patch.")
 
         clone = model.clone()
         if attached:

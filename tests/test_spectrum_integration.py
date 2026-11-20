@@ -17,10 +17,10 @@ SIGMAS = torch.tensor([1.0, 0.96, 0.92, 0.85, 0.75, 0.65,
                        0.55, 0.45, 0.35, 0.25, 0.15, 0.0])
 
 
-def spectrum(model):
+def spectrum(model, warmup=2):
     return SpectrumApplyKrea2().apply(
         model, enabled=True, preset="turbo", degree=1,
-        warmup=2, tail=1, window=1, bootstrap=True, debug=True,
+        warmup=warmup, tail=1, window=1, bootstrap=True, debug=True,
     )[0]
 
 
@@ -126,3 +126,39 @@ def test_default_remains_guarded_on_same_spectrum_configuration(caplog, model):
     assert report["mode_explorer_native_steps"] == 2
     assert "ModeExplorer early-feature regime transition" in report["actual_reasons"]
     assert trace["spectrum_policy"] == "guarded"
+
+
+def test_full_spectrum_does_not_spend_references_on_bootstrap(caplog, model):
+    caplog.set_level(logging.INFO)
+    options = dict(adaptive=False, diagnostics=True, full_spectrum=True)
+    baseline = spectrum(model, warmup=1)
+    sham, = ModeExplorer().apply(model, sham=True, **options)
+    guided, = ModeExplorer().apply(model, **options)
+    baseline_result = draw(baseline, sigmas=SIGMAS)
+    sham_result = draw(spectrum(sham, warmup=1), sigmas=SIGMAS)
+    assert torch.equal(baseline_result, sham_result)
+    report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    assert any(d["step"] == 1 and d["route"] == "bootstrap" for d in report["denoiser_decisions"])
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert any(d["route"] == "forecast" and d["reference_calls"] == 0 for d in trace["decisions"])
+    changed = draw(spectrum(guided, warmup=1), sigmas=SIGMAS)
+    assert not torch.equal(changed, sham_result)
+    trace = logs(caplog, "MODEEXPLORER_TRACE ")[-1]
+    assert trace["feature_attempts"] == trace["feature_reference_dit_calls"] == 2
+    assert all(d["reference_calls"] == 0 for d in trace["decisions"] if d["route"] == "forecast")
+    assert CURRENT.get() is None
+
+
+@pytest.mark.parametrize("full", [True, False])
+def test_er_sde_interop_stage_and_seed_reproducibility(caplog, model, full):
+    caplog.set_level(logging.INFO)
+    guided, = ModeExplorer().apply(model, adaptive=False, diagnostics=True, full_spectrum=full,
+                                   initialization=True, reference_continuation="rolling_euler")
+    joint = spectrum(guided)
+    options = dict(sigmas=SIGMAS, sampler="er_sde", stage="planner")
+    result = draw(joint, **options)
+    assert torch.equal(result, draw(joint, **options))
+    assert not torch.equal(result, draw(spectrum(model), **options))
+    options["stage"] = "highres"
+    assert torch.equal(draw(joint, **options), draw(spectrum(model), **options))
+    assert CURRENT.get() is None

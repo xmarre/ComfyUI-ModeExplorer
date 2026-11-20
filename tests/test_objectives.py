@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from mode_explorer.objectives import (
-    RIDGE, feature_shift, initial_direction, lift, noise_candidate, objective, pool,
+    RIDGE, cell_areas, feature_shift, initial_direction, lift, noise_candidate, objective, pool,
     reference_noise, seed_key, select_candidate, token_pool,
 )
 from mode_explorer.runtime import (
@@ -144,3 +144,43 @@ def test_centering_preserves_coarse_mean_and_adaptive_gate():
     assert torch.count_nonzero(shift) > 0
     adaptive = feature_shift(original, mask, "feature_cosine", 0.8, 0.4, True, 0.99)[0]
     assert not torch.count_nonzero(adaptive)
+
+
+@pytest.mark.parametrize("style,key,low,high", [
+    ("feature_cosine", "temperature", 0.15, 1.7),
+    ("feature_volume", "bandwidth", 0.25, 1.2),
+])
+def test_collective_parameters_change_updates_and_pair_stays_baseline(style, key, low, high):
+    x = torch.randn(4, 8, 3, 4, generator=torch.Generator().manual_seed(88))
+    x[1] = x[0] + 0.4 * x[1]
+    x[2] = 0.4 * x[0] - x[2]
+    apply = lambda n, value: feature_shift(x[:n], ~torch.eye(n, dtype=torch.bool), style,
+                                           0.7, 0.5, False, 0.7, **{key: value})[0]
+    torch.testing.assert_close(apply(2, low), apply(2, high), rtol=0, atol=0)
+    assert not torch.allclose(apply(4, low), apply(4, high))
+    x[:] = x[0].clone()
+    assert not torch.count_nonzero(apply(4, low).abs() > 1e-5)
+
+
+@pytest.mark.parametrize("grid", [2, 4, 6, 8])
+def test_verified_shift_preserves_physical_mean_and_improves_measured_loss(grid):
+    generator = torch.Generator().manual_seed(763)
+    height, width = 9, 17
+    image = torch.randn(3, 8, height, width, generator=generator)
+    image[1] = image[0] + 0.3 * image[1]
+    image[2] = 0.4 * image[0] + image[2]
+    x = pool(image, grid)
+    areas = cell_areas(height, width, *x.shape[-2:], grid, image.device)
+    pairs = ~torch.eye(3, dtype=torch.bool)
+    shift, _, loss = feature_shift(x, pairs, "feature_volume", 0.8, 0.4, False, 0.7,
+                                   live=1, areas=areas)
+    assert torch.count_nonzero(shift[0])
+    assert not torch.count_nonzero(shift[1:])
+    expanded = lift(shift, height, width, grid=grid)
+    torch.testing.assert_close(expanded.sum(dim=(-1, -2)), torch.zeros(3, 8), atol=1e-5, rtol=0)
+    assert expanded[0].square().sum() <= 0.08**2 * (x[0].square() * areas).sum() + 1e-6
+    y = x + shift
+    y = y - (y * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum()
+    assert objective(y.flatten(1), pairs, "feature_volume")[2] < loss
+    z = torch.randn_like(x)
+    torch.testing.assert_close((x * z).sum(), (image * lift(z, height, width, adjoint=True, grid=grid)).sum())

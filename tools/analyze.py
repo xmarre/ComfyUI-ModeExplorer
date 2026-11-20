@@ -14,7 +14,8 @@ import textwrap
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
-RATINGS = ("composition_group", "prompt_adherence", "quality", "artifact", "identity")
+GROUPS = ("composition_group", "camera_group", "pose_group", "layout_group")
+RATINGS = (*GROUPS, "prompt_adherence", "quality", "artifact", "identity")
 
 
 def describe(path):
@@ -54,7 +55,7 @@ def load_ratings(path):
         for row in csv.DictReader(file):
             if row["id"] in rows:
                 raise ValueError(f"Duplicate review ID {row['id']}")
-            for key in RATINGS[1:]:
+            for key in RATINGS[len(GROUPS):]:
                 if row.get(key):
                     value = float(row[key])
                     valid = value in (0, 1) if key == "artifact" else 1 <= value <= 5
@@ -67,8 +68,8 @@ def load_ratings(path):
         return rows
 
 
-def review_assets(root, manifest, runs):
-    destination = root / "review"
+def review_assets(root, manifest, runs, stage="final"):
+    destination = root / ("review" if stage == "final" else "review_planner")
     destination.mkdir(exist_ok=True)
     ordered = sorted(runs, key=lambda row: (row["prompt_id"], row["id"]))
     with (destination / "scores.csv").open("x", newline="", encoding="utf-8") as file:
@@ -164,11 +165,30 @@ def metrics(root, rows, ratings, perceptual, keep_traces):
     }
     result["lpips"] = perceptual(paths) if perceptual is not None else None
     review = [ratings.get(row["id"], {}) for row in rows]
-    groups = [score.get("composition_group") for score in review]
-    result["human_composition_distance"] = (
-        average(float(a != b) for a, b in combinations(groups, 2)) if all(groups) else None
+    for group in GROUPS:
+        names = [score.get(group) for score in review]
+        metric = group.removesuffix("_group")
+        result[f"human_{metric}_distance"] = (
+            average(float(a != b) for a, b in combinations(names, 2)) if all(names) else None
+        )
+        result[f"human_{metric}_unique_fraction"] = len(set(names)) / len(names) if all(names) else None
+    initializations = [point for row in rows for point in (row["trace"] or {}).get("points", [])
+                       if point["kind"] == "initialization"]
+    result["initialization_acceptance"] = average(ok for run in initializations for ok in run["accepted"])
+    result["initialization_proposals"] = average(len(run.get("attempts", [])) for run in initializations)
+    def same_pixels(before, after):
+        with Image.open(before) as a, Image.open(after) as b:
+            return np.array_equal(np.asarray(a), np.asarray(b))
+    result["repeat_pixel_match"] = average(
+        same_pixels(root / row["image"], root / run["image"])
+        for row in rows for run in row.get("repeats", []) if run["sampled"]
     )
-    for key in RATINGS[1:]:
+    for route in ("actual", "forecast"):
+        result[f"spectrum_{route}"] = average(
+            sum(run[route] for run in row.get("spectrum", []))
+            for row in rows if row.get("spectrum")
+        )
+    for key in RATINGS[len(GROUPS):]:
         values = [score.get(key) for score in review]
         result[key] = average(values) if all(value is not None for value in values) else None
     if keep_traces:
@@ -220,17 +240,23 @@ def main():
     p.add_argument("--ratings", type=Path, help="A filled review CSV.")
     p.add_argument("--lpips-device", help="Optional LPIPS AlexNet calculation on the given torch device (cpu or cuda).")
     p.add_argument("--trajectory", action="store_true", help="Compare pooled features and conditional x0 by actual sigma.")
+    p.add_argument("--stage", choices=("final", "planner"), default="final")
     args = p.parse_args()
     manifest = json.loads((args.output / "manifest.json").read_text())
     runs = [json.loads(line) for line in (args.output / "runs.jsonl").read_text().splitlines()]
+    if args.stage == "planner":
+        if not runs or not all("planner_image" in row for row in runs):
+            p.error("Planner analysis requires a Scale-Locked panel with exported planner images.")
+        runs = [{**row, "image": row["planner_image"], "repeats": []} for row in runs]
     if args.baseline not in {row["method"] for row in runs}:
         p.error("The baseline is absent from runs.jsonl.")
     if args.review:
-        review_assets(args.output, manifest, runs)
+        review_assets(args.output, manifest, runs, args.stage)
     ratings = load_ratings(args.ratings)
     engine = perceptual_engine(args.lpips_device) if args.lpips_device else None
     report = analyze(args.output, runs, args.baseline, ratings, engine, args.trajectory)
-    (args.output / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    filename = "summary.json" if args.stage == "final" else "summary_planner.json"
+    (args.output / filename).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
 
 
 if __name__ == "__main__":
