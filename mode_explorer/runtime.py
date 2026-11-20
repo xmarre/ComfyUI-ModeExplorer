@@ -31,6 +31,9 @@ FRAME = f"{KEY}.frame"
 BLOCK = 1  # second single-stream block, zero-indexed
 MAX_BATCH = 8
 MAX_POINTS = 12
+MAX_INITIALIZATION_DIT = 12
+MAX_INITIALIZATION_SECONDS = 45
+MAX_INITIALIZATION_NOISE_BYTES = 32 * 1024**2
 FEATURES = ("native", "feature_cosine", "feature_volume")
 OPERATIONS = ("auto", "sequential", "batch")
 CONDITION_FLAGS = frozenset({
@@ -54,6 +57,7 @@ class Settings:
     # Experimental opt-in to the unmodified Spectrum native/forecast policy.
     # Forecasted evaluations cannot receive attention guidance.
     full_spectrum: bool = False
+    initialization_trials: int = 3
 
     def __post_init__(self):
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
@@ -66,6 +70,8 @@ class Settings:
                 raise ValueError(f"ModeExplorer {key} must be in [{low}, {high}]")
         if type(self.reference_budget) is not int or not 0 <= self.reference_budget <= 4:
             raise ValueError("ModeExplorer reference_budget must be an integer in [0, 4]")
+        if type(self.initialization_trials) is not int or not 1 <= self.initialization_trials <= 3:
+            raise ValueError("ModeExplorer initialization_trials must be an integer in [1, 3]")
         if type(self.full_spectrum) is not bool:
             raise ValueError("ModeExplorer full_spectrum must be a boolean")
 
@@ -83,6 +89,7 @@ class Run:
     reference_calls: int = 0
     initialization_guider_calls: int = 0
     initialization_dit_calls: int = 0
+    initialization_deadline: float = math.inf
     native_dit_calls: int = 0
     feature_attempts: int = 0
     spectrum_forecasts: int = 0
@@ -371,6 +378,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     if run is None:
         return executor(*arguments, **kwargs)
     if run.phase == "initialization":
+        check_initialization_budget(run)
         run.initialization_dit_calls += 1
         return executor(*arguments, **kwargs)
     run.native_dit_calls += 1
@@ -440,42 +448,102 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     return result
 
 
-def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run):
+class InitializationLimit(RuntimeError):
+    """An auxiliary forward would exceed the initialization budget."""
+
+
+def check_initialization_budget(run):
+    if run.initialization_dit_calls >= MAX_INITIALIZATION_DIT:
+        raise InitializationLimit("initialization_dit_limit")
+    if time.perf_counter() >= run.initialization_deadline:
+        raise InitializationLimit("initialization_time_limit")
+
+
+def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evaluation_sigma=None):
     from comfy.model_management import throw_exception_if_processing_interrupted
 
+    # Four base-sized FP32 predictions (baseline, two references and one
+    # candidate) are retained at most, with a constant number of scratch latents.
+    if 4 * noise.numel() > MAX_INITIALIZATION_NOISE_BYTES:
+        run.reasons.add("initialization_latent_limit")
+        return noise
     sampling = model_wrap.inner_model.model_sampling
     sigma = sigmas[0]
-    sigma_batch = sigma.expand(run.batch)
+    sigma_batch = (sigma if evaluation_sigma is None else evaluation_sigma).expand(run.batch)
 
     def estimate(raw_noise):
         throw_exception_if_processing_interrupted()
+        check_initialization_budget(run)
         run.initialization_guider_calls += 1
         x = sampling.noise_scaling(sigma, raw_noise, latent_image, True)
-        return model_wrap(x, sigma_batch, model_options=options, seed=run.seed).float()
+        with isolated_spectrum_reference(run):
+            return model_wrap(x, sigma_batch, model_options=options, seed=run.seed).float()
 
+    selected = noise
     run.phase = "initialization"
+    run.initialization_deadline = time.perf_counter() + MAX_INITIALIZATION_SECONDS
+    accepted = torch.zeros(run.batch, device=noise.device, dtype=torch.bool)
+    attempts = []
+    limit = 0.32 - 0.27 * run.settings.fidelity
+    broadcast = (run.batch,) + (1,) * (noise.ndim - 1)
     try:
-        clean = estimate(noise)
-        refs = (estimate(reference_noise(noise, 0)), estimate(reference_noise(noise, 1)))
-        clean_image = spatial_image(clean)
-        ref_images = tuple(spatial_image(ref) for ref in refs)
-        direction, volume, bandwidth = initial_direction(clean_image, ref_images)
-        direction = direction * (run.start * run.noise_scale)
-        candidate = noise_candidate(noise, direction.reshape_as(noise), run.settings.strength * 0.18)
-        candidate_clean = estimate(candidate)
-        chosen, accepted, gain, relative = select_candidate(
-            spatial_image(noise), spatial_image(candidate), clean_image, spatial_image(candidate_clean),
-            ref_images, volume, bandwidth, run.settings.fidelity,
-        )
-        selected = chosen.reshape_as(noise)
-        if run.settings.diagnostics:
-            run.points.append({
-                "kind": "initialization", "accepted": accepted.cpu().tolist(),
-                "volume_gain": as_list(gain), "relative_clean_shift": as_list(relative),
-            })
+        clean = spatial_image(estimate(noise))
+        refs = tuple(spatial_image(estimate(reference_noise(noise, i))) for i in range(2))
+        direction, volume, bandwidth = initial_direction(clean, refs)
+        valid = torch.stack([torch.isfinite(t).flatten(1).all(dim=1) for t in (clean, *refs)]).all(dim=0)
+        valid &= clean.flatten(1).square().mean(dim=1).sqrt() > 1e-7
+        radius = torch.full_like(volume, run.settings.strength * 0.18)
+        for _ in range(run.settings.initialization_trials):
+            active = valid & ~accepted & (radius > 1e-7)
+            if not active.any():
+                break
+            candidate = noise_candidate(noise, direction.reshape_as(noise), radius[:, None])
+            changed = (candidate != noise).flatten(1).any(dim=1) & active
+            if not changed.any():
+                run.reasons.add("initialization_no_representable_direction")
+                break
+            candidate = torch.where(changed.reshape(broadcast), candidate, noise)
+            before = run.initialization_dit_calls
+            candidate_clean = spatial_image(estimate(candidate))
+            _, passed, gain, relative = select_candidate(
+                spatial_image(noise), spatial_image(candidate), clean, candidate_clean,
+                refs, volume, bandwidth, run.settings.fidelity,
+            )
+            newly_accepted = changed & passed
+            selected = torch.where(newly_accepted.reshape(broadcast), candidate, selected)
+            accepted |= newly_accepted
+            if run.settings.diagnostics:
+                statuses = [
+                    "inactive" if not attempted else
+                    "accepted" if ok else
+                    "nonfinite" if not (math.isfinite(d) and math.isfinite(g)) else
+                    "outside_trust_region" if d > limit else "insufficient_volume_gain"
+                    for attempted, ok, d, g in zip(
+                        changed.tolist(), newly_accepted.tolist(), as_list(relative), as_list(gain))
+                ]
+                attempts.append({
+                    "rms_budget": as_list(radius), "volume_gain": as_list(gain),
+                    "relative_clean_shift": as_list(relative), "status": statuses,
+                    "guider_calls": 1, "dit_calls": run.initialization_dit_calls - before,
+                })
+            # Use measured overshoot to propose an interior radius. Shrink
+            # geometrically on a rejected objective or nonfinite prediction.
+            ratio = (0.8 * limit / relative).clamp(0.0625, 0.5)
+            shrink = torch.where(torch.isfinite(relative) & (relative > limit), ratio, 0.5)
+            radius = torch.where(changed, radius * shrink, 0)
+            del candidate_clean
+        return selected
+    except InitializationLimit as exc:
+        run.reasons.add(str(exc))
         return selected
     finally:
         run.phase = "sample"
+        if run.settings.diagnostics:
+            run.points.append({
+                "kind": "initialization", "accepted": accepted.tolist(), "attempts": attempts,
+                "relative_clean_limit": limit, "guider_calls": run.initialization_guider_calls,
+                "dit_calls": run.initialization_dit_calls,
+            })
 
 
 class SamplerWrapper:
@@ -561,7 +629,19 @@ class SamplerWrapper:
             })
         completed = False
         try:
-            initial = optimize_noise(model_wrap, sigmas, options, noise, latent_image, run) if initialize else noise
+            initial = noise
+            if initialize:
+                from comfy.k_diffusion import sampling as native_solvers
+
+                solver = executor.class_obj.sampler_function
+                evaluation_sigma = sigmas[0]
+                if solver in (getattr(native_solvers, name, None) for name in
+                              ("sample_er_sde", "sample_sa_solver", "sample_sa_solver_pece")):
+                    evaluation_sigma = native_solvers.offset_first_sigma_for_snr(sigmas, sampling)[0]
+                if solver is native_solvers.sample_euler and executor.class_obj.extra_options.get("s_churn", 0):
+                    run.reasons.add("initialization_euler_churn")
+                else:
+                    initial = optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evaluation_sigma)
             result = sample({**extra_args, "model_options": options}, initial)
             completed = True
             return result

@@ -126,7 +126,7 @@ def feature_shift(
     return direction * limit * rate[..., None, None], nearest.squeeze(-1), loss
 
 
-def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: float) -> torch.Tensor:
+def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: float | torch.Tensor) -> torch.Tensor:
     """Rotate each noise tensor toward an ascent direction on its original radius."""
     flat = noise.float().flatten(1)
     drift = direction.float().flatten(1)
@@ -138,7 +138,7 @@ def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: fl
     chord = rms_budget * math.sqrt(flat.shape[1])
     angle = 2 * (chord / (2 * radius.clamp_min(EPS))).clamp(max=0.5).asin()
     moved = radius * (unit * angle.cos() + tangent * angle.sin())
-    moved = torch.where((magnitude > EPS) & (radius > EPS), moved, flat)
+    moved = torch.where((magnitude > EPS) & (radius > EPS) & torch.isfinite(moved), moved, flat)
     return moved.reshape_as(noise).to(noise.dtype)
 
 
