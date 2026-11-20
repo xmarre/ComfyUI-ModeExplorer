@@ -24,6 +24,7 @@ PROFILE_CONTROLS = {
     "feature_block", "feature_grid", "cosine_temperature", "volume_bandwidth", "volume_median",
     "reference_source", "reference_bank_size", "reference_trajectories", "reference_selection",
     "reference_continuation", "feature_update", "sham", "initialization_trials",
+    "feature_direction", "direction_trial",
     "reference_budget", "strength", "fidelity", "min_sigma", "adaptive", "similarity", "diagnostics",
 }
 SPECTRUM_CONTROLS = {

@@ -185,6 +185,26 @@ def feature_shift(
     return shift, nearest.squeeze(-1), loss
 
 
+def direction_control(shift: torch.Tensor, mode: str, seed: int, trial: int) -> torch.Tensor:
+    """Change the bounded proposal direction without changing any cell norm.
+
+    The sign mask is shared across spatial cells and evaluations, and uses
+    a private CPU RNG stream independent of the sampler and reference bank.
+    It preserves per-channel spatial power but is not generally tangent to
+    the live feature vector.
+    """
+    if mode == "repel":
+        return shift
+    if mode == "reverse":
+        return -shift
+    if mode == "channel_sign":
+        generator = torch.Generator(device="cpu").manual_seed(seed_key(seed, f"direction-control-{trial}"))
+        signs = torch.randint(0, 2, (shift.shape[1],), generator=generator, device="cpu")
+        signs = signs.to(device=shift.device, dtype=shift.dtype).mul_(2).sub_(1)
+        return shift * signs[None, :, None, None]
+    raise ValueError(f"Unknown feature direction {mode}")
+
+
 def noise_candidate(noise: torch.Tensor, direction: torch.Tensor, rms_budget: float | torch.Tensor) -> torch.Tensor:
     """Rotate each noise tensor toward an ascent direction on its original radius."""
     flat = noise.float().flatten(1)

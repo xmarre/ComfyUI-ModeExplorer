@@ -1,7 +1,7 @@
 """ComfyUI registration and clone ownership."""
 
 from .runtime import (
-    FEATURES, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
+    FEATURES, FEATURE_DIRECTIONS, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
     REFERENCE_SELECTIONS, REFERENCE_SOURCES, SamplerWrapper, Settings, attention_feature,
     diffusion_wrapper, has_spectrum, verify_patch_graph,
 )
@@ -44,6 +44,8 @@ class ModeExplorer:
             "feature_update": (list(FEATURE_UPDATES), {"default": Settings.feature_update, "tooltip": "Verified adds an area-weighted mean constraint, an 8% global RMS cap, and pooled objective backtracking."}),
             "sham": ("BOOLEAN", {"default": False, "tooltip": "Measure feature proposals and reference cost without editing attention. Initialization is skipped."}),
             "initialization_trials": ("INT", {"default": Settings.initialization_trials, "min": 1, "max": 3, "tooltip": "Maximum noise proposals after three baseline/reference guider predictions."}),
+            "feature_direction": (list(FEATURE_DIRECTIONS), {"default": Settings.feature_direction, "tooltip": "Causal experiment: repel is normal; reverse negates the bounded edit; channel_sign randomizes channel signs at identical pre-rounding cell norms. Controls require bounded update."}),
+            "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,

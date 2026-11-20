@@ -16,6 +16,7 @@ import torch
 from .objectives import (
     cell_areas,
     cell_size,
+    direction_control,
     feature_shift,
     initial_direction,
     noise_candidate,
@@ -46,6 +47,7 @@ REFERENCE_SOURCES = ("bank", "per_seed")
 REFERENCE_SELECTIONS = ("all", "closest")
 REFERENCE_CONTINUATIONS = ("first_estimate", "rolling_euler")
 FEATURE_UPDATES = ("bounded", "verified")
+FEATURE_DIRECTIONS = ("repel", "reverse", "channel_sign")
 FEATURE_GRIDS = (2, 4, 6, 8)
 CONDITION_FLAGS = frozenset({
     "area", "mask", "control", "hooks", "gligen", "start_percent", "end_percent",
@@ -81,6 +83,8 @@ class Settings:
     reference_continuation: str = "first_estimate"
     feature_update: str = "bounded"
     sham: bool = False
+    feature_direction: str = "repel"
+    direction_trial: int = 0
 
     def __post_init__(self):
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
@@ -106,10 +110,14 @@ class Settings:
         for key, choices in (
             ("feature_grid", FEATURE_GRIDS), ("reference_source", REFERENCE_SOURCES),
             ("reference_selection", REFERENCE_SELECTIONS), ("reference_continuation", REFERENCE_CONTINUATIONS),
-            ("feature_update", FEATURE_UPDATES),
+            ("feature_update", FEATURE_UPDATES), ("feature_direction", FEATURE_DIRECTIONS),
         ):
             if getattr(self, key) not in choices:
                 raise ValueError(f"ModeExplorer received an unknown {key}")
+        if self.feature_direction != "repel" and self.feature_update != "bounded":
+            raise ValueError("ModeExplorer direction controls require the bounded feature update")
+        if type(self.direction_trial) is not int or not 0 <= self.direction_trial <= 31:
+            raise ValueError("ModeExplorer direction_trial must be an integer in [0, 31]")
         if self.reference_source == "bank" and self.reference_trajectories > self.reference_bank_size:
             raise ValueError("ModeExplorer reference bank must fit all trajectories")
         for key in ("full_spectrum", "volume_median", "sham"):
@@ -165,6 +173,7 @@ class Frame:
     reference: torch.Tensor | None = None
     pooled: torch.Tensor | None = None
     metrics: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    edit_metrics: dict | None = None
     seen: bool = False
     prepare: object = None
     attempted: bool = False
@@ -422,6 +431,30 @@ def equal_condition_pairs(batch: int, offset: int, context, attention_mask, ref_
     return pairs
 
 
+def pooled_edit_metrics(before, after, pairs, proposal, repulsion, live, areas=None):
+    """Measure the actual pooled update after native-dtype addition."""
+    dims = (1, 2, 3)
+    difference = after[:live] - before[:live]
+    rms = difference.square().mean(dim=dims).sqrt()
+    base_rms = before[:live].square().mean(dim=dims).sqrt()
+    a, b = proposal[:live].flatten(1), repulsion[:live].flatten(1)
+    alignment = (a * b).sum(dim=1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(torch.finfo(a.dtype).tiny)
+    alignment = alignment.clamp(-1, 1)
+    if areas is None:
+        centered = after - after.mean(dim=(-1, -2), keepdim=True)
+    else:
+        centered = after - (after * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum()
+    unit, _, valid = unit_rows(centered.flatten(1))
+    cosine = (unit @ unit.T).clamp(-1, 1)
+    nearest = cosine.masked_fill(~(pairs & valid & valid.T), -1).amax(dim=-1)
+    return {
+        "applied_pooled_shift_rms": rms,
+        "applied_pooled_relative_rms": rms / base_rms.clamp_min(1e-7),
+        "proposal_direction_cosine": alignment,
+        "nearest_cosine_after": nearest[:live],
+    }
+
+
 def attention_feature(output, options):
     frame = options.get(FRAME)
     if frame is None or options.get("block_type") != "single" or options.get("block_index") != frame.run.settings.feature_block:
@@ -464,12 +497,18 @@ def attention_feature(output, options):
         bandwidth=settings.volume_bandwidth, median_bandwidth=settings.volume_median,
         live=frame.batch, areas=areas,
     )
-    if settings.diagnostics and len(frame.run.points) < MAX_POINTS:
+    repulsion = shift
+    if settings.feature_direction != "repel":
+        shift = direction_control(shift, settings.feature_direction, frame.run.seed, settings.direction_trial)
+    trace_edit = settings.diagnostics and len(frame.run.points) < MAX_POINTS
+    if trace_edit:
         frame.metrics = (
             redundancy[:frame.batch], loss,
             shift[:frame.batch].square().mean(dim=(1, 2, 3)).sqrt(),
         )
     if settings.sham:
+        if trace_edit:
+            frame.edit_metrics = pooled_edit_metrics(current, current, pairs, shift, repulsion, frame.batch, areas)
         return output
     result = output.clone()
     view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
@@ -478,6 +517,10 @@ def attention_feature(output, options):
     for iy in range(shift.shape[-2]):
         delta = shift[:frame.batch, :, iy].to(output.dtype).repeat_interleave(sx, dim=-1)
         view[:, iy * sy:(iy + 1) * sy].add_(delta[:, :, :width].transpose(1, 2)[:, None])
+    if trace_edit:
+        edited = token_pool(result[numbers[0]:numbers[1], start:end], height, width, settings.feature_grid)
+        after = torch.cat((edited, current[frame.batch:]), dim=0) if frame.reference is not None else edited
+        frame.edit_metrics = pooled_edit_metrics(current, after, pairs, shift, repulsion, frame.batch, areas)
     return result
 
 
@@ -525,6 +568,8 @@ def record(frame, x, velocity):
         cosine, loss, rms = frame.metrics
         point.update(nearest_cosine=as_list(cosine), objective=as_list(loss), shift_rms=as_list(rms),
                      edit_applied=not frame.run.settings.sham, reference_slots=frame.reference_slots)
+    if frame.edit_metrics is not None:
+        point.update({key: as_list(value) for key, value in frame.edit_metrics.items()})
     frame.run.points.append(point)
 
 
@@ -920,7 +965,8 @@ class SamplerWrapper:
             if settings.diagnostics:
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
-                    "sham": settings.sham,
+                    "sham": settings.sham, "feature_direction": settings.feature_direction,
+                    "direction_trial": settings.direction_trial,
                     "seconds": time.perf_counter() - begin, "reasons": sorted(run.reasons),
                     "native_dit_calls": run.native_dit_calls, "feature_reference_dit_calls": run.reference_calls,
                     "initialization_dit_calls": run.initialization_dit_calls,
