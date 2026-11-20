@@ -120,6 +120,24 @@ def test_render_reads_native_api_history_image_and_trace(tmp_path, monkeypatch):
     assert record["sampled_peak_device_mib"] is None
 
 
+def test_paired_fingerprints_and_edit_measurements():
+    def row(seed, value):
+        return {"seed": seed, "trace": {"points": [{
+            "kind": "trajectory", "sigma": 0.99, "attention": [[1, 1]],
+            "conditional_x0": [[value, 0]], "nearest_cosine": [0.6], "nearest_cosine_after": [0.5],
+            "applied_pooled_relative_rms": [0.01], "proposal_direction_cosine": [1.0],
+        }]}}
+    native = [row(1, 2), row(2, 4)]
+    guided = [row(2, 6), row(1, 3)]
+    assert analyze.paired_trajectory(guided, native)["paired_x0_fingerprint_relative_l2@0.99"] == 0.5
+    summary = analyze.trajectory(guided)
+    assert summary["applied_pooled_relative_rms@0.99"] == 0.01
+    assert abs(summary["nearest_cosine_change@0.99"] + 0.1) < 1e-8
+    guided[0]["trace"]["points"].append(guided[0]["trace"]["points"][0])
+    guided[1]["trace"]["points"] = []
+    assert not analyze.paired_trajectory(guided, native)
+
+
 def test_defect_transition_counts_exclude_missing_scores():
     native = [{"seed": i, "id": f"n{i}"} for i in range(5)]
     guided = [{"seed": i, "id": f"g{i}"} for i in range(5)]

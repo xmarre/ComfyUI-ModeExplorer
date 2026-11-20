@@ -134,6 +134,7 @@ def perceptual_engine(device):
 
 def trajectory(rows):
     by_metric = defaultdict(list)
+    by_edit = defaultdict(list)
     for row in rows:
         seen = set()
         for item in (row["trace"] or {}).get("points", []):
@@ -147,10 +148,52 @@ def trajectory(rows):
                 values = np.asarray(item[key][0], dtype=np.float64)
                 if np.isfinite(values).all():
                     by_metric[(sigma, key)].append(values)
-    return {
+            for key in ("applied_pooled_relative_rms", "applied_pooled_shift_rms", "proposal_direction_cosine"):
+                if item.get(key) and item[key][0] is not None:
+                    by_edit[(sigma, key)].append(item[key][0])
+            if item.get("nearest_cosine_after") and item.get("nearest_cosine"):
+                before, after = item["nearest_cosine"][0], item["nearest_cosine_after"][0]
+                if before is not None and after is not None:
+                    by_edit[(sigma, "nearest_cosine_change")].append(after - before)
+    result = {
         f"{key}@{sigma:g}": average(cosine_distance(a, b) for a, b in combinations(items, 2))
         for (sigma, key), items in by_metric.items() if len(items) >= 2
     }
+    result.update({f"{key}@{sigma:g}": average(items) for (sigma, key), items in by_edit.items()})
+    return result
+
+
+def paired_trajectory(rows, baseline_rows):
+    """Compare projected conditional-clean states at common, unique sigmas."""
+    def points(row):
+        result, duplicate = {}, set()
+        for p in (row.get("trace") or {}).get("points", []):
+            if p["kind"] != "trajectory":
+                continue
+            sigma = round(p["sigma"], 5)
+            if sigma in result:
+                duplicate.add(sigma)
+            result[sigma] = p
+        return {sigma: p for sigma, p in result.items() if sigma not in duplicate}
+
+    baseline = {row["seed"]: points(row) for row in baseline_rows}
+    by_sigma = defaultdict(list)
+    for row in rows:
+        reference = baseline.get(row["seed"], {})
+        for sigma, p in points(row).items():
+            q = reference.get(sigma)
+            if q is None:
+                continue
+            a = np.asarray(p["conditional_x0"], dtype=np.float64)
+            b = np.asarray(q["conditional_x0"], dtype=np.float64)
+            if a.shape != b.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
+                continue
+            norm = float(np.linalg.norm(b))
+            if norm <= 1e-8:
+                continue
+            by_sigma[sigma].append(float(np.linalg.norm(a - b) / norm))
+    return {f"paired_x0_fingerprint_relative_l2@{sigma:g}": average(values)
+            for sigma, values in by_sigma.items()}
 
 
 def metrics(root, rows, ratings, perceptual, keep_traces):
@@ -256,6 +299,9 @@ def analyze(root, runs, baseline, ratings, perceptual, keep_traces):
             ref = baseline_cache[cache_key]
             for key, value in data.items():
                 compared.setdefault(key, []).append((value, ref.get(key)))
+            if keep_traces:
+                for key, value in paired_trajectory(rows, native).items():
+                    compared.setdefault(key, []).append((value, 0.0))
             n_seeds += len(matched)
         summaries[method] = {"matched_seed_pairs": n_seeds, "metrics": {}, "defect_transitions": defects}
         for key, records in compared.items():
