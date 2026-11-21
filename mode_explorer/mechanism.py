@@ -59,6 +59,10 @@ class MechanisticSettings:
     def signed(self):
         return self.mode == "signed" or self.mode.startswith("joint")
 
+    @property
+    def core_arms(self):
+        return 2 + int(self.signed) + 2 * int(self.conditioning)
+
     def __post_init__(self):
         if self.mode not in MODES or self.component not in COMPONENTS or self.band not in FILTERS:
             raise ValueError("Unknown mechanistic mode, component or frequency band.")

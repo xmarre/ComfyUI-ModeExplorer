@@ -1,9 +1,13 @@
+from dataclasses import fields
+import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
 
-from mode_explorer.mechanism import conditioning_terms, filter_field, paired_measurement, signed_terms
+from mode_explorer.mechanism import MechanisticSettings, conditioning_terms, filter_field, paired_measurement, signed_terms
+from mode_explorer.mechanism_runtime import estimate_capture_workspace
 
 
 @pytest.mark.parametrize("h,w", [(9, 15), (8, 16)])
@@ -83,3 +87,24 @@ def test_patch_and_latent_measure_same_bands_and_resolve_diagonal_support():
         recovered = sum(filter_field(shared + sub_patch, band, .0625, .125, transition, patch_size=2)
                         for band in ("low", "mid", "high", "sub_patch"))
         torch.testing.assert_close(recovered, shared + sub_patch, atol=1e-6, rtol=1e-5)
+
+
+def test_published_profiles_pass_production_capture_preflight():
+    path = Path(__file__).resolve().parents[1] / "tools" / "mechanistic_profiles.json"
+    profiles = json.loads(path.read_text())
+    spec_fields = {field.name for field in fields(MechanisticSettings)} - {"mode", "alternate"}
+    for name, profile in profiles["profiles"].items():
+        options = {**profiles["common"], **profile["settings"]}
+        spec = MechanisticSettings(mode=options["experiment"], alternate=object(),
+                                   **{key: options[key] for key in spec_fields & options.keys()})
+        # 1632 × 2464 planner, 8× latent compression, 2× latent patches.
+        # Budget the instrumented baseline even when it could be reused.
+        captures, reserve = estimate_capture_workspace(
+            spec, feature_block=options["feature_block"], grid=(308 // 2, 204 // 2),
+            latent_shape=(1, 16, 1, 308, 204), attention_channels=6144, patch_size=2,
+            baseline_reused=False,
+        )
+        assert captures + reserve <= spec.capture_mib * 1024**2, name
+        if name == "conditioning_fixed":
+            assert spec.mode == "conditioning_fixed"
+            assert spec.core_arms == 4

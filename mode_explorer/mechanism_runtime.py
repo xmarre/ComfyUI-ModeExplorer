@@ -244,6 +244,33 @@ def _amplitude(full_plus, full_minus, half_plus, half_minus, base):
             "even_quadratic_relative_change": rms(4 * even_half - even) / rms(even) if rms(even) else None}
 
 
+def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, attention_channels, patch_size,
+                               baseline_reused):
+    """Return conservative bytes for staged captures and other CPU workspace."""
+    points = math.prod(grid)
+    projection_channels = latent_shape[1] * patch_size**2
+    block_sites = sum(site not in (_GLOBAL | UNAVAILABLE) for site in spec.site_names)
+    site_channels = attention_channels * len(spec.block_ids) * block_sites
+    if {_PACKED_PROJECTION, _UNPATCHED_PROJECTION}.intersection(spec.site_names):
+        site_channels += projection_channels
+
+    captured_arms = spec.core_arms - int(baseline_reused)
+    edited_arms = 1 + int(spec.signed) + int(spec.conditioning)
+    # Even when unrequested, each edit captures its input and output for validation.
+    extra_edit_sites = 2
+    if feature_block in spec.block_ids:
+        extra_edit_sites -= sum(site in spec.site_names for site in ("attention_pre", "attention_post"))
+    main_channels = site_channels * captured_arms + attention_channels * extra_edit_sites * edited_arms
+    # Calibration captures run after the main sites are released.
+    capture_bytes = 4 * points * max(main_channels, 4 * attention_channels * int(spec.amplitude_check))
+
+    fft_bytes = max(points, math.prod(latent_shape[-2:])) * (128 * spec.chunk + 128)
+    output_bytes = math.prod(latent_shape) * 4 * (10 + 4 * spec.core_arms + 4 * int(spec.amplitude_check))
+    if _UNPATCHED_PROJECTION in spec.site_names:
+        output_bytes += 4 * points * projection_channels * captured_arms
+    return capture_bytes, fft_bytes + output_bytes
+
+
 def research_response(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                       kwargs, native_velocity, point, spend, reference_sigma, initial_ordinal, ordinal, probe_seed):
     from .response_runtime import _tensor_hash, _tensor_value_hash
@@ -307,7 +334,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         raise ValueError("mechanistic_block_out_of_range")
     channels = dit.blocks[cfg.feature_block].attn.wo.in_features
     points = math.prod(frame.grid)
-    core_arms = 2 + int(spec.signed) + 2 * int(spec.conditioning)
+    core_arms = spec.core_arms
     rebuild = reference_sigma != frame.sigma
     recomputed = spec.mode.endswith("recomputed")
     ref_branches = ("C0", "C1") if recomputed else ("C0",)
@@ -334,26 +361,14 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                  feature_reference_origin="reconstructed_first_estimate" if rebuild else "initial_shadow")
     if run.response.forwards + required > cfg.auxiliary_budget:
         raise ValueError("auxiliary_forward_budget")
-    # Float32 is conservative for native capture on current supported kernels.
-    # Reserve space for paired FFT reductions, clean fields, and two edited captures
-    # per arm even if neither attention measurement was selected.
-    site_channels = channels * sum(s not in (_GLOBAL | UNAVAILABLE) for _, s in keys)
-    if {_PACKED_PROJECTION, _UNPATCHED_PROJECTION}.intersection(spec.site_names):
-        site_channels += dit.channels * dit.patch**2
-    captured_arms = core_arms - int(can_reuse)
-    edited_arms = 1 + int(spec.signed) + int(spec.conditioning)
-    extra_edit_sites = 2 - (sum(s in spec.site_names for s in ("attention_pre", "attention_post"))
-                            if cfg.feature_block in spec.block_ids else 0)
-    fft_bytes = max(points, math.prod(latent.shape[-2:])) * (128 * spec.chunk + 128)
-    output_bytes = latent.numel() * 4 * (10 + (4 * core_arms) + 4 * int(spec.amplitude_check))
-    if _UNPATCHED_PROJECTION in spec.site_names:
-        output_bytes += 4 * points * dit.channels * dit.patch**2 * captured_arms
-    main_site_channels = site_channels * captured_arms + channels * extra_edit_sites * edited_arms
-    site_bytes = 4 * points * max(main_site_channels, 4 * channels * int(spec.amplitude_check))
-    stage["capture_preflight_bytes"] = fft_bytes + output_bytes + site_bytes
+    capture_bytes, reserve_bytes = estimate_capture_workspace(
+        spec, feature_block=cfg.feature_block, grid=frame.grid, latent_shape=latent.shape,
+        attention_channels=channels, patch_size=dit.patch, baseline_reused=can_reuse,
+    )
+    stage["capture_preflight_bytes"] = capture_bytes + reserve_bytes
     if stage["capture_preflight_bytes"] > stage["capture_budget_bytes"]:
         raise CaptureLimit("mechanistic_capture_preflight")
-    workspace = Workspace(stage["capture_budget_bytes"] - fft_bytes - output_bytes)
+    workspace = Workspace(stage["capture_budget_bytes"] - reserve_bytes)
 
     # GPU-side allowance covers the cloned attention output (including non-image
     # tokens), references and latent fields. Full-resolution captures live on CPU.

@@ -55,18 +55,20 @@ def test_signed_uses_exact_matched_image_sites_and_preserves_native_cfg(model, c
     assert exp["amplitude"]["status"] == "measured"
 
 
-@pytest.mark.parametrize("mode,calls", [("joint_fixed", 7), ("joint_recomputed", 9)])
+@pytest.mark.parametrize("mode,calls", [("conditioning_fixed", 6), ("joint_fixed", 7), ("joint_recomputed", 9)])
 def test_conditioning_different_text_lengths_and_same_reference(model, caplog, mode, calls):
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     positive, _ = conditions(reference=True)
     alt = [[positive[0][0][:, :3] * -.75, {**positive[0][1], "pooled_output": None,
                                            "attention_mask": torch.tensor([[1, 1, 0]])}]]
-    m = patched(model, experiment=mode, alternate=alt, sites="attention_post,clean")
+    m = patched(model, experiment=mode, alternate=alt, sites="attention_post,clean", auxiliary_budget=calls)
     assert torch.equal(draw(model, reference=True), draw(m, reference=True))
     p = point(caplog)
     assert p["status"] == "completed", p
     assert p["auxiliary_dit_calls"] == calls
     e = p["mechanistic"]
+    if mode == "conditioning_fixed":
+        assert set(e["arms"]) == {"D00", "D01", "D10", "D11"}
     assert [e["conditioning"][k]["tokens"] for k in ("C0", "C1")] == [5, 3]
     assert e["conditioning"]["C1"]["metadata_mask_sha256"]
     assert e["conditioning"]["C1"]["mask_sha256"] is None

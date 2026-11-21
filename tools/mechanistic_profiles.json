@@ -26,8 +26,8 @@
       "checks": ["mechanistic.sites.b5.projection_input", "mechanistic.sites.final_projection_unpatched", "mechanistic.sites.clean", "mechanistic.amplitude", "export_status"]
     },
     "conditioning_fixed": {
-      "settings": {"experiment": "joint_fixed", "blocks": "5,12", "sites": "projection_input,after_mlp,clean", "states": 1, "auxiliary_budget": 7, "capture_mib": 8192},
-      "expected_calls_upper_bound": 7,
+      "settings": {"experiment": "conditioning_fixed", "blocks": "5,12", "sites": "projection_input,after_mlp,clean", "states": 1, "auxiliary_budget": 6, "capture_mib": 8192},
+      "expected_calls_upper_bound": 6,
       "checks": ["mechanistic.conditioning_realized_edit", "mechanistic.sites.clean.comparisons.conditioning_interaction"]
     },
     "active_component": {
