@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
 from .mechanism import measure_comparisons
+from .projection_activation import ActivationStudy, stage_metrics, transitions
 
 
 class ProjectionUnavailable(ValueError):
@@ -178,7 +179,7 @@ def _response_sizes(captures, terms, chunk):
     return math.sqrt(float(norm))
 
 
-def _component_fields(terms, captures, reference, token_chunk, cast_check, interrupt):
+def _component_fields(terms, captures, reference, token_chunk, cast_check, interrupt, staged=None):
     device = reference.weight.device
     first = captures[terms[0][1]]
     in_dim, out_dim = first.inputs.shape[-1], first.output.shape[-1]
@@ -188,6 +189,7 @@ def _component_fields(terms, captures, reference, token_chunk, cast_check, inter
     residual = torch.empty_like(linear)
     executed = torch.empty_like(linear)
     cast = torch.empty_like(linear) if cast_check else None
+    no_quant, no_rotation = (torch.empty_like(linear), torch.empty_like(linear)) if staged is not None else (None, None)
     floor = torch.zeros((), dtype=torch.float64, device=device)
 
     for t in range(0, count, token_chunk):
@@ -218,7 +220,10 @@ def _component_fields(terms, captures, reference, token_chunk, cast_check, inter
         residual[span] = output_delta - expected
         if cast is not None:
             cast[span] = cast_delta
-    return input_delta, linear, residual, executed, cast, math.sqrt(float(floor))
+        if staged is not None:
+            no_quant[span] = sum(scale * staged[name][0][span].double() for scale, name in terms)
+            no_rotation[span] = sum(scale * staged[name][1][span].double() for scale, name in terms)
+    return input_delta, linear, residual, executed, cast, math.sqrt(float(floor)), no_quant, no_rotation
 
 
 def _replay_error(result, cap, grid, spec, patch, chunk):
@@ -237,7 +242,71 @@ def _replay_error(result, cap, grid, spec, patch, chunk):
     return metrics
 
 
-def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt):
+def _activation_stages(reference, captures, spec, report, timing, interrupt):
+    info = report["activation_counterfactual"] = {"status": "unqualified", "packed_emulation": {},
+                                                 "reference_matmul_passes": 0}
+    if reference.storage is None:
+        info["reason"] = "requires_observed_tensorwise_int8_weight"
+        return None
+    if any(cap.inputs.dtype not in (torch.float16, torch.bfloat16, torch.float32) or
+           cap.output.dtype != cap.inputs.dtype for cap in captures.values()):
+        info["reason"] = "unsupported_eager_activation_or_output_dtype"
+        return None
+    try:
+        study = ActivationStudy(reference, spec, interrupt)
+    except ImportError:
+        info["reason"] = "eager_int8_contract_unavailable"
+        return None
+
+    arms = {}
+    device = reference.weight.device
+    with timing.measure("projection_activation_emulation", device):
+        for name, cap in captures.items():
+            try:
+                status, arm = study.qualify(cap.inputs, cap.output, cap.bounds)
+            except NotImplementedError:
+                info["reason"] = "eager_int8_accumulation_unavailable"
+                return None
+            info["packed_emulation"][name] = status
+            if arm is not None:
+                arms[name] = arm
+        if len(arms) != len(captures):
+            info["reason"] = "packed_eager_emulation_mismatch"
+            return None
+        info["quantization_observation"] = "eager_emulated_codes_and_row_scales_after_packed_bitwise_match"
+        info["epilogue_model"] = "fp32_row_scale_times_weight_scale_then_product_output_cast_then_bias_add"
+        qualify_pairs = {}
+        if "D0minus" in arms:
+            qualify_pairs["full"] = ("D01", "D0minus")
+        if "D0half_minus" in arms:
+            qualify_pairs["half"] = ("D0half_plus", "D0half_minus")
+        info["quantization_transitions"] = {
+            label: transitions(arms["D00"], arms[plus], arms[minus], study.token_chunk, interrupt)
+            for label, (plus, minus) in qualify_pairs.items()
+        }
+
+    staged = {}
+    with timing.measure("projection_activation_reference", device):
+        for name, cap in captures.items():
+            arm = arms[name] if name == "D00" and spec.projection_symmetric_check else arms.pop(name)
+            staged[name] = study.without_quantization(cap.inputs, arm, cap.bounds, cap.output.dtype)
+            info["reference_matmul_passes"] += 1 + int(reference.rotation is not None)
+    info.update(status="qualified", components={})
+    return study, staged, arms.get("D00")
+
+
+def _symmetric_activation(activation, source, native, bounds, name, info, timing):
+    study = activation[0]
+    with timing.measure("projection_activation_emulation", source.device):
+        try:
+            check, arm = study.qualify(source, native, bounds)
+        except NotImplementedError:
+            check, arm = {"packed_bit_exact": False, "reason": "eager_int8_accumulation_unavailable"}, None
+    info["packed_emulation"][name] = check
+    return arm
+
+
+def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt, activation):
     base, positive, negative = (captures[key] for key in ("D00", "D01", "D0minus"))
     lo, hi = base.bounds
     device = base.inputs.device
@@ -268,13 +337,48 @@ def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timin
         info["reason"] = "no_representable_symmetric_values"
         return
     result = evaluate(x, base)
+    if activation is not None:
+        stages_info = info["activation_counterfactual"] = {"status": "unqualified", "packed_emulation": {}}
+        plus_arm = _symmetric_activation(activation, x, result, base.bounds, "plus", stages_info, timing)
+        if plus_arm is not None:
+            with timing.measure("projection_activation_reference", device):
+                plus_stages = activation[0].without_quantization(x, plus_arm, base.bounds, result.dtype)
     plus = result[0, lo:hi].clone()
     del result
     with timing.measure("projection_reference", device):
         for start in range(lo, hi, spec.projection_token_chunk):
             stop = min(start + spec.projection_token_chunk, hi)
             x[:, start:stop] = 2 * base.inputs[:, start:stop].double() - x[:, start:stop].double()
-    minus = evaluate(x, base)[0, lo:hi]
+    result = evaluate(x, base)
+    minus = result[0, lo:hi]
+    if activation is not None:
+        minus_arm = _symmetric_activation(activation, x, result, base.bounds, "minus", stages_info, timing)
+        if plus_arm is not None and minus_arm is not None:
+            study, stages, base_arm = activation
+            with timing.measure("projection_activation_reference", device):
+                minus_stages = study.without_quantization(x, minus_arm, base.bounds, result.dtype)
+            with timing.measure("projection_activation_emulation", device):
+                stages_info["quantization_transitions"] = transitions(base_arm, plus_arm, minus_arm, study.token_chunk, interrupt)
+            del plus_arm, minus_arm
+            c0 = stages["D00"]
+            # The ideal map is exactly antisymmetric by construction.
+            def even(p, m, b):
+                delta = torch.empty_like(b, dtype=torch.float32)
+                for start in range(0, b.shape[0], study.token_chunk):
+                    interrupt()
+                    span = slice(start, start + study.token_chunk)
+                    delta[span] = .5 * p[span].double() + .5 * m[span].double() - b[span].double()
+                return delta
+
+            with timing.measure("projection_activation_reference", device):
+                n = even(plus, minus, base.output[0, lo:hi])
+                q, r = (even(p, m, b) for p, m, b in zip(plus_stages, minus_stages, c0))
+            with timing.measure("projection_spectral", device):
+                stages_info["even"] = stage_metrics(n, q, r, torch.zeros_like(n), grid, spec, patch, chunk)
+            stages_info.update(status="qualified",
+                               reference_matmul_passes=2 * (1 + int(study.reference.rotation is not None)))
+        else:
+            stages_info["reason"] = "packed_eager_emulation_mismatch"
     with timing.measure("projection_spectral", device):
         y0 = base.output[0, lo:hi].float()
         pos, neg = plus.float() - y0, minus.float() - y0
@@ -381,11 +485,13 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
     report["reference_dtype"] = "torch.float64"
     report["reference_equivalence"] = "same_observed_operands_across_packed_native_replays"
     report["components"] = {}
+    activation = _activation_stages(reference, captures, spec, report, timing, interrupt) if spec.projection_activation_check else None
     chosen = None
     for name, terms in components.items():
         with timing.measure("projection_reference", device):
-            i, linear, residual, native, cast, arithmetic = _component_fields(
+            i, linear, residual, native, cast, arithmetic, no_quant, no_rotation = _component_fields(
                 terms, captures, reference, spec.projection_token_chunk, spec.projection_cast_check, interrupt,
+                activation[1] if activation is not None else None,
             )
         report["reference_matmul_passes"] += 3 + len(terms) * int(spec.projection_cast_check)
         with timing.measure("projection_spectral", device):
@@ -416,6 +522,11 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
                        residual_resolved=residual_l2 > 4 * floor, significant_residual_threshold_l2=4 * floor,
                        residual_to_executed_l2=residual_l2 / native_l2 if native_l2 else None)
         report["components"][name] = metrics
+        if activation is not None:
+            with timing.measure("projection_spectral", device):
+                report["activation_counterfactual"]["components"][name] = stage_metrics(
+                    native, no_quant, no_rotation, linear, grid, spec, patch, chunk,
+                )
         if spec.projection_effect == name and spec.projection_study != "observe":
             if spec.projection_study == "control" and metrics["residual_resolved"]:
                 generator = torch.Generator(device=device).manual_seed(seed)
@@ -424,7 +535,7 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
                 report["control_target_l2"] = residual_l2
             elif spec.projection_study in ("linear", "executed") or metrics["residual_resolved"]:
                 chosen = {"linear": linear, "residual": residual, "executed": native}[spec.projection_study]
-        del i, linear, residual, native, cast, basis
+        del i, linear, residual, native, cast, basis, no_quant, no_rotation
     if {"half_odd", "half_even"} <= report["components"].keys():
         ratios = report["half_over_full"] = {}
         for kind in ("odd", "even"):
@@ -434,9 +545,10 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
                             if full[field]["displacement_l2"] else None
                             for field in ("input", "linear", "executed", "residual")}
     if spec.projection_symmetric_check:
-        _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt)
+        _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt, activation)
         if reference_errors or not bool(reference.equal):
             report["symmetric_check"].update(status="unqualified", reason="effective_operands_not_constant")
             report["symmetric_check"].pop("output", None)
+            report["symmetric_check"].pop("activation_counterfactual", None)
     report["status"] = "qualified"
     return chosen

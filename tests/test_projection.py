@@ -67,16 +67,26 @@ def test_actual_kitchen_int8_convrot_observation_and_symmetric_probe(device):
         delta = torch.randn((1, 8, 8), generator=gen).to(device=device, dtype=torch.float16) * .005
         snapshots = record(layer, {"D00": x0, "D01": x0 + delta, "D0minus": x0 - delta})
         weight_before = layer.weight
-        report = run_study(layer, snapshots, projection_symmetric_check=True, projection_cast_check=True)
+        report = run_study(layer, snapshots, projection_symmetric_check=True, projection_cast_check=True,
+                           projection_activation_check=True)
         assert layer.weight is weight_before
     contract = report["effective_operator"]
     assert contract["weight_representation"] == "stored_int8_codes"
     assert contract["convrot_group"] == 4 and contract["weight_scale_count"] == 8
     assert contract["backend_dispatch_candidate"] == "eager"
     assert report["local_projection_calls"] == 5
+    activation = report["activation_counterfactual"]
+    assert activation["status"] == "qualified", activation
+    assert all(item["packed_bit_exact"] for item in activation["packed_emulation"].values())
+    assert activation["quantization_transitions"]["full"]["codes_one_sign_only"] > 0
+    assert activation["components"]["even"]["native"]["displacement_l2"] > 0
     symmetric = report["symmetric_check"]
     assert symmetric["status"] == "measured" and symmetric["exactly_antisymmetric"]
     assert symmetric["output"]["even"]["displacement_l2"] > 0
+    sym = symmetric["activation_counterfactual"]
+    assert sym["status"] == "qualified"
+    assert sym["even"]["ideal_affine"]["displacement_l2"] == 0
+    assert sym["even"]["no_activation_quantization"]["displacement_l2"] < sym["even"]["native"]["displacement_l2"]
     even = report["components"]["even"]
     assert even["residual_resolved"]
     assert even["residual"]["displacement_l2"] > even["linear"]["displacement_l2"]
@@ -140,3 +150,49 @@ def test_reference_uses_executed_runtime_weight_and_bias_functions():
     assert measures["residual"]["displacement_l2"] == 0
     assert torch.equal(layer.weight, torch.eye(2))
     assert torch.count_nonzero(layer.bias) == 0
+
+
+
+def test_emulation_epilogue_casts_before_adding_bias():
+    from types import SimpleNamespace
+    from mode_explorer.projection_activation import ActivationStudy
+
+    ref = SimpleNamespace(storage=torch.ones((1, 1), dtype=torch.int8),
+                          scale=torch.tensor([1.]), bias=torch.tensor([2.**-11], dtype=torch.float64))
+    spec = MechanisticSettings(projection_study="observe")
+    study = ActivationStudy(ref, spec, lambda: None)
+    scaled_product = torch.tensor([[1. + 2.**-11]])
+    output = study._epilogue(scaled_product, torch.ones(1, 1), torch.float16)
+    assert output.item() == 1.
+    assert (scaled_product + ref.bias).half().item() == 1. + 2.**-10
+
+
+def test_nonmatching_packed_activation_emulation_keeps_only_affine_report(monkeypatch):
+    import comfy_kitchen as kitchen
+    from mode_explorer.projection_activation import ActivationStudy
+
+    epilogue = ActivationStudy._epilogue
+
+    def offset(self, *args, **kwargs):
+        result = epilogue(self, *args, **kwargs)
+        result[0, 0] += 1  # Outside the generated-image slice.
+        return result
+
+    monkeypatch.setattr(ActivationStudy, "_epilogue", offset)
+    with torch.inference_mode(), kitchen.use_backend("eager"):
+        layer = ops.mixed_precision_ops(compute_dtype=torch.float16).Linear(8, 8, device="cpu").eval()
+        layer.weight = torch.nn.Parameter(QuantizedTensor.from_float(
+            torch.eye(8, dtype=torch.float16), "TensorWiseINT8Layout", convrot=True,
+            convrot_groupsize=4, per_channel=True), requires_grad=False)
+        layer.quant_format = "int8_tensorwise"
+        layer.layout_type = "TensorWiseINT8Layout"
+        layer.bias.zero_()
+        x = torch.ones(1, 8, 8, dtype=torch.float16)
+        replay = record(layer, {"D00": x, "D01": x+.0625, "D0minus": x-.0625})
+        report = run_study(layer, replay, projection_activation_check=True)
+    assert report["native_replay_status"] == "qualified"
+    activation = report["activation_counterfactual"]
+    assert activation["status"] == "unqualified"
+    assert activation["reason"] == "packed_eager_emulation_mismatch"
+    assert "components" not in activation
+    assert all(check["packed_mismatched_values"] == 1 for check in activation["packed_emulation"].values())

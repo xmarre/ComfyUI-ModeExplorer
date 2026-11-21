@@ -336,6 +336,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
             assert "VAEDecode" not in {item["class_type"] for item in api.values()}
             assert planner["regeneration_mode"] == "planner_final_upscale_only" and planner["handoff_diagnostics"] == "off"
             assert research["analysis_device"] == "cuda" and research["projection_study"] == "observe"
+            assert research["projection_activation_check"] is True
             if path.name == "projection_conditioning.json":
                 assert research["alternate"] != planner["positive"]
         valid, error, *_ = asyncio.run(execution.validate_prompt(path.name, api, None))

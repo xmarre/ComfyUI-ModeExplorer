@@ -44,22 +44,22 @@
       "checks": ["native_input_fp32_sha256", "mechanistic.kernel_contract", "mechanistic.amplitude", "mechanistic.repeat_clean_rms"]
     },
     "projection_smoke": {
-      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "auxiliary_budget": 4, "capture_vram_mib": 12288},
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "projection_activation_check": true, "auxiliary_budget": 4, "capture_vram_mib": 16384},
       "expected_calls_upper_bound": 4,
       "local_projection_calls_per_state": 3,
-      "checks": ["mechanistic.projection.native_replay_status", "mechanistic.projection.effective_operator", "mechanistic.projection.components.even"]
+      "checks": ["mechanistic.projection.native_replay_status", "mechanistic.projection.effective_operator", "mechanistic.projection.activation_counterfactual.status"]
     },
     "projection_signed": {
-      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "states": 3, "projection_study": "observe", "projection_cast_check": true, "projection_symmetric_check": true, "amplitude_check": true, "auxiliary_budget": 18, "capture_vram_mib": 16384},
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "states": 3, "projection_study": "observe", "projection_activation_check": true, "projection_symmetric_check": true, "amplitude_check": true, "auxiliary_budget": 18, "capture_vram_mib": 24576},
       "expected_calls_upper_bound": 18,
       "local_projection_calls_per_state": 7,
-      "checks": ["mechanistic.projection.components.even", "mechanistic.projection.half_over_full", "mechanistic.projection.symmetric_check", "export_status"]
+      "checks": ["mechanistic.projection.activation_counterfactual.components.even", "mechanistic.projection.half_over_full", "mechanistic.projection.symmetric_check", "export_status"]
     },
     "projection_conditioning": {
-      "settings": {"experiment": "conditioning_fixed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "auxiliary_budget": 5, "capture_vram_mib": 12288},
+      "settings": {"experiment": "conditioning_fixed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "projection_activation_check": true, "auxiliary_budget": 5, "capture_vram_mib": 16384},
       "expected_calls_upper_bound": 5,
       "local_projection_calls_per_state": 4,
-      "checks": ["mechanistic.conditioning_realized_edit", "mechanistic.projection.native_replay_status", "mechanistic.projection.components.conditioning_interaction"]
+      "checks": ["mechanistic.conditioning_realized_edit", "mechanistic.projection.native_replay_status", "mechanistic.projection.activation_counterfactual.components.conditioning_interaction"]
 
     }
   }

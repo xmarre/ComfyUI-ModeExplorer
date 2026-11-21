@@ -36,7 +36,8 @@ class CaptureLimit(ValueError):
 class ResearchTiming:
     def __init__(self):
         self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation",
-                                      "projection_native_replay", "projection_reference", "projection_spectral"), 0.)
+                                      "projection_native_replay", "projection_reference", "projection_spectral",
+                                      "projection_activation_emulation", "projection_activation_reference"), 0.)
         self.events = []
 
     @contextmanager
@@ -390,6 +391,14 @@ def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, atten
                          + 128 * spec.projection_token_chunk * attention_channels)
         if spec.projection_symmetric_check:
             output_bytes += (8 * packed_tokens + 20 * points) * attention_channels
+        if spec.projection_activation_check:
+            # Bitwise qualification uses temporary packed rotation, codes and
+            # scales. Retain only generated-token output stages and a baseline
+            # for the optional symmetric probe.
+            output_bytes += (2 * attention_channels**2 + (16 * packed_tokens + 8 * replay_arms * points) * attention_channels
+                             + 96 * spec.projection_token_chunk * attention_channels)
+            if spec.projection_symmetric_check:
+                output_bytes += 20 * points * attention_channels
     return capture_bytes, fft_bytes + output_bytes
 
 
