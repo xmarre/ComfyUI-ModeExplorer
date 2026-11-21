@@ -251,7 +251,7 @@ def _edit_compare(left, right, sign, chunk):
     for i in range(0, left[0].shape[0], chunk):
         sl = slice(i, i + chunk)
         a = left[1][sl].float() - left[0][sl].float()
-        b = a if right is left else right[1][sl].float() - right[0][sl].float()
+        b = right[1][sl].float() - right[0][sl].float()
         sums.add_(torch.stack((a.square().sum(), b.square().sum(), (a - sign * b).square().sum())))
     norm, other, residual = map(math.sqrt, sums.tolist())
     return {"left_l2": norm, "right_l2": other, "mismatch_l2": residual,

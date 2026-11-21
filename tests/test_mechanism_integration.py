@@ -250,3 +250,30 @@ def test_cuda_policy_does_not_fall_back_to_cpu(model, caplog):
     assert measured["reason"] == "mechanistic_cuda_requires_cuda_inference"
     assert measured["auxiliary_dit_calls"] == 0
     assert measured["mechanistic"]["analysis_device"] is None
+
+
+
+def test_capture_allocation_failure_keeps_prediction_and_releases_hooks(model, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model)
+    spec = patched(model, sites="projection_input,clean")
+    stage = Workspace.stage
+    failed = False
+
+    def fail_once(self, value, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise torch.OutOfMemoryError("capture allocation")
+        return stage(self, value, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Workspace, "stage", fail_once)
+        assert torch.equal(native, draw(spec))
+    assert failed
+    measured = point(caplog)
+    assert measured["status"] == "skipped"
+    assert measured["reason"] == "mechanistic_out_of_memory"
+    assert measured["auxiliary_dit_calls"] == 1
+    assert torch.equal(native, draw(spec))
+    assert point(caplog)["status"] == "completed"
