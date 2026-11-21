@@ -128,7 +128,7 @@ class ModeExplorerResponse:
 
     @classmethod
     def INPUT_TYPES(cls):
-        from .response import BASES, LOCALIZATIONS, MODES, POLICIES, REPLAY_DIRECTIONS, ResponseSettings
+        from .response import BASES, LOCALIZATIONS, MAX_WORKSPACE_MIB, MODES, POLICIES, REPLAY_DIRECTIONS, ResponseSettings
 
         defaults = ResponseSettings()
 
@@ -155,7 +155,7 @@ class ModeExplorerResponse:
             "evaluation": number("INT", "evaluation", -1, 127, "-1 selects by sigma. Other values select a zero-based actual positive dispatch."),
             "states": number("INT", "states", 1, 2, "Maximum distinct matched states per sampler invocation."),
             "auxiliary_budget": number("INT", "auxiliary_budget", 0, 48, "Hard limit on extra DiT calls across matched states."),
-            "memory_mb": number("INT", "memory_mb", 16, 512, "Maximum estimated research tensor workspace, excluding the ordinary native forward."),
+            "memory_mb": number("INT", "memory_mb", 16, MAX_WORKSPACE_MIB, "Maximum estimated research tensor workspace, excluding the ordinary native forward."),
         }, "optional": {
             "clean_limit": number("FLOAT", "clean_limit", 0.00001, 0.25, "RMS trust bound for a clean-prediction correction.", step=0.00001),
             "candidate_gain": number("FLOAT", "candidate_gain", 0.01, 1.0, "Fraction of each measured clean displacement to propose.", step=0.01),

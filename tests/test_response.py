@@ -9,6 +9,13 @@ from mode_explorer.response import (
 )
 
 
+def test_opt_in_workspace_limit():
+    assert ResponseSettings().memory_mb == 128
+    assert ResponseSettings(memory_mb=1024).memory_mb == 1024
+    with pytest.raises(ValueError, match="memory_mb"):
+        ResponseSettings(memory_mb=1025)
+
+
 def test_gaussian_tilt_and_covariance_nonunit_noise():
     sigma, scale = 0.96, 0.7
     alpha, variance = 1 - sigma, (sigma * scale) ** 2

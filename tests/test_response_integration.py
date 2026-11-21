@@ -166,6 +166,17 @@ def test_active_gate_preserves_native_with_no_improvement_or_amplified_cfg(model
     assert traces(caplog)[-1]["response"]["reason"] == "response_steering_requires_native_cfg_one"
 
 
+def test_workspace_widget_matches_backend_limit(model):
+    from mode_explorer.response import MAX_WORKSPACE_MIB, ResponseSettings
+
+    widget = ModeExplorerResponse.INPUT_TYPES()["required"]["memory_mb"][1]
+    assert widget["default"] == ResponseSettings().memory_mb == 128
+    assert widget["max"] == MAX_WORKSPACE_MIB == 1024
+    assert configured(model, mode="joint_probe", memory_mb=1024) is not model
+    with pytest.raises(ValueError, match="memory_mb"):
+        configured(model, memory_mb=1025)
+
+
 def test_workspace_limit_precedes_forwards():
     from types import SimpleNamespace
     from mode_explorer.response import ResponseSettings

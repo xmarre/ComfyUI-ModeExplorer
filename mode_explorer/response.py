@@ -18,6 +18,7 @@ REPLAY_DIRECTIONS = ("repel", "reverse", "channel_sign", "sham", "tangent", "spa
 MAX_FLOW_SIGMA = 1.00001
 CALIBRATION_OFF_AXIS_LIMIT = 0.10
 MAX_STATES = 2
+MAX_WORKSPACE_MIB = 1024
 MAX_EXPORT_BYTES = 64 * 1024**2
 
 
@@ -82,7 +83,7 @@ class ResponseSettings:
         for key, low, high in (
             ("probe_grid", 1, 16), ("directions", 1, 4), ("trial", 0, 65535),
             ("evaluation", -1, 127), ("states", 1, MAX_STATES), ("auxiliary_budget", 0, 48),
-            ("memory_mb", 16, 512), ("feature_block", 0, 63), ("feature_grid", 1, 16),
+            ("memory_mb", 16, MAX_WORKSPACE_MIB), ("feature_block", 0, 63), ("feature_grid", 1, 16),
             ("latent_cell", -1, 255), ("head", -1, 255), ("cell", -1, 255), ("feature_references", 1, 3),
         ):
             value = getattr(self, key)
