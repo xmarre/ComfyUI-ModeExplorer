@@ -277,3 +277,48 @@ def test_capture_allocation_failure_keeps_prediction_and_releases_hooks(model, c
     assert measured["auxiliary_dit_calls"] == 1
     assert torch.equal(native, draw(spec))
     assert point(caplog)["status"] == "completed"
+
+
+def test_packed_projection_replay_and_downstream_isolation(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model, reference=True)
+    rng = torch.random.get_rng_state().clone()
+    configuration = dict(sites="", projection_study="observe", projection_cast_check=True, amplitude_check=True)
+    assert torch.equal(native, draw(patched(model, **configuration), reference=True))
+    assert torch.equal(rng, torch.random.get_rng_state())
+    p = point(caplog)
+    study = p["mechanistic"]["projection"]
+    assert study["status"] == "qualified", study
+    assert study["local_projection_calls"] == 5
+    assert study["geometry"]["D00"]["input"]["shape"][1] > 4 * 6
+    assert all(row["packed_bit_exact"] for row in study["native_replay"].values())
+    assert study["effective_operator"]["weight_representation"] == "effective_dense_cast_operand"
+    assert "half_even" in study["components"]
+    assert study["components"]["even"]["linear"]["displacement_l2"] > 0
+    assert study["components"]["even"]["output_cast_only"]["displacement_l2"] >= 0
+    experiment = patched(model, sites="", projection_study="executed", projection_effect="even",
+                         component="complete", auxiliary_budget=6)
+    assert torch.equal(native, draw(experiment, reference=True))
+    p = point(caplog)
+    study = p["mechanistic"]["projection"]
+    assert study["status"] == "qualified", study
+    assert p["auxiliary_dit_calls"] == 6
+    assert study["downstream_clean_rms"] > 0
+    assert not p["applied"]
+
+
+def test_projection_factorial_keeps_distinct_packed_text_geometry(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    positive, _ = conditions(reference=True)
+    alt = [[positive[0][0][:, :3] * -.75, positive[0][1]]]
+    config = patched(model, experiment="conditioning_fixed", alternate=alt, sites="",
+                     projection_study="observe", auxiliary_budget=6)
+    assert torch.equal(draw(model, reference=True), draw(config, reference=True))
+    p = point(caplog)
+    study = p["mechanistic"]["projection"]
+    assert study["status"] == "qualified", study
+    assert study["local_projection_calls"] == 4
+    assert study["geometry"]["D00"]["input"]["shape"][1] - study["geometry"]["D10"]["input"]["shape"][1] == 2
+    metrics = study["components"]["conditioning_interaction"]
+    assert metrics["executed"]["displacement_l2"] > 0
+    assert metrics["residual"]["displacement_l2"] < metrics["linear"]["displacement_l2"]

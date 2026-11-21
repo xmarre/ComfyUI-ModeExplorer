@@ -39,6 +39,11 @@ class MechanisticSettings:
     analysis_device: str = "cuda"
     capture_vram_mib: int = 8192
     cuda_chunk: int = 32
+    projection_study: str = "off"
+    projection_effect: str = "even"
+    projection_replay_fraction: float = .05
+    projection_token_chunk: int = 128
+    projection_cast_check: bool = False
 
     @cached_property
     def block_ids(self):
@@ -67,6 +72,18 @@ class MechanisticSettings:
         return 2 + int(self.signed) + 2 * int(self.conditioning)
 
     def __post_init__(self):
+        if self.projection_study not in ("off", "observe", "linear", "residual", "executed", "control"):
+            raise ValueError("Unknown projection study.")
+        if self.projection_effect not in ("positive", "odd", "even", "conditioning_interaction"):
+            raise ValueError("Unknown projection effect.")
+        if self.projection_study not in ("off", "observe"):
+            if self.component != "complete":
+                raise ValueError("Select complete as the clean response component for a projection displacement.")
+            if (self.projection_effect in ("odd", "even") and not self.signed
+                    or self.projection_effect == "conditioning_interaction" and not self.conditioning):
+                raise ValueError("The projection effect requires the corresponding experiment arms.")
+        if not 0 <= self.projection_replay_fraction <= .1 or not 16 <= self.projection_token_chunk <= 512:
+            raise ValueError("Projection replay tolerance or token chunk is out of range.")
         if self.mode not in MODES or self.component not in COMPONENTS or self.band not in FILTERS:
             raise ValueError("Unknown mechanistic mode, component or frequency band.")
         if set(self.site_names) - set(SITES) or not self.block_ids:

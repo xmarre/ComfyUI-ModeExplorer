@@ -132,6 +132,7 @@ def main():
         "amplitude": study.get("amplitude"), "sites": profile(study, args.comparison),
         "analysis_device": study.get("analysis_device"), "timings_ms": study.get("timings_ms"),
         "capture_transfer_bytes": study.get("capture_transfer_bytes"),
+        "projection": study.get("projection"),
         "frequency_cycles_per_latent_pixel": study.get("frequency_cycles_per_latent_pixel"),
         "frequency_cycles_per_grid_cell": study.get("frequency_cycles_per_grid_cell"),
         "patch_nyquist_per_axis": study.get("patch_nyquist_per_axis"),

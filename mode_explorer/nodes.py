@@ -282,6 +282,12 @@ class ModeExplorerMechanistic:
             "analysis_device": (["cuda", "cpu"], {"default": defaults.analysis_device, "tooltip": "CUDA uses the inference GPU. CPU is an explicit diagnostic fallback."}),
             "capture_vram_mib": number("INT", "capture_vram_mib", 16, 32768, tooltip="CUDA capture and spectral workspace budget, separate from ordinary DiT memory."),
             "cuda_chunk": number("INT", "cuda_chunk", 1, 128, tooltip="Channels processed together per CUDA spectral batch."),
+            "projection_study": (["off", "observe", "linear", "residual", "executed", "control"],
+                                 {"default": defaults.projection_study, "tooltip": "Diagnose or apply an isolated displacement at the feature block's native projection."}),
+            "projection_effect": (["even", "positive", "odd", "conditioning_interaction"], {"default": defaults.projection_effect}),
+            "projection_replay_fraction": number("FLOAT", "projection_replay_fraction", 0., .1, step=.005),
+            "projection_token_chunk": number("INT", "projection_token_chunk", 16, 512, step=16),
+            "projection_cast_check": ("BOOLEAN", {"default": False, "tooltip": "Separately measure one output cast of the reconstructed affine map."}),
         }}
 
     def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,
@@ -294,7 +300,7 @@ class ModeExplorerMechanistic:
         spec = MechanisticSettings(mode=experiment, **{key: options.pop(key) for key in spec_fields & options.keys()})
         for block in spec.block_ids:
             ModeExplorer.verify_model(model, block)
-        if spec.component == "observe" and treatment != "export_only":
+        if (spec.component == "observe" or spec.projection_study == "observe") and treatment != "export_only":
             raise ValueError("Select a component for active mechanistic steering.")
         return ModeExplorerResponse().apply(
             model, mode="feature_replay" if treatment == "export_only" else "feature_steer",

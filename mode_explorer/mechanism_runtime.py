@@ -9,6 +9,7 @@ from time import perf_counter
 import torch
 
 from .mechanism import UNAVAILABLE, filter_field, measure_comparisons
+from .projection import ProjectionCapture, ProjectionUnavailable, geometry as projection_geometry, study_projection
 from .objectives import cell_size, feature_shift, seed_key, token_pool
 from .response import clean_candidate, flow_clean, latent_cell_bounds, rms, select_response, velocity_for_clean
 from .runtime import FRAME, Frame, Run, isolated_reference, shadow_forward, spatial_image, token_slice
@@ -34,7 +35,8 @@ class CaptureLimit(ValueError):
 
 class ResearchTiming:
     def __init__(self):
-        self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation"), 0.)
+        self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation",
+                                      "projection_native_replay", "projection_reference", "projection_spectral"), 0.)
         self.events = []
 
     @contextmanager
@@ -75,7 +77,7 @@ class Workspace:
         self.limit, self.device, self.timing = limit, device, timing
         self.retained = self.peak = self.transfer_bytes = 0
 
-    def stage(self, value, *, inside_forward=True):
+    def stage(self, value, *, inside_forward=True, preserve_layout=False):
         size = value.numel() * value.element_size()
         if self.retained + size > self.limit:
             raise CaptureLimit("mechanistic_capture_limit")
@@ -85,7 +87,8 @@ class Workspace:
         label = ("capture_transfer" if inside_forward else "output_transfer") if transfer else "capture_copy"
         scope = self.timing.measure(label, value.device) if self.timing else nullcontext()
         with scope:
-            result = value.detach().to(self.device, copy=True, memory_format=torch.contiguous_format)
+            layout = torch.preserve_format if preserve_layout else torch.contiguous_format
+            result = value.detach().to(self.device, copy=True, memory_format=layout)
         if transfer:
             self.transfer_bytes += size
         self.retained += size
@@ -97,12 +100,16 @@ class Workspace:
 
 
 class Capture:
-    def __init__(self, cfg, grid, workspace, block, references=None, proposal=None, scale=0, fixed=None):
+    def __init__(self, cfg, grid, workspace, block, references=None, proposal=None, scale=0, fixed=None,
+                 projection=False, projection_override=None):
         self.cfg, self.grid, self.workspace, self.block = cfg, grid, workspace, block
         self.references, self.proposal, self.scale, self.fixed = references, proposal, scale, fixed
         self.fields, self.operators = {}, {}
         self.bounds = None
         self.edit = None
+        self.want_projection = projection
+        self.projection = None
+        self.projection_override = projection_override
         self.wants_edit = references is not None or proposal is not None or fixed is not None
 
     def store(self, site, tensor, force=False):
@@ -199,6 +206,44 @@ class Capture:
                     ("mlp_output", block.mlp, False), ("after_mlp", block, False),
                 ):
                     attach(module, (i, name), pre)
+            if self.want_projection or self.projection_override is not None:
+                block = dit.blocks[self.block]
+                if self.block not in self.cfg.block_ids:
+                    handles.append(block.register_forward_pre_hook(geometry, with_kwargs=True))
+
+                def capture_input(module, args):
+                    if _CAPTURE.get() is not self:
+                        return
+                    x, = args
+                    if self.projection_override is not None:
+                        original, _ = self.projection_override
+                        if self.bounds != original.bounds or projection_geometry(x) != original.input_geometry or not torch.equal(x, original.inputs):
+                            raise ProjectionUnavailable("downstream_packed_projection_input_mismatch")
+                    else:
+                        if self.projection is not None:
+                            raise ProjectionUnavailable("packed_projection_called_more_than_once")
+                        self.projection = ProjectionCapture(
+                            self.bounds, self.workspace.stage(x, preserve_layout=True), projection_geometry(x),
+                        )
+
+                def capture_output(module, args, output):
+                    if _CAPTURE.get() is not self:
+                        return
+                    if self.projection_override is not None:
+                        original, delta = self.projection_override
+                        if projection_geometry(output) != original.output_geometry or not torch.equal(output, original.output):
+                            raise ProjectionUnavailable("downstream_packed_projection_baseline_mismatch")
+                        lo, hi = self.bounds
+                        result = output.clone()
+                        for first in range(lo, hi, self.cfg.projection_token_chunk):
+                            stop = min(first + self.cfg.projection_token_chunk, hi)
+                            result[0, first:stop] = output[0, first:stop].float() + delta[first-lo:stop-lo]
+                        return result
+                    self.projection.output = self.workspace.stage(output, preserve_layout=True)
+                    self.projection.output_geometry = projection_geometry(output)
+
+                handles.append(block.attn.wo.register_forward_pre_hook(capture_input))
+                handles.append(block.attn.wo.register_forward_hook(capture_output))
             attach(dit.last.linear, (None, _PACKED_PROJECTION), force=_UNPATCHED_PROJECTION in self.cfg.site_names)
             yield
         finally:
@@ -300,7 +345,7 @@ def _amplitude(full_plus, full_minus, half_plus, half_minus, base):
 
 
 def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, attention_channels, patch_size,
-                               baseline_reused, chunk=None):
+                               baseline_reused, chunk=None, packed_tokens=None):
     """Return conservative bytes for staged captures and spectral/output workspace."""
     points = math.prod(grid)
     projection_channels = latent_shape[1] * patch_size**2
@@ -326,6 +371,18 @@ def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, atten
     output_bytes = math.prod(latent_shape) * 4 * (10 + 4 * spec.core_arms + 4 * int(spec.amplitude_check))
     if _UNPATCHED_PROJECTION in spec.site_names:
         output_bytes += 4 * points * projection_channels * captured_arms
+    if spec.projection_study != "off":
+        packed_tokens = points if packed_tokens is None else packed_tokens
+        replay_arms = spec.core_arms + 2 * int(spec.amplitude_check)
+        # Packed native operands and outputs survive until qualification,
+        # including the additional two arms at half amplitude.
+        capture_bytes += 8 * packed_tokens * attention_channels * replay_arms
+        # Replay result + component fields and spectral scratch. Effective FP64
+        # weight, INT8 codes, weight-equality temporaries, and rotation/GEMM
+        # scratch are budgeted independently of the captured activations.
+        output_bytes += (12 * attention_channels**2 + (1024**2) * 8
+                         + (16 * packed_tokens + (28 + 4 * replay_arms) * points) * attention_channels
+                         + 128 * spec.projection_token_chunk * attention_channels)
     return capture_bytes, fft_bytes + output_bytes
 
 
@@ -354,6 +411,10 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         "amplitude_check": spec.amplitude_check, "match_cross_dtype": spec.match_cross_dtype,
         "attention_mask_consumed_by_native_krea": False,
     }
+    projection_enabled = spec.projection_study != "off"
+    projection_downstream = spec.projection_study not in ("off", "observe")
+    if projection_enabled and analysis_device != latent.device:
+        raise CaptureLimit("packed_projection_replay_requires_inference_device")
     if spec.analysis_device == "cuda" and not latent.is_cuda:
         raise CaptureLimit("mechanistic_cuda_requires_cuda_inference")
     if reference_sigma is None:
@@ -419,29 +480,31 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     stage["first_estimate_reused_for"] = sorted(reused_anchors)
     repeat = cfg.calibration != "off"
     native_capture = any(site not in {"velocity", "clean"} | UNAVAILABLE for site in spec.site_names)
-    can_reuse = not (native_capture or cfg.frozen_state or frame.attempted or x.shape[0] != 1)
-    required = core_arms - int(can_reuse) + reference_calls + 2 * int(spec.amplitude_check) + int(repeat)
+    can_reuse = not (projection_enabled or native_capture or cfg.frozen_state or frame.attempted or x.shape[0] != 1)
+    required = core_arms - int(can_reuse) + reference_calls + 2 * int(spec.amplitude_check) + int(repeat) + int(projection_downstream)
     stage["baseline_reused"] = can_reuse
     stage.update(auxiliary_calls_planned=required, feature_reference_calls_planned=reference_calls,
                  feature_reference_calls=0,
                  feature_reference_origin="reconstructed_first_estimate" if rebuild else "initial_shadow")
     if run.response.forwards + required > cfg.auxiliary_budget:
         raise ValueError("auxiliary_forward_budget")
+    max_text = max(ctx.shape[1] for ctx, _ in branches.values())
+    reference_tokens = sum(math.prod(math.ceil(n / dit.patch) for n in ref.shape[-2:])
+                           * (ref.shape[2] if ref.ndim == 5 else 1) for ref in refs or ())
+    packed_tokens = points + max_text + reference_tokens
     capture_bytes, reserve_bytes = estimate_capture_workspace(
         spec, feature_block=cfg.feature_block, grid=frame.grid, latent_shape=latent.shape,
         attention_channels=channels, patch_size=dit.patch, baseline_reused=can_reuse, chunk=chunk,
+        packed_tokens=packed_tokens,
     )
-    stage["capture_preflight_bytes"] = capture_bytes + reserve_bytes
+    stage.update(capture_preflight_bytes=capture_bytes + reserve_bytes, capture_reserve_bytes=reserve_bytes)
     if stage["capture_preflight_bytes"] > stage["capture_budget_bytes"]:
         raise CaptureLimit("mechanistic_capture_preflight")
     workspace = Workspace(stage["capture_budget_bytes"] - reserve_bytes, analysis_device, timing)
 
-    # GPU-side allowance covers the cloned attention output (including non-image
-    # tokens), references and latent fields, separate from diagnostic captures.
-    max_text = max(ctx.shape[1] for ctx, _ in branches.values())
-    ref_tokens = sum(math.prod(math.ceil(n / dit.patch) for n in ref.shape[-2:])
-                     * (ref.shape[2] if ref.ndim == 5 else 1) for ref in refs or ())
-    gpu_bytes = 4 * (channels * (points + max_text + ref_tokens + 4 * frame.grid[1])
+    # The cloned attention output, references and latent fields are separate
+    # from diagnostic captures.
+    gpu_bytes = 4 * (channels * (packed_tokens + 4 * frame.grid[1])
                      + latent.numel() * (12 + core_arms * 2)
                      + channels * cfg.feature_grid**2 * cfg.feature_references * 3)
     # First-estimate anchors retain native FP32 clean and noise per reference.
@@ -515,7 +578,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         stage["arms"].append(name)
 
     def capture(**edit):
-        return Capture(spec, frame.grid, workspace, cfg.feature_block, **edit)
+        return Capture(spec, frame.grid, workspace, cfg.feature_block, projection=projection_enabled, **edit)
 
     if can_reuse:
         captures["D00"] = capture()
@@ -627,17 +690,64 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         light = replace(spec, sites="")
         for name, sign in (("D0half_plus", .5), ("D0half_minus", -.5)):
             predict(name, capture=Capture(light, frame.grid, workspace, cfg.feature_block,
-                                          proposal=plus.proposal, scale=sign))
+                                          proposal=plus.proposal, scale=sign, projection=projection_enabled))
         half_symmetry = compare_edits(_edit_pair(captures["D0half_plus"]), _edit_pair(captures["D0half_minus"]), -1)
         stage["half_realized_edit"] = half_symmetry
         stage["amplitude"] = _amplitude(clean["D01"], clean["D0minus"],
                                         clean["D0half_plus"], clean["D0half_minus"], clean["D00"])
         for name in ("D0half_plus", "D0half_minus"):
-            for value in captures.pop(name).fields.values():
+            for value in captures[name].fields.values():
                 workspace.release(value)
+            captures[name].fields.clear()
             value = None
             velocities.pop(name)
             clean.pop(name)
+
+    downstream_clean = None
+    if projection_enabled:
+        projection_report = stage["projection"] = {"schema": 1, "mode": spec.projection_study,
+                                                   "effect": spec.projection_effect, "packed_tokens_upper_bound": packed_tokens}
+        snapshots = {name: cap.projection for name, cap in captures.items()}
+        try:
+            if any(snapshot is None for snapshot in snapshots.values()):
+                raise ProjectionUnavailable("packed_projection_capture_incomplete")
+            if any(snapshot.inputs.shape[1] > packed_tokens for snapshot in snapshots.values()):
+                raise ProjectionUnavailable("packed_projection_exceeds_token_estimate")
+            delta = study_projection(dit.blocks[cfg.feature_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
+                                     chunk, projection_report, timing,
+                                     seed_key(probe_seed, f"projection-control-{cfg.trial}"))
+            if projection_downstream:
+                if delta is None:
+                    raise ProjectionUnavailable("projection_component_below_numerical_floor")
+                if spec.projection_effect in ("odd", "even") and stage["signed_realized_edit"]["status"] != "matched":
+                    raise ProjectionUnavailable("signed_intervention_unqualified")
+                if spec.projection_effect == "conditioning_interaction" and stage["conditioning_realized_edit"]["status"] != "matched":
+                    raise ProjectionUnavailable("fixed_conditioning_intervention_unqualified")
+                original = snapshots["D00"]
+                if not projection_report["native_replay"]["D00"]["packed_bit_exact"]:
+                    raise ProjectionUnavailable("downstream_requires_bit_exact_baseline")
+                # Keep the actual projected baseline for all tokens and add a
+                # component only at generated tokens in one native baseline arm.
+                patched = Capture(spec, frame.grid, workspace, cfg.feature_block,
+                                  projection_override=(original, delta))
+                predict("projection_component", capture=patched)
+                downstream_clean = clean["projection_component"]
+                projection_report["downstream_clean_rms"] = rms(downstream_clean - clean["D00"])
+                projection_report["downstream_output"] = "generated_token_displacement_on_native_baseline"
+                patched.projection_override = None
+                del delta, original
+        except ProjectionUnavailable as exc:
+            projection_report.update(status="unqualified", reason=str(exc))
+        finally:
+            for capture_state in captures.values():
+                snapshot = capture_state.projection
+                if snapshot is not None:
+                    workspace.release(snapshot.inputs)
+                    if snapshot.output is not None:
+                        workspace.release(snapshot.output)
+                    capture_state.projection = None
+            snapshots.clear()
+
     stage["captured_bytes"] = workspace.peak
     stage["capture_transfer_bytes"] = workspace.transfer_bytes
     point["status"] = "completed" if all(s["status"] != "incomplete" for s in stage["sites"].values()) else "incomplete"
@@ -656,6 +766,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     candidate = None
     if spec.component != "observe":
         component = components["complete" if spec.component == "control" else spec.component]
+        if projection_downstream and downstream_clean is not None:
+            component = downstream_clean - base
         component = filter_field(component, spec.band, spec.low_cut, spec.high_cut, spec.transition, patch_size=dit.patch)
         bounds = latent_cell_bounds(component.shape, cfg.feature_grid, spec.cell) if spec.cell >= 0 else None
         if bounds is not None:
@@ -673,7 +785,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                 noise = localize(noise)
             component = noise * (rms(component) / max(1e-12, rms(noise)))
         info = {"arm": spec.component, "isolated_component_rms": rms(component)}
-        if spec.component in ("odd", "even") and stage["signed_realized_edit"]["status"] != "matched":
+        if projection_downstream and downstream_clean is None:
+            info["reason"] = "projection_component_unqualified"
+        elif spec.component in ("odd", "even") and stage["signed_realized_edit"]["status"] != "matched":
             info["reason"] = "unqualified_signed_intervention"
         elif spec.component == "interaction" and stage["conditioning_realized_edit"]["status"] == "unqualified":
             info["reason"] = "unqualified_fixed_intervention"
@@ -704,7 +818,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         tensors = {"frozen_native_input": latent, "baseline_clean": base}
         tensors.update({f"{arm}_clean": clean[arm] for arm in main_arms if arm != "D00"})
         tensors.update({f"{name}_native_delta": value for name, value in components.items()})
-        if candidate is not None:
+        if downstream_clean is not None:
+            tensors["projection_component_clean"] = downstream_clean
+        if candidate is not None and (not projection_downstream or downstream_clean is not None):
             tensors["candidate_clean"] = candidate
         if point["applied"]:
             tensors["applied_clean"] = candidate
