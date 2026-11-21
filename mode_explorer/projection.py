@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
 from .mechanism import measure_comparisons
-from .projection_activation import ActivationStudy, stage_metrics, transitions
+from .projection_activation import ActivationStudy, EagerAccumulationUnavailable, stage_metrics, transitions
 
 
 class ProjectionUnavailable(ValueError):
@@ -264,7 +264,7 @@ def _activation_stages(reference, captures, spec, report, timing, interrupt):
         for name, cap in captures.items():
             try:
                 status, arm = study.qualify(cap.inputs, cap.output, cap.bounds)
-            except NotImplementedError:
+            except EagerAccumulationUnavailable:
                 info["reason"] = "eager_int8_accumulation_unavailable"
                 return None
             info["packed_emulation"][name] = status
@@ -300,7 +300,7 @@ def _symmetric_activation(activation, source, native, bounds, name, info, timing
     with timing.measure("projection_activation_emulation", source.device):
         try:
             check, arm = study.qualify(source, native, bounds)
-        except NotImplementedError:
+        except EagerAccumulationUnavailable:
             check, arm = {"packed_bit_exact": False, "reason": "eager_int8_accumulation_unavailable"}, None
     info["packed_emulation"][name] = check
     return arm

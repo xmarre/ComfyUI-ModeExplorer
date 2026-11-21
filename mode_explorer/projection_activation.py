@@ -8,6 +8,10 @@ import torch
 from .mechanism import measure_comparisons
 
 
+class EagerAccumulationUnavailable(RuntimeError):
+    pass
+
+
 @dataclass
 class ActivationArm:
     rotated: torch.Tensor
@@ -55,7 +59,13 @@ class ActivationStudy:
         for start in range(0, native.shape[0], self.token_chunk):
             self.interrupt()
             rows = slice(start, start + self.token_chunk)
-            prediction = self._epilogue(self.mm_int8(codes[rows], self.codes_t), scales[rows], native.dtype)
+            try:
+                raw = self.mm_int8(codes[rows], self.codes_t)
+            except torch.OutOfMemoryError:
+                raise
+            except RuntimeError as exc:
+                raise EagerAccumulationUnavailable from exc
+            prediction = self._epilogue(raw, scales[rows], native.dtype)
             observed = native[rows]
             # Compare element bytes, including the sign of zero.
             different = prediction.contiguous().view(torch.uint8) != observed.contiguous().view(torch.uint8)
@@ -76,7 +86,7 @@ class ActivationStudy:
         rows, count = source.shape[0], self.reference.weight.shape[0]
         rounded = torch.empty((rows, count), dtype=dtype, device=source.device)
         rotation = self.reference.rotation
-        ideal = torch.empty_like(rounded) if rotation is not None else rounded
+        unrounded = torch.empty_like(rounded) if rotation is not None else rounded
         for start in range(0, rows, self.token_chunk):
             self.interrupt()
             span = slice(start, start + self.token_chunk)
@@ -89,8 +99,8 @@ class ActivationStudy:
             if rotation is not None:
                 group = rotation.shape[0]
                 high_precision = (source[span].double().unflatten(-1, (-1, group)) @ rotation).flatten(-2)
-                ideal[span] = self._epilogue((high_precision / scales.double()) @ self.reference.weight.T, scales, dtype)
-        return rounded, ideal
+                unrounded[span] = self._epilogue((high_precision / scales.double()) @ self.reference.weight.T, scales, dtype)
+        return rounded, unrounded
 
 
 def transitions(base, plus, minus, token_chunk, interrupt):

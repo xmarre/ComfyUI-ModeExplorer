@@ -167,7 +167,8 @@ def test_emulation_epilogue_casts_before_adding_bias():
     assert (scaled_product + ref.bias).half().item() == 1. + 2.**-10
 
 
-def test_nonmatching_packed_activation_emulation_keeps_only_affine_report(monkeypatch):
+@pytest.mark.parametrize("reject", ["mismatch", "backend"])
+def test_unqualified_activation_emulation_keeps_only_affine_report(monkeypatch, reject):
     import comfy_kitchen as kitchen
     from mode_explorer.projection_activation import ActivationStudy
 
@@ -178,7 +179,15 @@ def test_nonmatching_packed_activation_emulation_keeps_only_affine_report(monkey
         result[0, 0] += 1  # Outside the generated-image slice.
         return result
 
-    monkeypatch.setattr(ActivationStudy, "_epilogue", offset)
+    if reject == "mismatch":
+        monkeypatch.setattr(ActivationStudy, "_epilogue", offset)
+    else:
+        from comfy_kitchen.backends.eager import quantization
+
+        def unavailable(*args):
+            raise RuntimeError("int8 matrix multiply unsupported")
+
+        monkeypatch.setattr(quantization, "mm_int8", unavailable)
     with torch.inference_mode(), kitchen.use_backend("eager"):
         layer = ops.mixed_precision_ops(compute_dtype=torch.float16).Linear(8, 8, device="cpu").eval()
         layer.weight = torch.nn.Parameter(QuantizedTensor.from_float(
@@ -193,6 +202,9 @@ def test_nonmatching_packed_activation_emulation_keeps_only_affine_report(monkey
     assert report["native_replay_status"] == "qualified"
     activation = report["activation_counterfactual"]
     assert activation["status"] == "unqualified"
-    assert activation["reason"] == "packed_eager_emulation_mismatch"
     assert "components" not in activation
-    assert all(check["packed_mismatched_values"] == 1 for check in activation["packed_emulation"].values())
+    if reject == "mismatch":
+        assert activation["reason"] == "packed_eager_emulation_mismatch"
+        assert all(check["packed_mismatched_values"] == 1 for check in activation["packed_emulation"].values())
+    else:
+        assert activation["reason"] == "eager_int8_accumulation_unavailable"
