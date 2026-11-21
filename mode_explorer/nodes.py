@@ -185,7 +185,7 @@ class ModeExplorerResponse:
             "require_fidelity": ("BOOLEAN", {"default": False, "tooltip": "Require an external fidelity metric that does not regress against baseline."}),
             "reference_min_sigma": number("FLOAT", "reference_min_sigma", -1, 1, "Reference eligibility floor. -1 inherits the ModeExplorer floor. On a native branch the default is 0.82.", step=0.000001),
             "reference_start_sigma": number("FLOAT", "reference_start_sigma", -1, 1.00001, "Match this observed actual sigma for the reference start. -1 uses the eligibility floor.", step=0.0000001),
-            "probe_precision": choice("probe_precision", ("auto", "fixed"), "Auto enlarges unresolved reduced-precision calibration pairs within the input trust bound. Fixed keeps the requested displacement."),
+            "probe_precision": choice("probe_precision", ("auto", "fixed"), "Auto chooses one reduced-precision measurement amplitude for the state within the input trust bound. Fixed keeps the requested displacement."),
             "scorer": ("MODEEXPLORER_LOCAL_SCORER", {"tooltip": "Optional local clean-latent scorer. Higher must mean better under its documented metric."}),
         }}
 

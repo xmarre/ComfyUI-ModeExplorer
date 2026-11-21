@@ -13,7 +13,7 @@ import torch
 
 from .objectives import cell_areas, seed_key
 from .response import (
-    CALIBRATION_OFF_AXIS_LIMIT, MAX_EXPORT_BYTES, MAX_FLOW_SIGMA, calibrated_pairs, clean_candidate, differences, direction_field, effective_tilt_scale, flow_clean,
+    CALIBRATION_OFF_AXIS_LIMIT, MAX_EXPORT_BYTES, MAX_FLOW_SIGMA, calibrated_pairs, clean_candidate, common_probe_displacement, differences, direction_field, effective_tilt_scale, flow_clean,
     latent_cell_bounds, localize_direction, velocity_for_clean,
     orthonormalize, output_projection, projected_operator, rms, select_response, shifted_pair,
 )
@@ -396,23 +396,30 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
         point.update(baseline_reused=not needs_baseline, repeat_rms=noise_floor if cfg.calibration != "off" else None,
                      differences=[], feature=[], candidates=[])
         tensors = {"frozen_native_input": latent.float(), "baseline_clean": base_clean} if cfg.export else {}
-        basis, responses = [], []
+        basis, responses, direction_indices = [], [], []
         coefficients = None
         if wants_latent:
             proposals = orthonormalize(
                 localize_direction(direction_field(latent, cfg.basis, cfg.probe_grid, probe_seed, cfg.trial, i), bounds)
                 for i in range(cfg.directions)
             )
+            amplitude, usable = common_probe_displacement(latent, proposals, cfg)
+            point.update(probe_displacement=amplitude, precision_adjusted=amplitude != cfg.displacement)
+            if usable is not None:
+                point["precision_eligible_directions"] = list(usable)
             for i, unit in enumerate(proposals):
                 if response.forwards + 2 > cfg.auxiliary_budget:
                     point["differences"].append({"index": i, "status": "skipped", "reason": "auxiliary_forward_budget"})
                     break
-                full, half_result, amplitude = calibrated_pairs(latent, unit, cfg)
+                full, half_result = calibrated_pairs(latent, unit, cfg, amplitude)
                 pair, metrics, reason = full
                 metrics.update(index=i, status="rejected" if reason else "completed", reason=reason,
                                configured_displacement=cfg.displacement, probe_displacement=amplitude,
                                precision_adjusted=amplitude != cfg.displacement)
                 point["differences"].append(metrics)
+                if usable and i not in usable:
+                    metrics.update(status="rejected", reason=reason or "unresolved_at_common_probe_displacement")
+                    continue
 
                 # Test the first usable direction at both amplitudes. Active
                 # steering requires a measured stable check before building its basis.
@@ -463,6 +470,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     continue
                 basis.append(unit)
                 responses.append(derivative.flatten())
+                direction_indices.append(i)
             if basis:
                 try:
                     op, right, eig = projected_operator(basis, responses)
@@ -471,6 +479,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     basis.clear()
                     responses.clear()
                 else:
+                    op["direction_indices"] = direction_indices
                     point["projected_response"] = op
                     coefficients = right if cfg.response_direction == "singular" else eig
                     point["principal_direction_coefficients"] = coefficients.tolist()

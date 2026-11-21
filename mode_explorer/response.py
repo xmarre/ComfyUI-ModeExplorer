@@ -262,35 +262,38 @@ def shifted_pair(x, unit, displacement, norm, trust_rms):
 
 
 
-def calibrated_pairs(x, unit, settings):
-    """Choose representable probe geometry before spending denoiser forwards."""
-    requested = settings.displacement
+def calibrated_pairs(x, unit, settings, amplitude):
     args = (settings.norm, settings.input_limit)
-    full = shifted_pair(x, unit, requested, *args)
-    if settings.calibration == "off":
-        return full, None, requested
+    full = shifted_pair(x, unit, amplitude, *args)
+    half = shifted_pair(x, unit, amplitude * 0.5, *args) if settings.calibration != "off" else None
+    return full, half
 
-    half = shifted_pair(x, unit, requested * 0.5, *args)
-    nominal = (full, half, requested)
-    if settings.probe_precision == "fixed" or x.dtype not in (torch.bfloat16, torch.float16):
-        return nominal
+
+def common_probe_displacement(x, directions, settings):
+    """Choose a single scale for the largest usable subset of this basis."""
+    requested = settings.displacement
+    if (settings.calibration == "off" or settings.probe_precision == "fixed"
+            or x.dtype not in (torch.bfloat16, torch.float16)):
+        return requested, None
 
     cap = settings.input_limit * (math.sqrt(x.numel()) if settings.norm == "l2" else 1)
-    amplitude = requested
-    for factor in (1.25, 1.5, 2.0, 3.0, 4.0):
-        if (full[2] is None and half[2] is None
-                and max(full[1]["off_axis_fraction"], half[1]["off_axis_fraction"]) <= CALIBRATION_OFF_AXIS_LIMIT):
-            return full, half, amplitude
-        enlarged = min(requested * factor, cap)
-        if enlarged <= amplitude or full[2] == "nonfinite_input":
+    best_amplitude, best_indices = requested, ()
+    amplitudes = (requested, *(min(requested * scale, cap) for scale in (1.25, 1.5, 2.0, 3.0, 4.0)))
+    for amplitude in dict.fromkeys(amplitudes):
+        if amplitude < requested:
+            continue
+        usable = []
+        for i, unit in enumerate(directions):
+            full, half = calibrated_pairs(x, unit, settings, amplitude)
+            if (full[2] is None and half[2] is None
+                    and max(full[1]["off_axis_fraction"], half[1]["off_axis_fraction"]) <= CALIBRATION_OFF_AXIS_LIMIT):
+                usable.append(i)
+        if len(usable) > len(best_indices):
+            best_amplitude, best_indices = amplitude, tuple(usable)
+        if len(usable) == len(directions):
             break
-        amplitude = enlarged
-        full = shifted_pair(x, unit, amplitude, *args)
-        half = shifted_pair(x, unit, amplitude * 0.5, *args)
-    if (full[2] is None and half[2] is None
-            and max(full[1]["off_axis_fraction"], half[1]["off_axis_fraction"]) <= CALIBRATION_OFF_AXIS_LIMIT):
-        return full, half, amplitude
-    return nominal
+    return best_amplitude, best_indices
+
 
 def differences(plus, minus, base, a, b):
     """Three-point differences with unequal realized steps on each side."""

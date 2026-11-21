@@ -450,3 +450,19 @@ def test_four_sites_share_reference_forwards_and_match_single_site_responses(mod
     response = traces(caplog)[-1]["response"]
     assert response["auxiliary_dit_calls"] == 0
     assert response["points"][0]["feature"][0]["reason"] == "auxiliary_forward_budget"
+
+
+def test_native_bf16_projected_matrix_uses_one_amplitude_per_state(model, caplog):
+    model.model.diffusion_model.bfloat16()
+    model.model.diffusion_model.dtype = torch.bfloat16
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    options = dict(directions=4, probe_grid=1, min_sigma=1.0, max_sigma=1.0)
+    patched = configured(model, **options)
+    assert torch.equal(draw(model, seed=2, sigmas=SIGMAS), draw(patched, seed=2, sigmas=SIGMAS))
+    point, = traces(caplog)[-1]["response"]["points"]
+    indices = point["projected_response"]["direction_indices"]
+    assert indices == point["precision_eligible_directions"] == [0, 1, 2, 3]
+    assert point["probe_displacement"] == 0.04 and point["precision_adjusted"]
+    assert {point["differences"][i]["probe_displacement"] for i in indices} == {0.04}
+    assert point["differences"][0]["half_calibration"]["requested_rms"] == 0.02
+    assert point["auxiliary_dit_calls"] == 11

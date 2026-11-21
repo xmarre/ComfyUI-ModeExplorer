@@ -177,3 +177,19 @@ def test_velocity_for_clean_supports_admitted_upper_tolerance():
     torch.testing.assert_close(flow_clean(x, velocity_for_clean(x, clean, sigma), sigma), clean)
     with pytest.raises(ValueError):
         velocity_for_clean(x, clean, 1.00002)
+
+
+def test_common_bf16_amplitude_rechecks_geometry_for_all_directions():
+    from mode_explorer.response import common_probe_displacement
+
+    x = (torch.randn((1, 16, 1, 7, 11), generator=torch.Generator().manual_seed(55)) * 0.9).bfloat16()
+    cfg = ResponseSettings(basis="bilinear", probe_grid=1, directions=4)
+    directions = orthonormalize(direction_field(x, cfg.basis, 1, 55, 0, i) for i in range(4))
+    independently_resolved = [common_probe_displacement(x, [direction], cfg)[0] for direction in directions]
+
+    assert independently_resolved == [0.03, 0.03, 0.03, 0.025]
+    # The maximum individual scale can leave a previously resolved direction off-axis.
+    assert common_probe_displacement(x, directions, cfg) == (0.04, (0, 1, 2, 3))
+    # Below the common scale, retain the largest admissible subset at one amplitude.
+    limited = ResponseSettings(basis="bilinear", probe_grid=1, directions=4, input_limit=0.0302)
+    assert common_probe_displacement(x, directions, limited) == (0.03, (0, 1, 2))
