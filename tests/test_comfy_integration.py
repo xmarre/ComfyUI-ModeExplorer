@@ -552,3 +552,42 @@ def test_projection_guidance_clean_export_has_single_native_conversion(model, ca
     assert manifest["native_input_fp32_sha256"] and manifest["native_condition_values"]["context"]
     assert len(transformed) == 2  # The selected clean prediction and the final sampled latent.
     assert torch.equal(load_file(destination / "predictions.safetensors")["guided_clean"], process(transformed[0]))
+
+
+def test_projection_guidance_native_kitchen_int8_projection(model, caplog, monkeypatch):
+    import comfy_kitchen as kitchen
+    from comfy import ops
+    from comfy.quant_ops import QuantizedTensor
+
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    block = model.get_model_object("diffusion_model").blocks[1]
+    original = block.attn.wo
+    quantized = ops.mixed_precision_ops(compute_dtype=torch.float32).Linear(
+        original.in_features, original.out_features, bias=original.bias is not None, device="cpu",
+    ).eval()
+    with kitchen.use_backend("eager"), torch.inference_mode():
+        quantized.weight = torch.nn.Parameter(QuantizedTensor.from_float(
+            original.weight.detach(), "TensorWiseINT8Layout", convrot=True, convrot_groupsize=16,
+            per_channel=True,
+        ), requires_grad=False)
+        quantized.quant_format = "int8_tensorwise"
+        quantized.layout_type = "TensorWiseINT8Layout"
+        if original.bias is not None:
+            quantized.bias.copy_(original.bias)
+        monkeypatch.setattr(block.attn, "wo", quantized)
+        guarded, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, amplitude=.01,
+                                                          scope="standalone", evaluations=1)
+        calls = []
+        handle = quantized.register_forward_pre_hook(lambda *args: calls.append(1))
+        try:
+            baseline = draw(model)
+            native_count = len(calls)
+            with caplog.at_level(logging.INFO):
+                edited = draw(guarded)
+        finally:
+            handle.remove()
+    assert native_count > 0 and len(calls) == 2 * native_count
+    assert not torch.equal(baseline, edited)
+    point, = traces(caplog)[-1]["projection_guidance"]["points"]
+    assert point["status"] == "applied" and point["rows"][0]["realized_rms"] == pytest.approx(.01, rel=1e-5)
