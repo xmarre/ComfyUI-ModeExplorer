@@ -92,6 +92,34 @@ def _noise(row, generator, weights, mode):
         yield span, delta
 
 
+def _realize_row(row, target_row, generator, seed, weights, mode, factor, *, cap_retry=False):
+    generator.manual_seed(seed)
+    generated, realized, changed = (torch.zeros((), device=row.device, dtype=torch.float32) for _ in range(3))
+    for span, delta in _noise(row, generator, weights, mode):
+        delta.mul_(factor)
+        generated.add_(_norm2(delta))
+        native = row[span]
+        before = native.float()
+        candidate = target_row[span]
+        candidate.copy_(before + delta)
+        perturbation = candidate.float() - before
+        if cap_retry:
+            # A nearest-rounded value can be farther from native than the FP32
+            # proposal. One step toward native rounds that element inward.
+            overshoot = perturbation.abs() > delta.abs()
+            candidate.copy_(torch.where(overshoot, torch.nextafter(candidate, native), candidate))
+            perturbation = candidate.float() - before
+        changed.add_(torch.count_nonzero(perturbation))
+        realized.add_(_norm2(perturbation))
+    return generated, realized, changed
+
+
+def _row_values(native, requested, target, cap, measurements, n):
+    generated, realized, changed = measurements
+    return torch.stack((native, requested, target, (generated / n).sqrt(),
+                        (realized / n).sqrt(), changed / n, cap))
+
+
 def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
     """Return a validated replacement or None, leaving native storage untouched."""
     lo, hi = bounds
@@ -111,7 +139,7 @@ def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
         info.update(status="skipped", reason="unsupported_projection_layout")
         return None
     n = (hi - lo) * output.shape[2]
-    summary = []
+    summary, proposals = [], []
     generator = torch.Generator(device=output.device)
     for index, seed in enumerate(seeds):
         row = output[offset + index, lo:hi]
@@ -127,30 +155,40 @@ def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
         for _, delta in _noise(row, generator, weights, cfg.mode):
             total.add_(_norm2(delta))
         factor = target / (total / n).sqrt().clamp_min(1e-12)
-        generator.manual_seed(seed)
-        generated, realized, changed = (torch.zeros((), device=output.device, dtype=torch.float32) for _ in range(3))
-        for span, delta in _noise(row, generator, weights, cfg.mode):
-            delta.mul_(factor)
-            generated.add_(_norm2(delta))
-            before = row[span].float()
-            target_row[span].copy_(before + delta)
-            rounded = target_row[span].float()
-            changed.add_((rounded != before).sum())
-            realized.add_(_norm2(rounded - before))
-        summary.append(torch.stack((native_rms, requested, target, (generated / n).sqrt(),
-                                    (realized / n).sqrt(), changed / n, cap)))
+        metrics = _realize_row(row, target_row, generator, seed, weights, cfg.mode, factor)
+        summary.append(_row_values(native_rms, requested, target, cap, metrics, n))
+        proposals.append((factor, weights))
 
     # A single compact synchronization qualifies the entire conditional batch
     # before the caller can expose any replacement to the next native block.
     values = torch.stack(summary).tolist()
+    retried = set()
+    if all(math.isfinite(value) for row in values for value in row):
+        for index, (_, _, _, _, realized, _, cap) in enumerate(values):
+            if realized <= cap:
+                continue
+            row = output[offset + index, lo:hi]
+            target_row = result[offset + index, lo:hi]
+            factor, weights = proposals[index]
+            # A small FP32 margin keeps normalization error inside the cap.
+            # This only affects a row whose native-rounded RMS exceeded it.
+            factor = factor * (1 - 8 * torch.finfo(torch.float32).eps)
+            generated, realized, changed = _realize_row(
+                row, target_row, generator, seeds[index], weights, cfg.mode, factor, cap_retry=True,
+            )
+            summary[index][3:6] = torch.stack(((generated / n).sqrt(), (realized / n).sqrt(), changed / n))
+            retried.add(index)
+        if retried:
+            values = torch.stack(summary).tolist()
     rows = []
-    for native, requested, target, generated, realized, changed, cap in values:
+    for index, (native, requested, target, generated, realized, changed, cap) in enumerate(values):
         rows.append(dict(native_rms=native, requested_rms=requested, target_rms=target, generated_rms=generated,
                          realized_rms=realized, changed_fraction=changed, allowed_rms=cap,
+                         rounding_backoff=index in retried,
                          relative_realization_error=abs(realized - generated) / generated if generated else None))
     info.update(rows=rows, generated_image_tokens=hi - lo,
                 estimated_owned_peak_bytes=(output.numel() * output.element_size()
-                    + 32 * min(hi - lo, CHUNK) * output.shape[-1] + 12 * ((hi - lo) + output.shape[-1])))
+                    + 32 * min(hi - lo, CHUNK) * output.shape[-1] + (8 + 4 * batch) * ((hi - lo) + output.shape[-1])))
     if not all(math.isfinite(value) for row in values for value in row):
         info.update(status="rejected", reason="nonfinite_projection_or_perturbation")
     elif any(row[4] > row[6] for row in values):
@@ -182,7 +220,7 @@ class GuidanceRun:
 
     def report(self):
         report = {"schema": 1, "mode": self.config.mode, "block": self.config.block, "site": SITE,
-                "trial": self.config.trial, "positive_actual_evaluations": self.ordinal,
+                "trial": self.config.trial, "scope": self.config.scope, "positive_actual_evaluations": self.ordinal,
                 "auxiliary_dit_calls": 0, "auxiliary_projection_calls": 0, "auxiliary_projection_gemms": 0,
                 "reason": self.reason or ("no_matching_actual_evaluation" if not self.points else None),
                 "points": self.points}
@@ -351,6 +389,28 @@ def _export_clean(state, x, velocity, offset, run, point, conditioning):
     state.exports = export.exports
 
 
+def _spectrum_regime_available(spectrum, sampler, options):
+    from sys import modules
+
+    from comfy.k_diffusion import sampling
+
+    # SA-PECE can change the actual ordinal in a post-callback correction.
+    # Spectrum's regime callback runs at the predictor, so keep corrections
+    # on the all-actual path until that transition can be qualified.
+    if sampler.sampler_function not in (sampling.sample_euler, getattr(sampling, "sample_er_sde", None)):
+        return False
+    owner, _, _, matches = spectrum
+    prefix = type(owner).__module__.rsplit(".", 1)[0]
+    patches = modules.get(prefix + ".qualified_patches")
+    if not callable(matches) or getattr(patches, "CONTRACT_REVISION", None) != "qualified-krea2-v4":
+        return False
+    from .runtime import guidance_pending
+
+    policy, failure = patches.qualify(options)
+    mode = getattr(policy, "mode_explorer", None)
+    return failure is None and mode is not None and mode.guidance_pending is guidance_pending
+
+
 def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, noise, sample):
     from comfy.model_sampling import CONST
     from comfy.samplers import CFGGuider, KSAMPLER
@@ -361,19 +421,20 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
 
     options = extra_args["model_options"]
     stage = options.get(STAGE, getattr(model_wrap, "model_options", {}).get(STAGE, "standalone"))
-    if config.scope != "all" and config.scope != stage:
-        return sample()
     seed = extra_args.get("seed")
     model = model_wrap.inner_model
     batch = noise.shape[0]
     state = GuidanceRun(config, seed if type(seed) is int else None, stage, model.process_latent_out)
     run = None
+    spectrum_policy = "none"
     completed = False
     begin = perf_counter()
 
     def eligible():
         if stage not in SCOPES[:-1]:
             return "unsupported_sampler_stage"
+        if config.scope != "all" and config.scope != stage:
+            return "stage_scope_mismatch"
         if type(seed) is not int:
             return "missing_seed"
         if type(executor.class_obj) is not KSAMPLER or type(model_wrap).predict_noise is not CFGGuider.predict_noise:
@@ -408,8 +469,11 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
             order = tuple(wrappers(options).get("sampler_sample", {}))
             if KEY not in order or order.index(KEY) > order.index("spectrum_krea2"):
                 state.reason = "projection_guidance_requires_outer_sampler_scope"
+            elif _spectrum_regime_available(spectrum, executor.class_obj, options):
+                spectrum_policy = "guided_regime"
             else:
                 force_native = spectrum_all_actual(spectrum)
+                spectrum_policy = "all_actual"
             if state.reason is None and force_native is None:
                 state.reason = "missing_spectrum_all_actual_contract"
         if state.reason is None:
@@ -426,6 +490,6 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
         payload = {"seed": state.seed, "stage": stage, "completed": completed, "batch": batch,
                    "seconds": perf_counter() - begin, "native_dit_calls": run.native_dit_calls if run else None,
                    "spectrum_forecast_calls": run.spectrum_forecasts if run else None,
-                   "spectrum_policy": "all_actual" if run and run.spectrum else "none",
+                   "spectrum_policy": spectrum_policy if run is not None else "none",
                    "projection_guidance": state.report()}
         LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))

@@ -50,8 +50,6 @@ def test_zero_energy_outlier_nonfinite_and_native_caps():
     assert apply(source, units="relative_rms")[1]["status"] == "unchanged"
     assert apply(source, mode="channel_aware")[1]["status"] == "applied"
     source.fill_(64.)
-    native, trace = apply(source, amplitude=.025, max_absolute_rms=.02)
-    assert native is None and trace["reason"] == "native_rounded_rms_limit"
     source[1, 2, 0] = torch.inf
     assert apply(source)[1]["reason"] == "nonfinite_projection_or_perturbation"
     source.zero_()
@@ -59,6 +57,26 @@ def test_zero_energy_outlier_nonfinite_and_native_caps():
     result, info = apply(source, mode="token_adaptive")
     assert result is not None and math.isfinite(info["rows"][0]["native_rms"])
     assert info["rows"][0]["generated_rms"] == pytest.approx(Guidance.amplitude)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_rounding_backoff_preserves_hard_cap_and_native_storage(relative):
+    source = torch.full((3, 12, 8), 64., dtype=torch.float16)
+    source[2].zero_()
+    original = source.clone()
+    config = Guidance(amplitude=.025, max_absolute_rms=.03 if relative else .02,
+                      max_relative_rms=.02 / 64 if relative else 0)
+    info = {}
+    seeds = [12347, 12347]
+    result = perturb(source, (1, 11), 1, 2, config, config.amplitude, seeds, info)
+    assert info["status"] == "applied" and info["rows"][0]["rounding_backoff"]
+    row = info["rows"][0]
+    assert 0 < row["realized_rms"] <= row["allowed_rms"]
+    assert row["generated_rms"] <= row["target_rms"]
+    assert info["rows"][1]["rounding_backoff"] is (not relative)
+    assert torch.equal(source, original)
+    assert torch.equal(result[0], original[0]) and torch.equal(result[:, (0, -1)], original[:, (0, -1)])
+    assert torch.equal(result, perturb(source, (1, 11), 1, 2, config, config.amplitude, seeds, {}))
 
 
 def test_chunked_fields(monkeypatch):

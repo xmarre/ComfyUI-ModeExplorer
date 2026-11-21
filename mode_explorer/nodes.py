@@ -379,6 +379,9 @@ class ModeExplorerProjectionGuidance:
         if config is not None:
             clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(Settings(feature="native"), guidance=config))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
+            # Spectrum's verified ModeExplorer contract requires this marker.
+            # Projection guidance installs no feature frame, so it is inert.
+            clone.set_model_attn1_output_patch(attention_feature)
         return (clone,)
 
 

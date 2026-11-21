@@ -446,10 +446,48 @@ def test_projection_guidance_scale_locked_spectrum_routes(caplog, model):
     trace, = logs(caplog, "MODEEXPLORER_TRACE ")
     report, = logs(caplog, "Spectrum Krea 2 summary: ")
     assert trace["stage"] == report["stage"] == "planner"
-    assert trace["spectrum_policy"] == "all_actual"
-    assert trace["native_dit_calls"] > 0 and trace["spectrum_forecast_calls"] == 0
+    assert trace["spectrum_policy"] == "guided_regime"
+    assert trace["native_dit_calls"] > 0 and report["fallback"] is None
     assert len(trace["projection_guidance"]["points"]) == 2
     assert all(p["status"] == "applied" for p in trace["projection_guidance"]["points"])
     assert "target denoiser evaluations=0" in caplog.text
     assert torch.isfinite(planner["samples"]).all()
+    assert CURRENT.get() is None
+
+
+@pytest.mark.parametrize("sampler", ["euler", "er_sde"])
+def test_projection_guided_spectrum_resumes_with_fresh_anchors(caplog, model, sampler):
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    caplog.set_level(logging.INFO)
+    patched, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, scope="standalone", amplitude=.01)
+    result = draw(spectrum(patched, warmup=1), sigmas=SIGMAS, sampler=sampler)
+    assert torch.isfinite(result).all()
+    trace, = logs(caplog, "MODEEXPLORER_TRACE ")
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    assert trace["spectrum_policy"] == "guided_regime" and report["fallback"] is None
+    assert report["mode_explorer_native_steps"] == 2
+    assert "ModeExplorer early-feature regime transition" in report["actual_reasons"]
+    routes = {item["step"]: item["route"] for item in report["denoiser_decisions"]
+              if item["route"] != "forecast_rejected"}
+    assert [routes[index] for index in range(3)] == ["actual", "actual", "actual"]
+    assert report["forecast"] == trace["spectrum_forecast_calls"] > 0
+    assert report["actual"] + report["forecast"] == len(SIGMAS) - 1
+    guidance = trace["projection_guidance"]
+    assert [p["evaluation"] for p in guidance["points"]] == [0, 1]
+    assert all(p["status"] == "applied" for p in guidance["points"])
+    assert guidance["auxiliary_dit_calls"] == guidance["auxiliary_projection_calls"] == 0
+    assert CURRENT.get() is None
+
+
+def test_projection_guided_spectrum_pece_retains_all_actual(caplog, model):
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    caplog.set_level(logging.INFO)
+    patched, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, scope="standalone", amplitude=.01)
+    draw(spectrum(patched), sigmas=SIGMAS, sampler="sa_solver_pece")
+    trace, = logs(caplog, "MODEEXPLORER_TRACE ")
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    assert trace["spectrum_policy"] == "all_actual" and report["forecast"] == 0
+    assert len(trace["projection_guidance"]["points"]) == 2
     assert CURRENT.get() is None

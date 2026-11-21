@@ -676,8 +676,12 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
 
 def guidance_pending(model_options, sigma):
     run = model_options.get("transformer_options", {}).get(RUN)
-    return (type(run) is Run and run.feature_active and run.phase == "sample"
-            and sigma_eligible(sigma, run.settings.min_sigma)
+    if type(run) is not Run or run.phase != "sample":
+        return False
+    if run.guidance is not None:
+        state = run.guidance
+        return state.config.strength(state.ordinal, sigma) > 0
+    return (run.feature_active and sigma_eligible(sigma, run.settings.min_sigma)
             and (run.batch > 1 or run.reference_calls < run.settings.reference_budget))
 
 

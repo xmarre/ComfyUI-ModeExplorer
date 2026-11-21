@@ -34,7 +34,9 @@ def build(directory, split, arms, blind_key, identity=None):
     for arm in ("weak_gaussian", "higher_gaussian", "token_adaptive"):
         variants[arm] = json.loads((ROOT / "examples" / f"projection_guidance_{arm}.json").read_text())
     legacy = json.loads((ROOT / "examples" / "causal_directions.json").read_text())
-    legacy_settings = next(n["widgets_values"] for n in legacy["nodes"] if n["type"] == "ModeExplorerKrea2")
+    legacy_settings, = (node["widgets_values"] for node in legacy["nodes"]
+                        if node["type"] == "ModeExplorerKrea2" and not node["widgets_values"][23]
+                        and node["widgets_values"][-2] == "repel")
     directory.mkdir(parents=True, exist_ok=False)
     trial_seed = int.from_bytes(hashlib.sha256(f"{blind_key}:{split}".encode()).digest()[:8], "little")
     shuffle = random.Random(trial_seed)
@@ -64,12 +66,6 @@ def build(directory, split, arms, blind_key, identity=None):
                 guidance["properties"] = {"Node name for S&R": "ModeExplorerKrea2"}
                 guidance["title"] = "ModeExplorer Feature Guidance"
                 guidance["widgets_values"] = copy.deepcopy(legacy_settings)
-                # A weak feature-reference comparator with the same block as the direct arms.
-                guidance["widgets_values"][0:12] = [
-                    True, "feature_cosine", False, .04, .7, .82, False, .5, "auto", 2, True, False,
-                ]
-                guidance["widgets_values"][12] = 5
-                guidance["widgets_values"][-2:] = ["repel", 0]
             if case["id"] == "identity":
                 attach_identity(workflow, guidance, lora)
             (directory / f"{code}.json").write_text(json.dumps(workflow, indent=2) + "\n")

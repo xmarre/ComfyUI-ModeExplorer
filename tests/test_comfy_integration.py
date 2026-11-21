@@ -499,7 +499,15 @@ def test_projection_guidance_stage_retry_and_local_oom(model, caplog, monkeypatc
     guided, = node.apply(model, enabled=True, block=0, scope="planner", evaluations=1)
     settings = dict(sigmas=torch.tensor([1., .99, .99, .85, 0.]))
     baseline = draw(model, **settings)
-    assert torch.equal(draw(guided, stage="highres", **settings), baseline)
+    with caplog.at_level(logging.INFO):
+        assert torch.equal(draw(guided, **settings), baseline)
+        assert torch.equal(draw(guided, stage="highres", **settings), baseline)
+    skipped = traces(caplog)[-2:]
+    assert [entry["stage"] for entry in skipped] == ["standalone", "highres"]
+    for entry in skipped:
+        guidance = entry["projection_guidance"]
+        assert guidance["scope"] == "planner" and guidance["reason"] == "stage_scope_mismatch"
+        assert guidance["points"] == []
     with caplog.at_level(logging.INFO):
         assert not torch.equal(draw(guided, stage="planner", **settings), baseline)
     assert len(traces(caplog)[-1]["projection_guidance"]["points"]) == 1
@@ -526,6 +534,22 @@ def test_projection_guidance_stage_retry_and_local_oom(model, caplog, monkeypatc
         draw(guided, stage="planner", **settings)
     assert not block._forward_pre_hooks and not block.attn.wo._forward_hooks
     assert projection_guidance._ACTIVE.get() is None
+
+
+def test_benchmark_original_feature_copies_published_low_strength_arm(tmp_path):
+    from tools.projection_guidance_benchmark import ROOT, build
+
+    output = tmp_path / "benchmark"
+    build(output, "screening", ["original_feature"], "fixture")
+    example = json.loads((ROOT / "examples" / "causal_directions.json").read_text())
+    original = next(n["widgets_values"] for n in example["nodes"] if n["type"] == "ModeExplorerKrea2")
+    assert original[3] == .025 and original[-2] == "repel"
+    cases = json.loads((output / "private_allocation.json").read_text())
+    assert len(cases) == 6
+    for case in cases:
+        workflow = json.loads((output / (case["code"] + ".json")).read_text())
+        comparator, = (node for node in workflow["nodes"] if node["type"] == "ModeExplorerKrea2")
+        assert comparator["widgets_values"] == original
 
 
 def test_projection_guidance_clean_export_has_single_native_conversion(model, caplog, monkeypatch, tmp_path):
