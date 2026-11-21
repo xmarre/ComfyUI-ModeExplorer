@@ -1,0 +1,138 @@
+{
+  "native": {
+    "method": "native",
+    "spectrum": "all_actual"
+  },
+  "sham": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "repel",
+      "direction_trial": 0,
+      "sham": true
+    }
+  },
+  "repel": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "repel",
+      "direction_trial": 0,
+      "sham": false
+    }
+  },
+  "reverse": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "reverse",
+      "direction_trial": 0,
+      "sham": false
+    }
+  },
+  "channel_sign_0": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "channel_sign",
+      "direction_trial": 0,
+      "sham": false
+    }
+  },
+  "channel_sign_1": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "channel_sign",
+      "direction_trial": 1,
+      "sham": false
+    }
+  },
+  "channel_sign_2": {
+    "method": "cosine",
+    "spectrum": "all_actual",
+    "settings": {
+      "strength": 0.025,
+      "fidelity": 0.7,
+      "adaptive": false,
+      "min_sigma": 0.82,
+      "reference_budget": 2,
+      "feature_block": 5,
+      "feature_grid": "4",
+      "reference_source": "bank",
+      "reference_bank_size": 8,
+      "reference_trajectories": 1,
+      "reference_selection": "all",
+      "reference_continuation": "first_estimate",
+      "feature_update": "bounded",
+      "feature_direction": "channel_sign",
+      "direction_trial": 2,
+      "sham": false
+    }
+  }
+}
