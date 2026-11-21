@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from mode_explorer.mechanism import MechanisticSettings, conditioning_terms, filter_field, paired_measurement, signed_terms
-from mode_explorer.mechanism_runtime import estimate_capture_workspace
+from mode_explorer.mechanism import MechanisticSettings, band_weights, conditioning_terms, filter_field, paired_measurement, signed_terms
+from mode_explorer.mechanism_runtime import Workspace, _site_metrics, estimate_capture_workspace
 
 
 @pytest.mark.parametrize("h,w", [(9, 15), (8, 16)])
@@ -104,7 +104,73 @@ def test_published_profiles_pass_production_capture_preflight():
             latent_shape=(1, 16, 1, 308, 204), attention_channels=6144, patch_size=2,
             baseline_reused=False,
         )
-        assert captures + reserve <= spec.capture_mib * 1024**2, name
+        assert captures + reserve <= spec.capture_mib * 1024**2, (name, "cpu")
+        cuda_capture, cuda_reserve = estimate_capture_workspace(
+            spec, feature_block=options["feature_block"], grid=(154, 102), latent_shape=(1, 16, 1, 308, 204),
+            attention_channels=6144, patch_size=2, baseline_reused=False, chunk=spec.cuda_chunk,
+        )
+        assert cuda_capture + cuda_reserve <= spec.capture_vram_mib * 1024**2, (name, "cuda")
         if name == "conditioning_fixed":
             assert spec.mode == "conditioning_fixed"
             assert spec.core_arms == 4
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is unavailable"))])
+@pytest.mark.parametrize("mode,arm_count", [("signed", 3), ("joint_fixed", 5)])
+def test_spectral_reuse_and_accuracy(device, mode, arm_count, monkeypatch):
+    rng = torch.Generator().manual_seed(33)
+    a = torch.randn(7, 13, 18, generator=rng) + 32
+    p, m, c, q = torch.randn(4, *a.shape, generator=rng) * .003
+    fields = {"D00": a, "D01": a + p, "D0minus": a + m}
+    if arm_count == 5:
+        fields.update(D10=a + 8 + c, D11=a + 8 + c + q)
+    fields = {name: field.to(device) for name, field in fields.items()}
+    spec = MechanisticSettings(mode=mode, alternate=object())
+    observed = []
+    fft = torch.fft.rfft2
+
+    def record_fft(tensor, *args, **kwargs):
+        observed.append((tensor.device.type, math.prod(tensor.shape[:-2])))
+        return fft(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", record_fft)
+    result = _site_metrics(fields, spec, 1, 2, 3)
+    assert observed == [(device, 3 * arm_count), (device, 3 * arm_count), (device, arm_count)]
+    if device == "cuda":
+        tensor = fields["D00"].transpose(1, 2)
+        workspace = Workspace(100_000, tensor.device)
+        snapshot = workspace.stage(tensor)
+        assert snapshot.device == tensor.device and snapshot.is_contiguous()
+        assert snapshot.data_ptr() != tensor.data_ptr()
+        assert workspace.transfer_bytes == 0
+
+    a = fields["D00"].cpu()
+    p = fields["D01"].cpu() - a
+    m = fields["D0minus"].cpu() - a
+    independent = {
+        "positive": (a, a + p),
+        "negative": (a, a + m),
+        "odd": (torch.zeros_like(a), (p - m) / 2),
+        "even": (torch.zeros_like(a), (p + m) / 2),
+        "positive_vs_reflected_negative": (-m, p),
+    }
+    if arm_count == 5:
+        c0 = fields["D10"].cpu() - a
+        c1 = fields["D11"].cpu() - fields["D01"].cpu()
+        edit = fields["D11"].cpu() - fields["D10"].cpu()
+        independent.update(conditioning_baseline=(a, fields["D10"].cpu()),
+                           conditioning_edited=(fields["D01"].cpu(), fields["D11"].cpu()),
+                           conditioning_interaction=(c0, c1), feature_across_conditions=(p, edit))
+    names, weights = band_weights(a.shape, spec.low_cut, spec.high_cut, a.device, patch_size=2)
+    for key, (before, after) in independent.items():
+        actual = result[key]
+        delta = after.double() - before.double()
+        assert actual["displacement_l2"] == pytest.approx(float(delta.norm()), rel=2e-5)
+        b, d = fft(before.double(), norm="ortho"), fft(delta, norm="ortho")
+        bins = torch.stack((b.abs().square(), d.abs().square(), 2 * (b.conj() * d).real)).sum(1).flatten(1)
+        for name, (energy, edit, cross) in zip(names, (bins @ weights.double().T).T.tolist()):
+            band = actual["bands"][name]
+            for stat, expected in (("baseline", energy), ("displacement", edit), ("cross_term", cross),
+                                   ("net_change", edit + cross)):
+                assert band[stat] == pytest.approx(expected, rel=5e-4, abs=1e-6), (key, name, stat)

@@ -8,6 +8,7 @@ import re
 import shutil
 from pathlib import Path
 import tempfile
+from time import perf_counter
 
 import torch
 
@@ -175,6 +176,8 @@ def _export(response, tensors, point):
     if not response.config.export:
         return
     mechanistic = response.config.mechanistic is not None
+    timings = point.get("mechanistic", {}).get("timings_ms")
+    export_start = perf_counter()
     run_limit = MAX_EXPORT_BYTES * (response.config.states if mechanistic else 1)
     remaining = min(MAX_EXPORT_BYTES, run_limit - response.exports)
     size = sum(t.numel() * torch.float32.itemsize for t in tensors.values())
@@ -207,6 +210,8 @@ def _export(response, tensors, point):
         run_dir = Path(tempfile.mkdtemp(prefix="response-", dir=directory))
         save_file(payload, run_dir / "predictions.safetensors",
                   metadata={"modeexplorer_response": "1", "clean_format": "comfy_vae_latent"})
+        if timings is not None:
+            timings["export"] = (perf_counter() - export_start) * 1000
         manifest = (json.dumps(point, allow_nan=False, separators=(",", ":")) if "mechanistic" in point
                     else json.dumps(point, allow_nan=False, indent=2)) + "\n"
         if len(manifest.encode("utf-8")) > (MECHANISTIC_MANIFEST_LIMIT if "mechanistic" in point else 512 * 1024):
@@ -221,6 +226,9 @@ def _export(response, tensors, point):
         if run_dir is not None:
             shutil.rmtree(run_dir, ignore_errors=True)
         point["export_status"] = f"failed_{type(exc).__name__}"
+    finally:
+        if timings is not None:
+            timings["export"] = (perf_counter() - export_start) * 1000
 
 
 def run_response(executor, run, frame, arguments, kwargs, velocity):
@@ -423,14 +431,19 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 return velocity
 
         if cfg.mechanistic is not None:
-            from .mechanism_runtime import CaptureLimit, research_response
+            from .mechanism_runtime import CaptureLimit, ResearchTiming, research_response
             from .runtime import finite_json
 
+            timing = ResearchTiming()
             try:
                 result, tensors = research_response(
                     executor, run, frame, latent, x, timesteps, context, mask, refs, clean_options,
-                    kwargs, velocity, point, spend, reference_sigma, initial_sol_evaluations, sol_evaluations, probe_seed,
+                    kwargs, velocity, point, spend, reference_sigma, initial_sol_evaluations, sol_evaluations, probe_seed, timing,
                 )
+            except torch.OutOfMemoryError:
+                point.update(status="skipped", reason="mechanistic_cuda_out_of_memory" if latent.is_cuda
+                             else "mechanistic_out_of_memory")
+                return velocity
             except CaptureLimit as exc:
                 point.update(status="skipped", reason=str(exc))
                 return velocity
@@ -438,12 +451,15 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 reason = str(exc)
                 point.update(status="skipped" if reason == "auxiliary_forward_budget" else "rejected", reason=reason)
                 return velocity
+            finally:
+                point["mechanistic"]["timings_ms"] = timing.finish()
             if tensors:
                 point["auxiliary_dit_calls"] = response.forwards - before
                 point["auxiliary_dit_rows"] = response.rows - rows_before
                 export_point = finite_json(point)
                 _export(response, tensors, export_point)
                 point.update((key, value) for key, value in export_point.items() if key.startswith("export_"))
+                point["mechanistic"]["timings_ms"] = export_point["mechanistic"]["timings_ms"]
             return result
 
         baseline_taps = {} if wants_feature and cfg.downstream else None

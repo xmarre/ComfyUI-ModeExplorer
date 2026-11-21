@@ -262,7 +262,7 @@ class ModeExplorerMechanistic:
             "max_sigma": ("FLOAT", {"default": 1., "min": 0., "max": 1., "step": .00001}),
             "auxiliary_budget": ("INT", {"default": 24, "min": 0, "max": 48}),
             "memory_mb": ("INT", {"default": 768, "min": 16, "max": 1024}),
-            "capture_mib": number("INT", "capture_mib", 16, 8192),
+            "capture_mib": number("INT", "capture_mib", 16, 8192, tooltip="Capture and spectral workspace limit for explicit CPU analysis."),
         }, "optional": {
             **optional,
             "alternate": ("CONDITIONING",),
@@ -279,6 +279,9 @@ class ModeExplorerMechanistic:
             "checkpoint_provenance": (["", "same_execution", "alternate_execution", "dequantized_approximation",
                                        "original_weights", "different_weights"], {"default": ""}),
             "trial": common["required"]["trial"],
+            "analysis_device": (["cuda", "cpu"], {"default": defaults.analysis_device, "tooltip": "CUDA uses the inference GPU. CPU is an explicit diagnostic fallback."}),
+            "capture_vram_mib": number("INT", "capture_vram_mib", 16, 32768, tooltip="CUDA capture and spectral workspace budget, separate from ordinary DiT memory."),
+            "cuda_chunk": number("INT", "cuda_chunk", 1, 128, tooltip="Channels processed together per CUDA spectral batch."),
         }}
 
     def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,

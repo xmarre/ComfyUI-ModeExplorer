@@ -12,7 +12,10 @@
     "evaluation": -1,
     "export": true,
     "memory_mb": 768,
-    "chunk": 8
+    "chunk": 8,
+    "analysis_device": "cuda",
+    "capture_vram_mib": 10240,
+    "cuda_chunk": 32
   },
   "profiles": {
     "smoke": {

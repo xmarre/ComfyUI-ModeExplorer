@@ -36,6 +36,9 @@ class MechanisticSettings:
     alternate: object = None
     checkpoint_provenance: str = ""
     match_cross_dtype: bool = False
+    analysis_device: str = "cuda"
+    capture_vram_mib: int = 8192
+    cuda_chunk: int = 32
 
     @cached_property
     def block_ids(self):
@@ -70,6 +73,10 @@ class MechanisticSettings:
             raise ValueError("Unknown measurement site or empty block selection.")
         if not 1 <= self.chunk <= 64 or not 16 <= self.capture_mib <= 8192:
             raise ValueError("Chunk and capture budget are outside the supported range.")
+        if self.analysis_device not in ("cuda", "cpu"):
+            raise ValueError("Analysis device must be cuda or cpu.")
+        if not 16 <= self.capture_vram_mib <= 32768 or not 1 <= self.cuda_chunk <= 128:
+            raise ValueError("CUDA channel chunk and capture budget are outside the supported range.")
         if not 0 < self.low_cut < self.high_cut < math.sqrt(0.5) / 2 or not 0 <= self.transition <= 0.25:
             raise ValueError("Frequency cutoffs must increase within the spatial Nyquist grid.")
         if not 0 <= self.symmetry_limit <= 1 or not -1 <= self.cell <= 255:
@@ -108,74 +115,123 @@ def band_weights(shape, low, high, device, sample_stride=1, patch_size=None):
     return tuple(marks), torch.stack(tuple(marks.values())).flatten(1).to(weights.dtype) * weights.repeat(shape[-2])
 
 
-def combination(terms, channel):
-    result = terms[0][1][channel].float() * terms[0][0]
-    for scale, tensor in terms[1:]:
-        result.add_(tensor[channel].float(), alpha=scale)
+def combination(terms, fields, zero):
+    """Combine only a channel batch. Preserve cached input and Fourier fields."""
+    if not terms:
+        return zero
+    scale, name = terms[0]
+    if len(terms) == 1 and scale == 1:
+        return fields[name]
+    result = fields[name] * scale
+    for scale, name in terms[1:]:
+        result.add_(fields[name], alpha=scale)
     return result
 
 
-def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25, *, sample_stride=1, patch_size=None):
-    """Measure two channel-first fields, optionally specified as linear combinations."""
-    baseline = ((1.0, baseline),) if torch.is_tensor(baseline) else baseline
-    edited = ((1.0, edited),) if torch.is_tensor(edited) else edited
-    fields = [tensor for _, tensor in (*baseline, *edited)]
-    shape = fields[0].shape
-    if len(shape) != 3 or any(t.shape != shape or t.device != fields[0].device for t in fields):
+def measure_comparisons(basis, comparisons, chunk=8, low=.125, high=.25, *, sample_stride=1, patch_size=None):
+    """Measure (baseline, displacement) in a shared basis, with one FFT per basis field and channel."""
+    source = [value for terms in basis.values() for _, value in terms]
+    shape, device = source[0].shape, source[0].device
+    if len(shape) != 3 or any(value.shape != shape or value.device != device for value in source):
         raise ValueError("Incompatible channel-first spatial tensors.")
-    device = fields[0].device
+
     names, weights = band_weights(shape, low, high, device, sample_stride, patch_size)
-    counts = weights.sum(dim=1).int().tolist()
-    weights = weights.double().T
-    powers = torch.zeros((4, len(names)), dtype=torch.float64, device=device)
-    totals = torch.zeros(4, dtype=torch.float64, device=device)
-    spatial = torch.zeros(shape[-2:], dtype=torch.float64, device=device)
-    for i in range(0, shape[0], chunk):
-        channels = slice(i, i + chunk)
-        base = combination(baseline, channels)
-        arm = combination(edited, channels)
-        delta = arm - base
-        spatial += delta.square().sum(dim=0)
-        totals += torch.stack((base.square().sum(dtype=torch.float64), arm.square().sum(dtype=torch.float64),
-                               delta.square().sum(dtype=torch.float64), (base * arm).sum(dtype=torch.float64)))
-        a = torch.fft.rfft2(base, norm="ortho")
-        d = torch.fft.rfft2(delta, norm="ortho")
-        b = a + d
-        per_bin = torch.stack((a.abs().square(), b.abs().square(), d.abs().square(),
-                               2 * (a.conj() * d).real)).sum(dim=1).flatten(1)
-        powers += per_bin.double() @ weights
-    if not torch.isfinite(totals).all() or not torch.isfinite(powers).all():
-        raise ValueError("Nonfinite spatial or spectral measurement.")
-    base, arm, delta, dot = totals.tolist()
+    counts = weights.sum(dim=1)
     n = math.prod(shape)
+    h, w = shape[-2:]
+    power = torch.zeros((len(comparisons), 4, len(names)), dtype=torch.float64, device=device)
+    totals = torch.zeros((len(comparisons), 4), dtype=torch.float64, device=device)
+    spatial = torch.zeros((len(comparisons), h, w), device=device)
+    for i in range(0, shape[0], chunk):
+        ch = slice(i, i + chunk)
+        # Use one cached FP32 cast per distinct source tensor in the batch.
+        values = {id(value): value[ch].float() for value in {id(t): t for t in source}.values()}
+        fields = {name: combination([(scale, id(value)) for scale, value in terms], values, None)
+                  for name, terms in basis.items()}
+        packed = torch.stack(tuple(fields.values()))
+        # Center channels before FFT and restore DC analytically. A large
+        # offset otherwise leaks through FP32 round-off into small AC responses.
+        mean = packed.mean(dim=(-1, -2), keepdim=True)
+        packed.sub_(mean)
+        transformed = torch.fft.rfft2(packed, norm="ortho")
+        transformed[..., 0, 0] = mean[..., 0, 0] * math.sqrt(h * w)
+        spectra = dict(zip(fields, transformed.unbind()))
+        zero = torch.zeros_like(packed[0])
+        zero_fft = torch.zeros_like(transformed[0])
+        for idx, (base, change) in enumerate(comparisons.values()):
+            a = combination(base, fields, zero)
+            d = combination(change, fields, zero)
+            b = a + d
+            energy = d.square()
+            spatial[idx].add_(energy.sum(dim=0))
+            totals[idx].add_(torch.stack((a.square().sum(), b.square().sum(), energy.sum(), (a * b).sum())))
+
+            af = combination(base, spectra, zero_fft)
+            df = combination(change, spectra, zero_fft)
+            bf = af + df
+            per_bin = torch.stack(((af.real.square() + af.imag.square()).sum(0),
+                                   (bf.real.square() + bf.imag.square()).sum(0),
+                                   (df.real.square() + df.imag.square()).sum(0),
+                                   2 * (af.real * df.real + af.imag * df.imag).sum(0))).flatten(1)
+            # Explicit FP32 products and reductions avoid TF32 matmul settings on CUDA.
+            # Accumulate only the small chunk summaries in FP64.
+            power[idx].add_((per_bin[:, None] * weights).sum(dim=-1))
+
+    ordered = spatial.flatten(1)
+    top = [ordered.topk(max(1, math.ceil(h * w * p / 100)), dim=1).values.sum(dim=1)
+           for p in (1, 10, 25)]
+    ty, tx = min(4, h), min(4, w)
+    tiles = [spatial[:, i*h//ty:(i+1)*h//ty, j*w//tx:(j+1)*w//tx].sum(dim=(1, 2))
+             for i in range(ty) for j in range(tx)]
+    summary = torch.cat((totals, power.transpose(1, 2).flatten(1), torch.stack(top + tiles, dim=1)), dim=1)
+    # Move only compact results to the host, once per site.
+    host = torch.cat((counts.expand(len(comparisons), -1), summary), dim=1).cpu()
+    if not torch.isfinite(host).all():
+        raise ValueError("Nonfinite spatial or spectral measurement.")
+    dtype = str(source[0].dtype)
+    return {name: _measurement(row, names, shape, dtype, n, ty, tx)
+            for name, row in zip(comparisons, host.tolist())}
+
+
+def _measurement(row, names, shape, dtype, n, ty, tx):
+    counts = row[:len(names)]
+    base, arm, delta, dot = row[len(names):len(names)+4]
+    offset = len(names) + 4
     bn, an, dn = math.sqrt(base), math.sqrt(arm), math.sqrt(delta)
     cosine = max(-1., min(1., dot / (bn * an))) if bn * an else None
-    ordered = spatial.flatten()
-    top = {str(p): float(ordered.topk(max(1, math.ceil(ordered.numel() * p / 100))).values.sum()) / delta
-           if delta else None for p in (1, 10, 25)}
-    # Sum disjoint spatial tiles so the map is comparable to total displacement
-    # energy and never mixes channels, overlapping windows, or normalized activations.
-    h, w = shape[-2:]
-    ty, tx = min(4, h), min(4, w)
-    tiles = [[float(spatial[i*h//ty:(i+1)*h//ty, j*w//tx:(j+1)*w//tx].sum())
-              for j in range(tx)] for i in range(ty)]
-    result = {}
-    for name, count, (b, a, d, cross) in zip(names, counts, powers.T.tolist()):
-        result[name] = {
-            "frequency_bins": count, "baseline": b, "edited": a, "displacement": d,
+    bands = {}
+    for i, name in enumerate(names):
+        b, a, d, cross = row[offset + 4*i:offset + 4*i + 4]
+        bands[name] = {
+            "frequency_bins": int(counts[i]), "baseline": b, "edited": a, "displacement": d,
             "cross_term": cross, "net_change": d + cross,
             "baseline_fraction": b / base if base else None, "edited_fraction": a / arm if arm else None,
             "displacement_fraction": d / delta if delta else None,
             "relative_net_change": (d + cross) / b if b else None,
         }
+    offset += 4 * len(names)
+    top = {str(p): value / delta if delta else None for p, value in zip((1, 10, 25), row[offset:offset+3])}
+    tiles = row[offset+3:]
     return {
-        "shape_chw": list(shape), "baseline_dtype": str(baseline[0][1].dtype),
-        "edited_dtype": str(edited[0][1].dtype), "baseline_l2": bn, "edited_l2": an,
-        "displacement_l2": dn, "baseline_rms": bn / math.sqrt(n), "edited_rms": an / math.sqrt(n),
+        "shape_chw": list(shape), "baseline_dtype": dtype, "edited_dtype": dtype,
+        "baseline_l2": bn, "edited_l2": an, "displacement_l2": dn,
+        "baseline_rms": bn / math.sqrt(n), "edited_rms": an / math.sqrt(n),
         "displacement_rms": dn / math.sqrt(n), "relative_displacement": dn / bn if bn else None,
         "cosine": cosine, "normalized_displacement": math.sqrt(max(0., 2 - 2 * cosine)) if cosine is not None else None,
-        "top_spatial_percent_energy_fraction": top, "spatial_tile_energy": tiles, "bands": result,
+        "top_spatial_percent_energy_fraction": top,
+        "spatial_tile_energy": [tiles[i*tx:(i+1)*tx] for i in range(ty)], "bands": bands,
     }
+
+
+def paired_measurement(baseline, edited, chunk=8, low=.125, high=.25, *, sample_stride=1, patch_size=None):
+    """Measure two channel-first fields, optionally specified as linear combinations."""
+    baseline = ((1., baseline),) if torch.is_tensor(baseline) else baseline
+    edited = ((1., edited),) if torch.is_tensor(edited) else edited
+    basis = {"base": baseline, "delta": (*edited, *((-scale, value) for scale, value in baseline))}
+    result = measure_comparisons(basis, {"pair": (((1., "base"),), ((1., "delta"),))},
+                                 chunk, low, high, sample_stride=sample_stride, patch_size=patch_size)["pair"]
+    result["edited_dtype"] = str(edited[0][1].dtype)
+    return result
 
 
 def filter_field(field, band, low, high, transition=0.0, *, patch_size=1):

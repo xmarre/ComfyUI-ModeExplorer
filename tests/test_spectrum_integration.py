@@ -381,7 +381,7 @@ def test_mechanistic_preserves_passive_forecasts_and_forces_active_native(caplog
     caplog.set_level(logging.INFO)
     base = draw(spectrum(model), sigmas=SIGMAS)
     node = ModeExplorerMechanistic()
-    options = dict(feature_block=1, blocks="1", sites="projection_input,clean", evaluation=1)
+    options = dict(feature_block=1, blocks="1", sites="projection_input,clean", evaluation=1, analysis_device="cpu")
     passive, = node.apply(model, **options)
     assert torch.equal(base, draw(spectrum(passive), sigmas=SIGMAS))
     passive_report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
@@ -410,7 +410,8 @@ def test_mechanistic_scale_locked_uses_original_planner_and_zero_target_evaluati
     caplog.set_level(logging.INFO)
     p, n = conditions()
     latent = {"samples": torch.zeros(1, 16, 1, 80, 80)}
-    patched, = ModeExplorerMechanistic().apply(model, feature_block=1, blocks="1", sites="clean", evaluation=0)
+    patched, = ModeExplorerMechanistic().apply(model, feature_block=1, blocks="1", sites="clean", evaluation=0,
+                                                analysis_device="cpu")
     options = dict(steps=6, composition_lock_sigma=.60, sampler_name="er_sde")
     with torch.inference_mode():
         _, baseline_planner, _ = node.sample(spectrum(model), p, n, latent, 902, .25, 0., 0., **options)

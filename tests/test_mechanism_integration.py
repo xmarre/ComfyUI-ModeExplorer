@@ -19,7 +19,7 @@ def point(caplog):
 
 def patched(model, **changes):
     return ModeExplorerMechanistic().apply(model, **{"feature_block": 1, "blocks": "0-2",
-                                                     "evaluation": 1, "export": False, **changes})[0]
+                                                     "evaluation": 1, "export": False, "analysis_device": "cpu", **changes})[0]
 
 
 def test_signed_uses_exact_matched_image_sites_and_preserves_native_cfg(model, caplog):
@@ -36,6 +36,12 @@ def test_signed_uses_exact_matched_image_sites_and_preserves_native_cfg(model, c
     exp = m["mechanistic"]
     assert m["auxiliary_dit_calls"] == m["auxiliary_dit_rows"] == 8
     assert exp["repeat_clean_rms"] == 0
+    assert exp["analysis_device"] == "cpu"
+    assert exp["capture_transfer_bytes"] == 0
+    assert exp["timings_ms"]["auxiliary_dit"] > 0
+    assert exp["timings_ms"]["capture_copy"] > 0
+    assert exp["timings_ms"]["spectral"] > 0
+    assert exp["timings_ms"]["export"] == 0
     assert exp["sites"]["b1.attention_pre"]["comparisons"]["positive"]["displacement_rms"] == 0
     assert exp["sites"]["b1.attention_post"]["comparisons"]["positive"]["displacement_rms"] > 0
     assert exp["sites"]["b0.mlp_output"]["comparisons"]["positive"]["displacement_rms"] == 0
@@ -131,6 +137,7 @@ def test_export_frozen_match_and_shared_reference_start(model, caplog, tmp_path,
     export_id = second["export_id"]
     manifest = loads((tmp_path / "modeexplorer_response" / export_id / "manifest.json").read_text())
     assert manifest["native_input_fp32_sha256"] == second["native_input_fp32_sha256"]
+    assert 0 < manifest["mechanistic"]["timings_ms"]["export"] <= second["mechanistic"]["timings_ms"]["export"]
     export_path, exported, study = load(tmp_path / "modeexplorer_response" / export_id)
     assert compare((exported, study), (exported, study))["status"] == "matched_inputs"
     old = {**study, "schema": 1, "frequency_cycles_per_grid_cell": [.125, .25]}
@@ -232,3 +239,14 @@ def test_legacy_exports_keep_sampler_budget(tmp_path, monkeypatch):
     response_runtime._export(response, tensors, second := {})
     assert first["export_status"] == "completed"
     assert second["export_status"] == "export_budget"
+
+
+def test_cuda_policy_does_not_fall_back_to_cpu(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    assert ModeExplorerMechanistic.INPUT_TYPES()["optional"]["analysis_device"][1]["default"] == "cuda"
+    assert torch.equal(draw(model), draw(patched(model, analysis_device="cuda")))
+    measured = point(caplog)
+    assert measured["status"] == "skipped"
+    assert measured["reason"] == "mechanistic_cuda_requires_cuda_inference"
+    assert measured["auxiliary_dit_calls"] == 0
+    assert measured["mechanistic"]["analysis_device"] is None
