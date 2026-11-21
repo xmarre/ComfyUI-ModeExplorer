@@ -10,12 +10,12 @@ SITES = (
     "attention_pre", "attention_post", "gate_logits", "sigmoid_gate",
     "projection_input", "projection_output", "attention_contribution",
     "after_attention", "mlp_input", "mlp_output", "mlp_contribution", "after_mlp",
-    "final_projection", "velocity", "clean",
+    "final_projection", "final_projection_unpatched", "velocity", "clean",
 )
 UNAVAILABLE = {"sigmoid_gate", "attention_contribution", "mlp_contribution"}
 MODES = ("signed", "conditioning_fixed", "conditioning_recomputed", "joint_fixed", "joint_recomputed")
 COMPONENTS = ("observe", "complete", "even", "odd", "interaction", "control")
-FILTERS = ("all", "low", "mid", "high")
+FILTERS = ("all", "low", "mid", "high", "sub_patch")
 
 
 @dataclass(frozen=True)
@@ -25,8 +25,8 @@ class MechanisticSettings:
     sites: str = "velocity,clean"
     chunk: int = 8
     capture_mib: int = 2048
-    low_cut: float = 0.125
-    high_cut: float = 0.25
+    low_cut: float = 0.0625
+    high_cut: float = 0.125
     transition: float = 0.0
     component: str = "observe"
     band: str = "all"
@@ -66,7 +66,7 @@ class MechanisticSettings:
             raise ValueError("Unknown measurement site or empty block selection.")
         if not 1 <= self.chunk <= 64 or not 16 <= self.capture_mib <= 8192:
             raise ValueError("Chunk and capture budget are outside the supported range.")
-        if not 0 < self.low_cut < self.high_cut < math.sqrt(0.5) or not 0 <= self.transition <= 0.25:
+        if not 0 < self.low_cut < self.high_cut < math.sqrt(0.5) / 2 or not 0 <= self.transition <= 0.25:
             raise ValueError("Frequency cutoffs must increase within the spatial Nyquist grid.")
         if not 0 <= self.symmetry_limit <= 1 or not -1 <= self.cell <= 255:
             raise ValueError("Symmetry tolerance or cell is outside its supported range.")
@@ -80,23 +80,28 @@ class MechanisticSettings:
             raise ValueError("The amplitude check requires opposite-signed arms.")
 
 
-def radius(shape, device):
+def frequency_grid(shape, device, sample_stride=1, patch_size=None):
     h, w = shape[-2:]
-    fy = torch.fft.fftfreq(h, device=device)
-    fx = torch.fft.rfftfreq(w, device=device)
-    return (fy[:, None].square() + fx[None, :].square()).sqrt()
+    fy = torch.fft.fftfreq(h, d=sample_stride, device=device)[:, None]
+    fx = torch.fft.rfftfreq(w, d=sample_stride, device=device)[None, :]
+    common = (fy.abs() <= .5 / patch_size) & (fx <= .5 / patch_size) if patch_size else None
+    return (fy.square() + fx.square()).sqrt(), common
 
 
-def band_weights(shape, low, high, device):
-    radii = radius(shape, device)
+def band_weights(shape, low, high, device, sample_stride=1, patch_size=None):
+    radii, common = frequency_grid(shape, device, sample_stride, patch_size)
     dc = radii == 0
-    labels = (dc, (~dc) & (radii <= low), (radii > low) & (radii <= high), radii > high)
+    marks = {"dc": dc, "low": (~dc) & (radii <= low), "mid": (radii > low) & (radii <= high),
+             "high": radii > high}
+    if common is not None:
+        marks = {name: mask & common for name, mask in marks.items()}
+        marks["sub_patch"] = ~common
     w = shape[-1]
     weights = torch.full((w // 2 + 1,), 2.0, device=device)
     weights[0] = 1
     if w % 2 == 0:
         weights[-1] = 1
-    return torch.stack(labels).flatten(1).to(weights.dtype) * weights.repeat(shape[-2])
+    return tuple(marks), torch.stack(tuple(marks.values())).flatten(1).to(weights.dtype) * weights.repeat(shape[-2])
 
 
 def combination(terms, channel):
@@ -106,7 +111,7 @@ def combination(terms, channel):
     return result
 
 
-def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
+def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25, *, sample_stride=1, patch_size=None):
     """Measure two channel-first fields, optionally specified as linear combinations."""
     baseline = ((1.0, baseline),) if torch.is_tensor(baseline) else baseline
     edited = ((1.0, edited),) if torch.is_tensor(edited) else edited
@@ -115,8 +120,10 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
     if len(shape) != 3 or any(t.shape != shape or t.device != fields[0].device for t in fields):
         raise ValueError("Incompatible channel-first spatial tensors.")
     device = fields[0].device
-    weights = band_weights(shape, low, high, device).double().T
-    powers = torch.zeros((4, 4), dtype=torch.float64, device=device)
+    names, weights = band_weights(shape, low, high, device, sample_stride, patch_size)
+    counts = weights.sum(dim=1).int().tolist()
+    weights = weights.double().T
+    powers = torch.zeros((4, len(names)), dtype=torch.float64, device=device)
     totals = torch.zeros(4, dtype=torch.float64, device=device)
     spatial = torch.zeros(shape[-2:], dtype=torch.float64, device=device)
     for i in range(0, shape[0], chunk):
@@ -149,9 +156,10 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
     tiles = [[float(spatial[i*h//ty:(i+1)*h//ty, j*w//tx:(j+1)*w//tx].sum())
               for j in range(tx)] for i in range(ty)]
     result = {}
-    for name, (b, a, d, cross) in zip(("dc", "low", "mid", "high"), powers.T.tolist()):
+    for name, count, (b, a, d, cross) in zip(names, counts, powers.T.tolist()):
         result[name] = {
-            "baseline": b, "edited": a, "displacement": d, "cross_term": cross, "net_change": d + cross,
+            "frequency_bins": count, "baseline": b, "edited": a, "displacement": d,
+            "cross_term": cross, "net_change": d + cross,
             "baseline_fraction": b / base if base else None, "edited_fraction": a / arm if arm else None,
             "displacement_fraction": d / delta if delta else None,
             "relative_net_change": (d + cross) / b if b else None,
@@ -166,10 +174,10 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
     }
 
 
-def filter_field(field, band, low, high, transition=0.0):
+def filter_field(field, band, low, high, transition=0.0, *, patch_size=1):
     if band == "all":
         return field
-    r = radius(field.shape, field.device)
+    r, common = frequency_grid(field.shape, field.device, patch_size=patch_size)
 
     def low_pass(cut):
         if transition == 0:
@@ -178,7 +186,7 @@ def filter_field(field, band, low, high, transition=0.0):
         return (1 + torch.cos(torch.pi * t)) * 0.5
 
     first, second = low_pass(low), low_pass(high)
-    mask = {"low": first, "mid": second - first, "high": 1 - second}[band]
+    mask = ~common if band == "sub_patch" else {"low": first, "mid": second - first, "high": 1 - second}[band] * common
     freq = torch.fft.rfft2(field.float(), norm="ortho")
     return torch.fft.irfft2(freq * mask, s=field.shape[-2:], norm="ortho")
 

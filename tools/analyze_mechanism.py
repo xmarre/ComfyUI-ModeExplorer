@@ -17,8 +17,8 @@ def load(path):
         raise ValueError("Manifest exceeds the mechanistic size limit.")
     point = json.loads(path.read_text())
     study = point.get("mechanistic", {})
-    if point.get("schema") != 1 or study.get("schema") != 1:
-        raise ValueError(f"{path} is not a schema 1 mechanistic export.")
+    if point.get("schema") != 1 or study.get("schema") not in (1, 2):
+        raise ValueError(f"{path} is not a supported mechanistic export.")
     return path, point, study
 
 
@@ -30,6 +30,7 @@ def profile(study, comparison):
             "status": "completed" if value else site["status"] if site["status"] != "completed" else "comparison_missing",
             "reason": site.get("reason"),
             "coordinate": site["coordinate"],
+            "latent_pixels_per_sample": site.get("latent_pixels_per_sample"),
             "even_energy_fraction": site.get("even_energy_fraction"),
             "even_energy_fraction_by_band": site.get("even_energy_fraction_by_band"),
             "measurement": value,
@@ -57,7 +58,8 @@ def compare(left, right):
                 for key, data in study["conditioning"].items()}
 
     pairs["conditioning"] = condition_values(study0), condition_values(study1)
-    for name in ("mode", "injection_block", "frequency_cycles_per_grid_cell", "amplitude_check"):
+    for name in ("schema", "mode", "injection_block", "frequency_cycles_per_grid_cell",
+                 "frequency_cycles_per_latent_pixel", "patch_nyquist_per_axis", "amplitude_check"):
         pairs[name] = (study0.get(name), study1.get(name))
     mismatches = [name for name, (a, b) in pairs.items() if a != b]
     sites0, sites1 = study0["sites"], study1["sites"]
@@ -128,6 +130,9 @@ def main():
     result = {"comparison": args.comparison, "profiles": [{
         "path": str(path), "status": point["status"], "sigma": point["sigma"],
         "amplitude": study.get("amplitude"), "sites": profile(study, args.comparison),
+        "frequency_cycles_per_latent_pixel": study.get("frequency_cycles_per_latent_pixel"),
+        "frequency_cycles_per_grid_cell": study.get("frequency_cycles_per_grid_cell"),
+        "patch_nyquist_per_axis": study.get("patch_nyquist_per_axis"),
     } for path, point, study in loaded]}
     if len(loaded) == 2:
         result["compatibility"] = compare(loaded[0][1:], loaded[1][1:])

@@ -28,7 +28,7 @@ def test_signed_uses_exact_matched_image_sites_and_preserves_native_cfg(model, c
     rng = torch.random.get_rng_state().clone()
     proxied = patched(model, sites="attention_pre,attention_post,gate_logits,sigmoid_gate,projection_input,projection_output,"
                                  "attention_contribution,after_attention,mlp_input,mlp_output,mlp_contribution,"
-                                 "after_mlp,final_projection,velocity,clean", amplitude_check=True, repeat_baseline=True)
+                                 "after_mlp,final_projection,final_projection_unpatched,velocity,clean", amplitude_check=True, repeat_baseline=True)
     assert torch.equal(native, draw(proxied, cfg=2, reference=True, split_cfg=True))
     assert torch.equal(rng, torch.random.get_rng_state())
     m = point(caplog)
@@ -45,6 +45,12 @@ def test_signed_uses_exact_matched_image_sites_and_preserves_native_cfg(model, c
     assert exp["sites"]["b1.projection_input"]["comparisons"]["positive"]["shape_chw"] == [64, 4, 6]
     assert exp["sites"]["final_projection"]["comparisons"]["positive"]["shape_chw"] == [64, 4, 6]
     assert exp["sites"]["clean"]["comparisons"]["positive"]["shape_chw"] == [16, 7, 11]
+    assert exp["sites"]["final_projection"]["latent_pixels_per_sample"] == 2
+    assert exp["sites"]["final_projection_unpatched"]["latent_pixels_per_sample"] == 1
+    assert exp["sites"]["final_projection_unpatched"]["comparisons"] == exp["sites"]["velocity"]["comparisons"]
+    assert exp["sites"]["b1.projection_input"]["comparisons"]["positive"]["bands"]["sub_patch"]["frequency_bins"] == 0
+    assert exp["sites"]["clean"]["comparisons"]["positive"]["bands"]["sub_patch"]["frequency_bins"] > 0
+    assert exp["frequency_cycles_per_latent_pixel"] == [.0625, .125]
     assert exp["signed_realized_edit"]["status"] == "matched"
     assert exp["amplitude"]["status"] == "measured"
 
@@ -111,10 +117,13 @@ def test_export_frozen_match_and_shared_reference_start(model, caplog, tmp_path,
 
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
-    cfg = patched(model, evaluation=-1, states=3, sites="clean", export=True)
+    cfg = patched(model, evaluation=-1, states=3, blocks="1", amplitude_check=True, auxiliary_budget=21, export=True,
+                  sites="attention_pre,attention_post,projection_input,projection_output,after_attention,after_mlp,"
+                        "final_projection_unpatched,clean")
     draw(cfg)
     first, second, third = traces(caplog)[-1]["response"]["points"]
     assert all(p["export_status"] == "completed" for p in (first, second, third))
+    assert [p["auxiliary_dit_calls"] for p in (first, second, third)] == [6, 6, 6]
     assert [p["mechanistic"]["first_estimate_reused_for"] for p in (first, second, third)] == [[], ["C0"], ["C0"]]
     assert [p["mechanistic"]["feature_reference_calls"] for p in (first, second, third)] == [1, 1, 1]
     export_id = second["export_id"]
@@ -122,6 +131,8 @@ def test_export_frozen_match_and_shared_reference_start(model, caplog, tmp_path,
     assert manifest["native_input_fp32_sha256"] == second["native_input_fp32_sha256"]
     export_path, exported, study = load(tmp_path / "modeexplorer_response" / export_id)
     assert compare((exported, study), (exported, study))["status"] == "matched_inputs"
+    old = {**study, "schema": 1, "frequency_cycles_per_grid_cell": [.125, .25]}
+    assert compare((exported, old), (exported, study))["status"] == "incompatible_inputs"
     assert profile(study, "conditioning_interaction")["clean"]["status"] == "comparison_missing"
     components = component_pair(export_path, "complete_native_delta", export_path, "complete_native_delta")
     assert components["displacement_cosine"] == pytest.approx(1)
@@ -170,3 +181,52 @@ def test_cross_dtype_replay_matches_condition_values_and_rejects_changes(model, 
     monkeypatch.setattr(fixture, "conditions", conditions)
     draw(cfg)
     assert point(caplog)["reason"] == "frozen_condition_values_mismatch"
+
+
+def test_three_production_size_exports_keep_all_seven_tensors(tmp_path, monkeypatch):
+    import folder_paths
+    from safetensors import safe_open
+
+    from mode_explorer.response import MAX_EXPORT_BYTES, ResponseSettings
+    from mode_explorer.response_runtime import ResponseRun, _export, read_export
+
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    spec = MechanisticSettings()
+    response = ResponseRun(ResponseSettings(states=3, export=True, mechanistic=spec), lambda tensor: tensor + 1)
+    names = ("frozen_native_input", "baseline_clean", "D01_clean", "D0minus_clean",
+             "complete_native_delta", "odd_native_delta", "even_native_delta")
+    shape = (1, 16, 1, 250, 250)
+    for state in range(3):
+        tensor = torch.full(shape, state, dtype=torch.float32)
+        point = {"schema": 1, "mechanistic": {"schema": 2}, "evaluation": state}
+        _export(response, dict.fromkeys(names, tensor), point)
+        assert point["export_status"] == "completed"
+        meta, package = read_export(point["export_id"])
+        assert meta["export_budget_scope"] == "per_state"
+        assert meta["export_tensor_bytes"] == 28_000_000
+        assert meta["evaluation"] == state
+        with safe_open(package, framework="pt") as opened:
+            assert set(opened.keys()) == set(names)
+            assert opened.get_slice("even_native_delta")[0, 0, 0, 0, 0].item() == state
+            assert opened.get_slice("baseline_clean")[0, 0, 0, 0, 0].item() == state + 1
+    assert response.exports == 84_000_000 > MAX_EXPORT_BYTES
+
+    oversized = torch.zeros(1).expand(MAX_EXPORT_BYTES // 4 + 1)
+    _export(response, {"frozen_native_input": oversized}, point := {})
+    assert point["export_status"] == "export_budget"
+
+
+def test_legacy_exports_keep_sampler_budget(tmp_path, monkeypatch):
+    import folder_paths
+
+    from mode_explorer.response import ResponseSettings
+    from mode_explorer import response_runtime
+
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(response_runtime, "MAX_EXPORT_BYTES", 32)
+    response = response_runtime.ResponseRun(ResponseSettings(states=2, export=True), lambda tensor: tensor)
+    tensors = {"baseline_clean": torch.zeros(6)}
+    response_runtime._export(response, tensors, first := {})
+    response_runtime._export(response, tensors, second := {})
+    assert first["export_status"] == "completed"
+    assert second["export_status"] == "export_budget"

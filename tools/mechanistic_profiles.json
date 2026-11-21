@@ -21,9 +21,9 @@
       "checks": ["mechanistic.repeat_clean_rms", "mechanistic.signed_realized_edit", "mechanistic.sites.clean"]
     },
     "signed_full_resolution": {
-      "settings": {"experiment": "signed", "blocks": "5", "sites": "attention_pre,attention_post,projection_input,projection_output,after_attention,after_mlp,clean", "states": 3, "amplitude_check": true, "auxiliary_budget": 21, "capture_mib": 8192},
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "attention_pre,attention_post,projection_input,projection_output,after_attention,after_mlp,final_projection_unpatched,clean", "states": 3, "amplitude_check": true, "auxiliary_budget": 21, "capture_mib": 8192},
       "expected_calls_upper_bound": 21,
-      "checks": ["mechanistic.sites.b5.projection_input", "mechanistic.sites.clean", "mechanistic.amplitude"]
+      "checks": ["mechanistic.sites.b5.projection_input", "mechanistic.sites.final_projection_unpatched", "mechanistic.sites.clean", "mechanistic.amplitude", "export_status"]
     },
     "conditioning_fixed": {
       "settings": {"experiment": "joint_fixed", "blocks": "5,12", "sites": "projection_input,after_mlp,clean", "states": 1, "auxiliary_budget": 7, "capture_mib": 8192},

@@ -174,8 +174,14 @@ def read_export(export_id):
 def _export(response, tensors, point):
     if not response.config.export:
         return
-    size = sum(t.numel() * t.element_size() for t in tensors.values())
-    if size + response.exports > MAX_EXPORT_BYTES:
+    mechanistic = response.config.mechanistic is not None
+    run_limit = MAX_EXPORT_BYTES * (response.config.states if mechanistic else 1)
+    remaining = min(MAX_EXPORT_BYTES, run_limit - response.exports)
+    size = sum(t.numel() * torch.float32.itemsize for t in tensors.values())
+    if mechanistic:
+        point.update(export_budget_scope="per_state", export_tensor_bytes=size,
+                     export_tensor_limit_bytes=MAX_EXPORT_BYTES, export_run_budget_bytes=run_limit)
+    if size > remaining:
         point["export_status"] = "export_budget"
         return
     run_dir = None
@@ -192,7 +198,9 @@ def _export(response, tensors, point):
             value = response.process_latent_out(tensor) if output else tensor
             payload[name] = value.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
         size = sum(t.numel() * t.element_size() for t in payload.values())
-        if size + response.exports > MAX_EXPORT_BYTES:
+        if mechanistic:
+            point["export_tensor_bytes"] = size
+        if size > remaining:
             point["export_status"] = "export_budget"
             return
         # A private unique directory prevents accidental overwrite across renders.
@@ -435,9 +443,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 point["auxiliary_dit_rows"] = response.rows - rows_before
                 export_point = finite_json(point)
                 _export(response, tensors, export_point)
-                for key in ("export_status", "export_id"):
-                    if key in export_point:
-                        point[key] = export_point[key]
+                point.update((key, value) for key, value in export_point.items() if key.startswith("export_"))
             return result
 
         baseline_taps = {} if wants_feature and cfg.downstream else None

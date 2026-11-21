@@ -13,7 +13,18 @@ from .response import clean_candidate, flow_clean, latent_cell_bounds, rms, sele
 from .runtime import FRAME, Frame, Run, isolated_reference, shadow_forward, spatial_image, token_slice
 
 _CAPTURE = ContextVar("modeexplorer_mechanistic_capture", default=None)
-_GLOBAL = {"final_projection", "velocity", "clean"}
+_PACKED_PROJECTION = "final_projection"
+_UNPATCHED_PROJECTION = "final_projection_unpatched"
+_LATENT_GRID = {_UNPATCHED_PROJECTION, "velocity", "clean"}
+_GLOBAL = _LATENT_GRID | {_PACKED_PROJECTION}
+
+
+def _unpatch_projection(value, patch, spatial_shape):
+    """Match Krea's (channel, patch-y, patch-x) unpatching and native crop."""
+    _, h, w = value.shape
+    y, x = spatial_shape
+    return (value.reshape(-1, patch, patch, h, w).permute(0, 3, 1, 4, 2)
+            .reshape(-1, h * patch, w * patch)[:, :y, :x])
 
 
 class CaptureLimit(ValueError):
@@ -112,14 +123,14 @@ class Capture:
             if _CAPTURE.get() is self:
                 self.bounds = token_slice(kwargs["transformer_options"], args[0].shape[1], math.prod(self.grid))
 
-        def attach(module, site, pre=False):
-            if site[1] not in self.cfg.site_names:
+        def attach(module, site, pre=False, force=False):
+            if site[1] not in self.cfg.site_names and not force:
                 return
 
             def record(module, args, output=None):
                 if _CAPTURE.get() is self:
                     self.operators[str(site)] = f"{type(module).__module__}.{type(module).__qualname__}"
-                    self.store(site, args[0] if pre else output)
+                    self.store(site, args[0] if pre else output, force=force)
 
             register = module.register_forward_pre_hook if pre else module.register_forward_hook
             handles.append(register(record))
@@ -135,7 +146,7 @@ class Capture:
                     ("mlp_output", block.mlp, False), ("after_mlp", block, False),
                 ):
                     attach(module, (i, name), pre)
-            attach(dit.last.linear, (None, "final_projection"))
+            attach(dit.last.linear, (None, _PACKED_PROJECTION), force=_UNPATCHED_PROJECTION in self.cfg.site_names)
             yield
         finally:
             for handle in reversed(handles):
@@ -195,11 +206,12 @@ def _edit_compare(left, right, sign, chunk):
             "relative_mismatch": residual / max(norm, other) if max(norm, other) else None}
 
 
-def _site_metrics(fields, cfg):
+def _site_metrics(fields, cfg, sample_stride, patch):
     comparisons = {}
 
     def measure(name, base, edit):
-        comparisons[name] = paired_measurement(base, edit, cfg.chunk, cfg.low_cut, cfg.high_cut)
+        comparisons[name] = paired_measurement(base, edit, cfg.chunk, cfg.low_cut, cfg.high_cut,
+                                               sample_stride=sample_stride, patch_size=patch)
 
     d00, d01 = fields["D00"], fields["D01"]
     measure("positive", d00, d01)
@@ -240,9 +252,10 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     spec = cfg.mechanistic
     dit = executor.class_obj
     stage = point["mechanistic"] = {
-        "schema": 1, "mode": spec.mode, "checkpoint_provenance": spec.checkpoint_provenance,
+        "schema": 2, "mode": spec.mode, "checkpoint_provenance": spec.checkpoint_provenance,
         "injection_block": cfg.feature_block, "blocks": list(spec.block_ids), "requested_sites": list(spec.site_names),
-        "chunk_channels": spec.chunk, "frequency_cycles_per_grid_cell": [spec.low_cut, spec.high_cut],
+        "chunk_channels": spec.chunk, "frequency_cycles_per_latent_pixel": [spec.low_cut, spec.high_cut],
+        "patch_nyquist_per_axis": .5 / dit.patch,
         "capture_budget_bytes": spec.capture_mib * 1024**2, "cfg_scope": "isolated_positive_row",
         "trajectory": "frozen_export" if cfg.frozen_state else "live_feature" if run.feature_active else "native_or_component",
         "sites": {}, "arms": [], "component": spec.component, "band": spec.band,
@@ -324,16 +337,17 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     # Float32 is conservative for native capture on current supported kernels.
     # Reserve space for paired FFT reductions, clean fields, and two edited captures
     # per arm even if neither attention measurement was selected.
-    site_channels = sum(
-        dit.channels * dit.patch**2 if s == "final_projection" else channels
-        for _, s in keys if s not in UNAVAILABLE and s not in {"velocity", "clean"}
-    )
+    site_channels = channels * sum(s not in (_GLOBAL | UNAVAILABLE) for _, s in keys)
+    if {_PACKED_PROJECTION, _UNPATCHED_PROJECTION}.intersection(spec.site_names):
+        site_channels += dit.channels * dit.patch**2
     captured_arms = core_arms - int(can_reuse)
     edited_arms = 1 + int(spec.signed) + int(spec.conditioning)
     extra_edit_sites = 2 - (sum(s in spec.site_names for s in ("attention_pre", "attention_post"))
                             if cfg.feature_block in spec.block_ids else 0)
     fft_bytes = max(points, math.prod(latent.shape[-2:])) * (128 * spec.chunk + 128)
     output_bytes = latent.numel() * 4 * (10 + (4 * core_arms) + 4 * int(spec.amplitude_check))
+    if _UNPATCHED_PROJECTION in spec.site_names:
+        output_bytes += 4 * points * dit.channels * dit.patch**2 * captured_arms
     main_site_channels = site_channels * captured_arms + channels * extra_edit_sites * edited_arms
     site_bytes = 4 * points * max(main_site_channels, 4 * channels * int(spec.amplitude_check))
     stage["capture_preflight_bytes"] = fft_bytes + output_bytes + site_bytes
@@ -458,20 +472,27 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     for key in keys:
         block, site = key
         name = site if block is None else f"b{block}.{site}"
-        info = {"site": site, "block": block, "coordinate": "native_diffusion_latent" if site in {"velocity", "clean"}
-                else "generated_image_patch_grid"}
+        stride = 1 if site in _LATENT_GRID else dit.patch
+        coordinate = "native_diffusion_latent" if stride == 1 else "generated_image_patch_grid"
+        info = {"site": site, "block": block, "coordinate": coordinate, "latent_pixels_per_sample": stride}
         if site in UNAVAILABLE:
             info.update(status="unsupported", reason="no_exact_native_module_boundary")
         else:
             if site == "clean" or site == "velocity":
                 values = clean if site == "clean" else velocities
                 fields = {arm: spatial_image(values[arm])[0].detach().cpu() for arm in main_arms}
+            elif site == _UNPATCHED_PROJECTION:
+                fields = {}
+                for arm in main_arms:
+                    packed = captures[arm].fields.get((None, _PACKED_PROJECTION))
+                    fields[arm] = _unpatch_projection(packed, dit.patch, latent.shape[-2:]) if packed is not None else None
+                del packed
             else:
                 fields = {arm: captures[arm].fields.get(key) for arm in main_arms}
             if any(value is None for value in fields.values()):
                 info.update(status="incomplete", missing_arms=[arm for arm, value in fields.items() if value is None])
             else:
-                comparisons = _site_metrics(fields, spec)
+                comparisons = _site_metrics(fields, spec, stride, dit.patch)
                 info.update(status="completed", comparisons=comparisons)
                 if spec.signed:
                     odd_power, even_power = (comparisons[part]["displacement_l2"]**2 for part in ("odd", "even"))
@@ -484,9 +505,15 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                     info["even_energy_fraction_by_band"] = fraction
             del fields
         stage["sites"][name] = info
+        capture_key = (None, _PACKED_PROJECTION) if site in {_PACKED_PROJECTION, _UNPATCHED_PROJECTION} else key
+        if capture_key == (None, _PACKED_PROJECTION) and any(
+            requested in spec.site_names and requested not in stage["sites"]
+            for requested in (_PACKED_PROJECTION, _UNPATCHED_PROJECTION)
+        ):
+            continue
         for arm in main_arms:
-            if key in captures[arm].fields:
-                workspace.release(captures[arm].fields.pop(key))
+            if capture_key in captures[arm].fields:
+                workspace.release(captures[arm].fields.pop(capture_key))
     for arm in main_arms:
         for value in captures[arm].fields.values():
             workspace.release(value)
@@ -523,7 +550,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     candidate = None
     if spec.component != "observe":
         component = components["complete" if spec.component == "control" else spec.component]
-        component = filter_field(component, spec.band, spec.low_cut, spec.high_cut, spec.transition)
+        component = filter_field(component, spec.band, spec.low_cut, spec.high_cut, spec.transition, patch_size=dit.patch)
         bounds = latent_cell_bounds(component.shape, cfg.feature_grid, spec.cell) if spec.cell >= 0 else None
         if bounds is not None:
             y0, y1, x0, x1 = bounds
@@ -535,7 +562,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         if spec.component == "control":
             rng = torch.Generator(device="cpu").manual_seed(seed_key(probe_seed, f"mechanism-control-{cfg.trial}"))
             noise = torch.randn(component.shape, generator=rng, device="cpu").to(component)
-            noise = filter_field(noise, spec.band, spec.low_cut, spec.high_cut, spec.transition)
+            noise = filter_field(noise, spec.band, spec.low_cut, spec.high_cut, spec.transition, patch_size=dit.patch)
             if bounds is not None:
                 noise = localize(noise)
             component = noise * (rms(component) / max(1e-12, rms(noise)))

@@ -55,3 +55,31 @@ def test_signed_and_factorial_exact_quadratic_and_linear_responses():
     assert paired_measurement(c0, c1)["displacement_l2"] == 0
     c0, c1 = conditioning_terms(base, base + linear, plus, plus + linear + quadratic)
     assert paired_measurement(c0, c1)["displacement_l2"] == pytest.approx(.25 * math.sqrt(base.numel()))
+
+
+def test_patch_and_latent_measure_same_bands_and_resolve_diagonal_support():
+    # 32 latent pixels or 16 patches per axis. The scene's diagonal
+    # 6/32-frequency modes are above 1/4 radially and inside the common square.
+    t = torch.arange(32, dtype=torch.float64)
+    y, x = torch.meshgrid(t, t, indexing="ij")
+    shared = (torch.cos(2 * torch.pi * 2 * x / 32) +
+              torch.cos(2 * torch.pi * 3 * x / 32) +
+              torch.cos(2 * torch.pi * 6 * (x + y) / 32))[None].float()
+    sub_patch = torch.cos(2 * torch.pi * 10 * x / 32)[None].float()
+    pixel = paired_measurement(shared, shared + sub_patch, low=.0625, high=.125, patch_size=2)
+    samples = shared[:, ::2, ::2]
+    patch = paired_measurement(samples, samples, low=.0625, high=.125, sample_stride=2, patch_size=2)
+    for band in ("low", "mid", "high"):
+        assert pixel["bands"][band]["baseline_fraction"] == pytest.approx(1 / 3)
+        assert patch["bands"][band]["baseline_fraction"] == pytest.approx(1 / 3)
+    assert pixel["bands"]["sub_patch"]["displacement_fraction"] == pytest.approx(1)
+    assert patch["bands"]["sub_patch"]["frequency_bins"] == 0
+    assert sum(b["frequency_bins"] for b in pixel["bands"].values()) == 32**2
+    assert sum(b["frequency_bins"] for b in patch["bands"].values()) == 16**2
+    torch.testing.assert_close(
+        filter_field(shared + sub_patch, "sub_patch", .0625, .125, patch_size=2), sub_patch, atol=1e-6, rtol=1e-5,
+    )
+    for transition in (0., .05):
+        recovered = sum(filter_field(shared + sub_patch, band, .0625, .125, transition, patch_size=2)
+                        for band in ("low", "mid", "high", "sub_patch"))
+        torch.testing.assert_close(recovered, shared + sub_patch, atol=1e-6, rtol=1e-5)
