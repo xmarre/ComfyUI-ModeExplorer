@@ -452,6 +452,8 @@ def test_projection_guidance_native_calls_cfg_batch_and_rng(model, caplog, split
     from mode_explorer.nodes import ModeExplorerProjectionGuidance
 
     node = ModeExplorerProjectionGuidance()
+    amp_widget = node.INPUT_TYPES()["required"]["amplitude"][1]
+    assert amp_widget["default"] == .000303 and amp_widget["round"] is False
     assert node.apply(model)[0] is model
     assert node.apply(model, enabled=True, amplitude=0)[0] is model
     guided, = node.apply(model, enabled=True, block=2, scope="standalone", amplitude=.009)

@@ -330,7 +330,10 @@ class ModeExplorerProjectionGuidance:
         from .projection_guidance import Guidance, MODES, SCHEDULES, SCOPES, UNITS
 
         def number(kind, name, minimum, maximum, step=1):
-            return (kind, {"default": getattr(Guidance, name), "min": minimum, "max": maximum, "step": step})
+            options = {"default": getattr(Guidance, name), "min": minimum, "max": maximum, "step": step}
+            if kind == "FLOAT":
+                options["round"] = False
+            return (kind, options)
 
         return {"required": {
             "model": ("MODEL",),
@@ -346,7 +349,8 @@ class ModeExplorerProjectionGuidance:
             "scope": (list(SCOPES), {"default": Guidance.scope}),
             "trial": number("INT", "trial", 0, 2**31 - 1),
             "max_absolute_rms": number("FLOAT", "max_absolute_rms", .000001, 1., .000001),
-            "max_relative_rms": ("FLOAT", {"default": 0., "min": 0., "max": 1., "step": .000001, "tooltip": "Optional additional limit relative to native projection RMS. 0 disables this limit."}),
+            "max_relative_rms": ("FLOAT", {"default": 0., "min": 0., "max": 1., "step": .000001, "round": False,
+                                           "tooltip": "Optional additional limit relative to native projection RMS. 0 disables this limit."}),
             "export_clean": ("BOOLEAN", {"default": False, "tooltip": "Save clean predictions at selected evaluations for matched diagnostic comparisons. Adds device-to-host work."}),
         }}
 

@@ -95,6 +95,9 @@ def _noise(row, generator, weights, mode):
 def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
     """Return a validated replacement or None, leaving native storage untouched."""
     lo, hi = bounds
+    if output.device.type not in ("cpu", "cuda"):
+        info.update(status="skipped", reason="unsupported_projection_device")
+        return None
     if output.layout != torch.strided or output.ndim != 3 or output.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         info.update(status="skipped", reason="unsupported_projection_output")
         return None

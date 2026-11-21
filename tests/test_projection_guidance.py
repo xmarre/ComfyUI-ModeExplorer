@@ -84,6 +84,12 @@ def test_explicit_schedule():
     assert sigma_only.strength(0, .79) == 0
 
 
+def test_unknown_tensor_device_has_a_local_skip_reason():
+    source = torch.zeros(2, 12, 8, device="meta")
+    result, info = apply(source)
+    assert result is None and info["reason"] == "unsupported_projection_device"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_production_projection_geometry_uses_bounded_cuda_workspace():
     tokens = 154 * 102
