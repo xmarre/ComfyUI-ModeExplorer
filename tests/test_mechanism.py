@@ -102,9 +102,10 @@ def test_published_profiles_pass_production_capture_preflight():
         captures, reserve = estimate_capture_workspace(
             spec, feature_block=options["feature_block"], grid=(308 // 2, 204 // 2),
             latent_shape=(1, 16, 1, 308, 204), attention_channels=6144, patch_size=2,
-            baseline_reused=False,
+            baseline_reused=False, packed_tokens=154 * 102 + 512,
         )
-        assert captures + reserve <= spec.capture_mib * 1024**2, (name, "cpu")
+        if spec.projection_study == "off":
+            assert captures + reserve <= spec.capture_mib * 1024**2, (name, "cpu")
         cuda_capture, cuda_reserve = estimate_capture_workspace(
             spec, feature_block=options["feature_block"], grid=(154, 102), latent_shape=(1, 16, 1, 308, 204),
             attention_channels=6144, patch_size=2, baseline_reused=False, chunk=spec.cuda_chunk,

@@ -1,0 +1,38 @@
+{
+  "last_node_id": 15,
+  "last_link_id": 15,
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.66,
+      "offset": [
+        10,
+        20
+      ]
+    }
+  },
+  "version": 0.4,
+  "nodes": [
+    {"id": 1, "type": "UNETLoader", "pos": [30, 30], "size": [290, 100], "flags": {}, "order": 0, "mode": 0, "inputs": [], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [3], "slot_index": 0}], "properties": {"Node name for S&R": "UNETLoader"}, "widgets_values": ["krea2_int8_convrot.safetensors", "default"]},
+    {"id": 2, "type": "CLIPLoader", "pos": [30, 200], "size": [290, 100], "flags": {}, "order": 1, "mode": 0, "inputs": [], "outputs": [{"name": "CLIP", "type": "CLIP", "links": [1], "slot_index": 0}], "properties": {"Node name for S&R": "CLIPLoader"}, "widgets_values": ["qwen3vl_4b_fp8_scaled.safetensors", "krea2", "default"]},
+    {"id": 4, "type": "CLIPTextEncode", "pos": [370, 210], "size": [325, 135], "flags": {}, "order": 3, "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 1}], "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [2, 5], "slot_index": 0}], "properties": {"Node name for S&R": "CLIPTextEncode"}, "widgets_values": ["A documentary photograph of someone waiting for a ferry on a misty morning."]},
+    {"id": 5, "type": "ConditioningZeroOut", "pos": [370, 400], "size": [290, 100], "flags": {}, "order": 4, "mode": 0, "inputs": [{"name": "conditioning", "type": "CONDITIONING", "link": 2}], "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [6], "slot_index": 0}], "properties": {"Node name for S&R": "ConditioningZeroOut"}},
+    {"id": 6, "type": "EmptyLatentImage", "pos": [30, 535], "size": [290, 100], "flags": {}, "order": 5, "mode": 0, "inputs": [], "outputs": [{"name": "LATENT", "type": "LATENT", "links": [7], "slot_index": 0}], "properties": {"Node name for S&R": "EmptyLatentImage"}, "widgets_values": [2048, 3104, 1]},
+    {"id": 8, "type": "Krea2TurboFlowAlignedRegenerate", "pos": [2000, 40], "size": [385, 850], "flags": {}, "order": 8, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 11}, {"name": "positive", "type": "CONDITIONING", "link": 5}, {"name": "negative", "type": "CONDITIONING", "link": 6}, {"name": "latent_image", "type": "LATENT", "link": 7}, {"name": "spectral_calibration", "type": "SLRD_SPECTRUM", "link": null}], "outputs": [{"name": "output", "type": "LATENT", "links": [], "slot_index": 0}, {"name": "lowres_planner", "type": "LATENT", "links": [12], "slot_index": 1}, {"name": "denoised_output", "type": "LATENT", "links": [], "slot_index": 2}], "properties": {"Node name for S&R": "Krea2TurboFlowAlignedRegenerate"}, "widgets_values": [423766116834948, "fixed", 4, 0, 0, 13, 0.7, 3, "", 1, "er_sde", "simple", "ER-SDE", 1, 1, 1, 0, 0.2, 0.35, 0.5, 1, 4, false, true, true, "planner_final_upscale_only", 0.5, "off", 0, 0, "interpolate", "", 0.01, "auto_two_passes", 0.15, "final_latent"], "title": "Scale-Locked · Planner only"},
+    {"id": 11, "type": "SpectrumApplyKrea2", "pos": [1580, 210], "size": [330, 490], "flags": {}, "order": 7, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 15}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [11], "slot_index": 0}], "properties": {"Node name for S&R": "SpectrumApplyKrea2"}, "widgets_values": [false, "turbo", 1, 0.01, 2, 1, 1, 0.0, 8, "vram", 4096, true, false, true, 0.5, "off", "all"], "title": "Spectrum · Disabled for matched actual evaluations"},
+    {"id": 14, "type": "ModeExplorerMechanisticKrea2", "pos": [735, 20], "size": [410, 1140], "flags": {}, "order": 6, "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 3}, {"name": "scorer", "type": "MODEEXPLORER_LOCAL_SCORER", "link": null}, {"name": "alternate", "type": "CONDITIONING", "link": null}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [15], "slot_index": 0}], "properties": {"Node name for S&R": "ModeExplorerMechanisticKrea2"}, "widgets_values": [true, "signed", "5", "", "observe", "all", "export_only", 0, 1, 0.82, 1.0, 4, 768, 2048, 0.06, 0.5, 0.0, 5, "4", 0.025, 1, true, "", "", false, false, -1.0, -1.0, 8, -1, 0.0625, 0.125, 0.0, 0.1, false, false, false, false, "", 0, "cuda", 12288, 32, "observe", "even", 0.05, 128, false, false], "title": "Projection Smoke"},
+    {"id": 15, "type": "SaveLatent", "pos": [1810, 35], "size": [300, 110], "flags": {}, "order": 14, "mode": 0, "inputs": [{"name": "samples", "type": "LATENT", "link": 12}], "outputs": [], "properties": {"Node name for S&R": "SaveLatent"}, "widgets_values": ["modeexplorer/projection_smoke"]}
+  ],
+  "links": [
+    [1, 2, 0, 4, 0, "CLIP"],
+    [2, 4, 0, 5, 0, "CONDITIONING"],
+    [3, 1, 0, 14, 0, "MODEL"],
+    [5, 4, 0, 8, 1, "CONDITIONING"],
+    [6, 5, 0, 8, 2, "CONDITIONING"],
+    [7, 6, 0, 8, 3, "LATENT"],
+    [11, 11, 0, 8, 0, "MODEL"],
+    [12, 8, 1, 15, 0, "LATENT"],
+    [15, 14, 0, 11, 0, "MODEL"]
+  ]
+}

@@ -282,7 +282,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     from importlib.util import find_spec
 
     installed = {
-        "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors"],
+        "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors", "krea2_int8_convrot.safetensors"],
         "text_encoders": ["qwen3vl_4b_fp8_scaled.safetensors"],
         "vae": ["qwen_image_vae.safetensors"],
     }
@@ -299,7 +299,9 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     for path in sorted((root / "examples").glob("*.json")):
         if path.name in ("spectrum_ab.json", "response_spectrum.json") and not spectrum_available:
             continue
-        if path.name in ("scale_locked_spectrum.json", "response_scale_locked.json") and not (scale_locked and spectrum_available):
+        if (path.name.startswith("projection_") or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json")) and not (
+            scale_locked and spectrum_available
+        ):
             continue
         graph = json.loads(path.read_text())
         node_map = {node["id"]: node for node in graph["nodes"]}
@@ -326,6 +328,16 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
             assert port["link"] == ident and ident in output["links"]
             assert value == output["type"] == port["type"]
             api[str(dst)]["inputs"][port["name"]] = [str(src), source_slot]
+        if path.name.startswith("projection_"):
+            planner, = [item["inputs"] for item in api.values()
+                        if item["class_type"] == "Krea2TurboFlowAlignedRegenerate"]
+            research, = [item["inputs"] for item in api.values()
+                         if item["class_type"] == "ModeExplorerMechanisticKrea2"]
+            assert "VAEDecode" not in {item["class_type"] for item in api.values()}
+            assert planner["regeneration_mode"] == "planner_final_upscale_only" and planner["handoff_diagnostics"] == "off"
+            assert research["analysis_device"] == "cuda" and research["projection_study"] == "observe"
+            if path.name == "projection_conditioning.json":
+                assert research["alternate"] != planner["positive"]
         valid, error, *_ = asyncio.run(execution.validate_prompt(path.name, api, None))
         assert valid, (path.name, error)
 

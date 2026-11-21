@@ -44,6 +44,7 @@ class MechanisticSettings:
     projection_replay_fraction: float = .05
     projection_token_chunk: int = 128
     projection_cast_check: bool = False
+    projection_symmetric_check: bool = False
 
     @cached_property
     def block_ids(self):
@@ -104,6 +105,8 @@ class MechanisticSettings:
             raise ValueError("The odd and even components require a signed experiment.")
         if self.component == "interaction" and not self.conditioning:
             raise ValueError("The interaction component requires alternate conditioning.")
+        if self.projection_symmetric_check and (not self.signed or self.projection_study == "off"):
+            raise ValueError("The projection symmetry check requires a signed projection study.")
         if self.amplitude_check and not self.signed:
             raise ValueError("The amplitude check requires opposite-signed arms.")
 

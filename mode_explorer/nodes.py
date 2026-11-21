@@ -288,6 +288,7 @@ class ModeExplorerMechanistic:
             "projection_replay_fraction": number("FLOAT", "projection_replay_fraction", 0., .1, step=.005),
             "projection_token_chunk": number("INT", "projection_token_chunk", 16, 512, step=16),
             "projection_cast_check": ("BOOLEAN", {"default": False, "tooltip": "Separately measure one output cast of the reconstructed affine map."}),
+            "projection_symmetric_check": ("BOOLEAN", {"default": False, "tooltip": "Run two packed projection calls with exactly opposing representable image-token deltas."}),
         }}
 
     def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,

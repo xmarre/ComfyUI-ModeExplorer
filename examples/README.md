@@ -24,6 +24,9 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 | [External quality gate](response_quality_gate.json) | Connect a local validated scorer to enable quality acceptance. An empty scorer input keeps the native path. |
 | [Response with Spectrum](response_spectrum.json) | Diagnose otherwise actual evaluations on the Full arm while retaining the paired Guarded arm. Both use the compatibility overlay. |
 | [Mechanistic signed smoke](mechanistic_signed.json) | Observational signed response on native velocity and clean latents with aligned frequency bands and exports. |
+| [Projection smoke](projection_smoke.json) | One early frozen-state packed projection replay on the planner. |
+| [Projection signed](projection_signed.json) | Three early states with signed, half-amplitude, output-cast and representable-symmetry measurements. |
+| [Projection conditioning](projection_conditioning.json) | Four-arm fixed intervention with a connected alternate positive and matched packed projection replay. |
 | [Response with Scale-Locked](response_scale_locked.json) | Planner-only response probes with separate planner and final outputs on the native refinement graph. |
 
 Use a shared upstream weight LoRA for identity comparisons. For Raw, load Raw weights, encode a true negative prompt, and use the Raw Spectrum preset when Spectrum is installed. Begin inside the model's supported resolution range.

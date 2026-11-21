@@ -1,6 +1,7 @@
 """Qualified packed projection replay and local numerical decomposition."""
 
 from dataclasses import dataclass
+from importlib.metadata import version
 import math
 
 import torch
@@ -12,6 +13,10 @@ from .mechanism import measure_comparisons
 
 class ProjectionUnavailable(ValueError):
     pass
+
+
+def bitwise_equal(left, right):
+    return torch.equal(left.view(torch.uint8), right.view(torch.uint8))
 
 
 def geometry(tensor):
@@ -69,6 +74,7 @@ class EffectiveProjection:
             "observed_call": "torch.nn.functional.linear", "linear_input_dtype": str(source.dtype),
             "effective_weight_dtype": str(weight.dtype), "bias_dtype": str(bias.dtype) if bias is not None else None,
             "backend": "unobserved", "accumulation_dtype": "unobserved", "activation_codes": "unobserved",
+            "activation_scales": "unobserved",
         }
         if isinstance(weight, QuantizedTensor):
             if weight._layout_cls != "TensorWiseINT8Layout" or not isinstance(weight.params, TensorWiseINT8Layout.Params):
@@ -87,7 +93,8 @@ class EffectiveProjection:
                 if data.shape[-1] % size or size not in (4, 16, 64, 256, 1024):
                     raise ProjectionUnavailable("unsupported_convrot_group_size")
                 self.rotation = _build_hadamard(size, analysis_device, torch.float64)
-            self.contract.update(weight_representation="stored_int8_codes", weight_scale_count=scale.numel(),
+            self.contract.update(weight_representation="stored_int8_codes", storage_dtype=str(data.dtype),
+                                 comfy_kitchen_version=version("comfy-kitchen"), weight_scale_count=scale.numel(),
                                  weight_scale_dtype=str(scale.dtype), convrot_group=size,
                                  input_quantization="dynamic_per_flattened_row_in_audited_kitchen_int8_path",
                                  affine_reference="stored_int8_with_ideal_rotation_and_weight_scales")
@@ -171,7 +178,7 @@ def _response_sizes(captures, terms, chunk):
     return math.sqrt(float(norm))
 
 
-def _component_fields(terms, captures, reference, token_chunk, cast_check):
+def _component_fields(terms, captures, reference, token_chunk, cast_check, interrupt):
     device = reference.weight.device
     first = captures[terms[0][1]]
     in_dim, out_dim = first.inputs.shape[-1], first.output.shape[-1]
@@ -184,6 +191,7 @@ def _component_fields(terms, captures, reference, token_chunk, cast_check):
     floor = torch.zeros((), dtype=torch.float64, device=device)
 
     for t in range(0, count, token_chunk):
+        interrupt()
         span = slice(t, min(t + token_chunk, count))
 
         def gather(name, field):
@@ -215,7 +223,7 @@ def _component_fields(terms, captures, reference, token_chunk, cast_check):
 
 def _replay_error(result, cap, grid, spec, patch, chunk):
     lo, hi = cap.bounds
-    if torch.equal(result, cap.output):
+    if bitwise_equal(result, cap.output):
         return {"packed_bit_exact": True, "packed_l2": 0., "packed_rms": 0.,
                 "displacement_l2": 0., "displacement_rms": 0., "relative_output_error": 0.}
     # The fixup case is rare. Keep one error field, and only for image tokens.
@@ -227,6 +235,54 @@ def _replay_error(result, cap, grid, spec, patch, chunk):
     metrics.update(packed_bit_exact=False, packed_l2=packed_l2, packed_rms=packed_l2 / math.sqrt(result.numel()),
                    relative_output_error=packed_l2 / native_l2 if native_l2 else None)
     return metrics
+
+
+def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt):
+    base, positive, negative = (captures[key] for key in ("D00", "D01", "D0minus"))
+    lo, hi = base.bounds
+    device = base.inputs.device
+    x = base.inputs.clone(memory_format=torch.preserve_format)
+    sums = torch.zeros(2, dtype=torch.float64, device=device)
+    kept = torch.zeros((), dtype=torch.int64, device=device)
+    with timing.measure("projection_reference", device):
+        for start in range(lo, hi, spec.projection_token_chunk):
+            interrupt()
+            stop = min(start + spec.projection_token_chunk, hi)
+            x0 = base.inputs[:, start:stop].double()
+            p = positive.inputs[:, start:stop].double()
+            m = negative.inputs[:, start:stop].double()
+            target = (p - m) * .5
+            plus = (x0 + target).to(x.dtype)
+            minus = (2 * x0 - plus.double()).to(x.dtype)
+            exact = (plus.double() + minus.double() == 2 * x0) & plus.isfinite() & minus.isfinite()
+            edit = torch.where(exact, plus.double() - x0, 0.)
+            kept.add_(edit.count_nonzero())
+            sums.add_(torch.stack((target.square().sum(), edit.square().sum())))
+            x[:, start:stop] = x0 + edit
+
+    total, realized = sums.sqrt().tolist()
+    info = report["symmetric_check"] = {"status": "unqualified", "input_l2": realized,
+                                       "target_input_l2": total, "realized_to_target_l2": realized / total if total else None,
+                                       "nonzero_values": int(kept), "exactly_antisymmetric": True}
+    if realized == 0:
+        info["reason"] = "no_representable_symmetric_values"
+        return
+    result = evaluate(x, base)
+    plus = result[0, lo:hi].clone()
+    del result
+    with timing.measure("projection_reference", device):
+        for start in range(lo, hi, spec.projection_token_chunk):
+            stop = min(start + spec.projection_token_chunk, hi)
+            x[:, start:stop] = 2 * base.inputs[:, start:stop].double() - x[:, start:stop].double()
+    minus = evaluate(x, base)[0, lo:hi]
+    with timing.measure("projection_spectral", device):
+        y0 = base.output[0, lo:hi].float()
+        pos, neg = plus.float() - y0, minus.float() - y0
+        basis = {"plus": ((1., _chw(pos, grid)),), "minus": ((1., _chw(neg, grid)),)}
+        metrics = measure_comparisons(basis, {"odd": ((), ((.5, "plus"), (-.5, "minus"))),
+                                             "even": ((), ((.5, "plus"), (.5, "minus")))},
+                                      chunk, spec.low_cut, spec.high_cut, sample_stride=patch, patch_size=patch)
+    info.update(status="measured", output=metrics)
 
 
 def study_projection(module, captures, grid, spec, patch, chunk, report, timing, seed):
@@ -247,7 +303,11 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
         raise ProjectionUnavailable("packed_projection_capture_incomplete")
     # Additional module hooks may change values or state outside the weight
     # contract. The temporary ModeExplorer hooks have already been removed.
-    if module.training or module._forward_hooks or module._forward_pre_hooks:
+    from torch.nn.modules import module as hooks
+    from comfy.model_management import throw_exception_if_processing_interrupted as interrupt
+
+    if (module.training or module._forward_hooks or module._forward_pre_hooks
+            or hooks._global_forward_hooks or hooks._global_forward_pre_hooks):
         raise ProjectionUnavailable("projection_training_or_external_module_hooks")
     first = captures["D00"]
     device = first.inputs.device
@@ -261,13 +321,14 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
     replay = report["native_replay"] = {}
     reference_errors = set()
 
-    for name, cap in captures.items():
-        if geometry(cap.inputs) != cap.input_geometry:
+    def evaluate(inputs, cap):
+        interrupt()
+        if geometry(inputs) != cap.input_geometry or inputs.stride(-1) != 1 or cap.output.stride(-1) != 1:
             raise ProjectionUnavailable("packed_input_snapshot_geometry_mismatch")
 
         def accept(source, weight, bias):
             nonlocal reference
-            if report["input_presmoothing"] or source is not cap.inputs:
+            if report["input_presmoothing"] or source is not inputs:
                 raise ProjectionUnavailable("linear_operand_input_transformed_or_unverified")
             if reference is None:
                 reference = EffectiveProjection(source, weight, bias, device)
@@ -278,14 +339,18 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
             observer = LinearOperand(accept)
             report["local_projection_calls"] += 1
             with observer:
-                result = module(cap.inputs)
+                result = module(inputs)
             if not torch.is_tensor(result) or geometry(result) != cap.output_geometry:
                 raise ProjectionUnavailable("native_projection_replay_geometry_mismatch")
             if observer.error is not None or observer.calls != 1 or observer.output is not result:
                 reference_errors.add(observer.error or "single_direct_linear_call_not_observed")
+            return result
+
+    for name, cap in captures.items():
+        result = evaluate(cap.inputs, cap)
         with timing.measure("projection_spectral", device):
             replay[name] = _replay_error(result, cap, grid, spec, patch, chunk)
-        del result, observer
+        del result
     floors = {}
     with timing.measure("projection_reference", device):
         for name, terms in components.items():
@@ -308,12 +373,19 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
         raise ProjectionUnavailable(",".join(sorted(reference_errors)) or "effective_operands_not_constant")
     # Replay evidence is stronger than the observed Python module or registry name.
     report["effective_operator"] = reference.contract
+    report["owned_effective_weight_bytes"] = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (reference.weight, reference.storage, reference.scale, reference.bias, reference.rotation)
+        if tensor is not None
+    )
+    report["reference_dtype"] = "torch.float64"
+    report["reference_equivalence"] = "same_observed_operands_across_packed_native_replays"
     report["components"] = {}
     chosen = None
     for name, terms in components.items():
         with timing.measure("projection_reference", device):
             i, linear, residual, native, cast, arithmetic = _component_fields(
-                terms, captures, reference, spec.projection_token_chunk, spec.projection_cast_check,
+                terms, captures, reference, spec.projection_token_chunk, spec.projection_cast_check, interrupt,
             )
         report["reference_matmul_passes"] += 3 + len(terms) * int(spec.projection_cast_check)
         with timing.measure("projection_spectral", device):
@@ -361,5 +433,10 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
             ratios[kind] = {field: half[field]["displacement_l2"] / full[field]["displacement_l2"]
                             if full[field]["displacement_l2"] else None
                             for field in ("input", "linear", "executed", "residual")}
+    if spec.projection_symmetric_check:
+        _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt)
+        if reference_errors or not bool(reference.equal):
+            report["symmetric_check"].update(status="unqualified", reason="effective_operands_not_constant")
+            report["symmetric_check"].pop("output", None)
     report["status"] = "qualified"
     return chosen

@@ -295,7 +295,7 @@ def test_packed_projection_replay_and_downstream_isolation(model, caplog):
     assert study["effective_operator"]["weight_representation"] == "effective_dense_cast_operand"
     assert "half_even" in study["components"]
     assert study["components"]["even"]["linear"]["displacement_l2"] > 0
-    assert study["components"]["even"]["output_cast_only"]["displacement_l2"] >= 0
+    assert "output_cast_only" in study["components"]["even"]
     experiment = patched(model, sites="", projection_study="executed", projection_effect="even",
                          component="complete", auxiliary_budget=6)
     assert torch.equal(native, draw(experiment, reference=True))
@@ -322,3 +322,22 @@ def test_projection_factorial_keeps_distinct_packed_text_geometry(model, caplog)
     metrics = study["components"]["conditioning_interaction"]
     assert metrics["executed"]["displacement_l2"] > 0
     assert metrics["residual"]["displacement_l2"] < metrics["linear"]["displacement_l2"]
+
+
+
+def test_projection_diagnostic_oom_keeps_native_prediction(model, caplog, monkeypatch):
+    import mode_explorer.mechanism_runtime as runtime
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    native = draw(model)
+    candidate = patched(model, sites="", component="complete", treatment="minimum_change",
+                        projection_study="linear", auxiliary_budget=6)
+
+    def fail(*args, **kwargs):
+        raise torch.OutOfMemoryError("effective weight allocation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "study_projection", fail)
+        assert torch.equal(native, draw(candidate))
+    assert point(caplog)["reason"] == "mechanistic_out_of_memory"
+    assert not point(caplog).get("applied", False)

@@ -74,6 +74,8 @@ python tools/analyze_mechanism.py PATH_TO_EXPORT --comparison conditioning_inter
 python tools/analyze_mechanism.py FIRST_EXPORT SECOND_EXPORT --comparison even --components even_native_delta even_native_delta
 ```
 
+See [projection-level numerical isolation](projection.md) for packed output-projection replay, the affine reference and projection-component interventions.
+
 ## GPU sequence on the production planner
 
 Use the [standalone workflow](../examples/mechanistic_signed.json) for a smoke run. Use the [profile settings](../tools/mechanistic_profiles.json) with the original production seed, sampler, scheduler, sigmas, geometry, checkpoint and attention stack. On the pinned Scale-Locked branch use `regeneration_mode=planner_final_upscale_only`, `handoff_diagnostics=off` and decode `lowres_planner`. This dispatches the same planner, then only latent enlargement, with zero target DiT evaluations. Choose the cheap interpolation option if the enlarged target is unused. Preserve the planner's original native-only Spectrum policy. Confirm the Scale-Locked log reports `target denoiser evaluations=0` and the ModeExplorer trace reports planner stage with zero forecasts. Do not use a capture of the enlarged latent as the original planner state.

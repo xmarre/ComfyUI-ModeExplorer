@@ -9,7 +9,7 @@ from time import perf_counter
 import torch
 
 from .mechanism import UNAVAILABLE, filter_field, measure_comparisons
-from .projection import ProjectionCapture, ProjectionUnavailable, geometry as projection_geometry, study_projection
+from .projection import ProjectionCapture, ProjectionUnavailable, bitwise_equal, geometry as projection_geometry, study_projection
 from .objectives import cell_size, feature_shift, seed_key, token_pool
 from .response import clean_candidate, flow_clean, latent_cell_bounds, rms, select_response, velocity_for_clean
 from .runtime import FRAME, Frame, Run, isolated_reference, shadow_forward, spatial_image, token_slice
@@ -110,6 +110,7 @@ class Capture:
         self.want_projection = projection
         self.projection = None
         self.projection_override = projection_override
+        self.projection_realized_energy = None
         self.wants_edit = references is not None or proposal is not None or fixed is not None
 
     def store(self, site, tensor, force=False):
@@ -217,7 +218,7 @@ class Capture:
                     x, = args
                     if self.projection_override is not None:
                         original, _ = self.projection_override
-                        if self.bounds != original.bounds or projection_geometry(x) != original.input_geometry or not torch.equal(x, original.inputs):
+                        if self.bounds != original.bounds or projection_geometry(x) != original.input_geometry or not bitwise_equal(x, original.inputs):
                             raise ProjectionUnavailable("downstream_packed_projection_input_mismatch")
                     else:
                         if self.projection is not None:
@@ -231,13 +232,17 @@ class Capture:
                         return
                     if self.projection_override is not None:
                         original, delta = self.projection_override
-                        if projection_geometry(output) != original.output_geometry or not torch.equal(output, original.output):
+                        if projection_geometry(output) != original.output_geometry or not bitwise_equal(output, original.output):
                             raise ProjectionUnavailable("downstream_packed_projection_baseline_mismatch")
                         lo, hi = self.bounds
                         result = output.clone()
+                        energy = torch.zeros((), dtype=torch.float64, device=output.device)
                         for first in range(lo, hi, self.cfg.projection_token_chunk):
                             stop = min(first + self.cfg.projection_token_chunk, hi)
-                            result[0, first:stop] = output[0, first:stop].float() + delta[first-lo:stop-lo]
+                            before = output[0, first:stop].float()
+                            result[0, first:stop] = before + delta[first-lo:stop-lo]
+                            energy.add_((result[0, first:stop].float() - before).square().sum())
+                        self.projection_realized_energy = energy
                         return result
                     self.projection.output = self.workspace.stage(output, preserve_layout=True)
                     self.projection.output_geometry = projection_geometry(output)
@@ -383,6 +388,8 @@ def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, atten
         output_bytes += (12 * attention_channels**2 + (1024**2) * 8
                          + (16 * packed_tokens + (28 + 4 * replay_arms) * points) * attention_channels
                          + 128 * spec.projection_token_chunk * attention_channels)
+        if spec.projection_symmetric_check:
+            output_bytes += (8 * packed_tokens + 20 * points) * attention_channels
     return capture_bytes, fft_bytes + output_bytes
 
 
@@ -713,6 +720,10 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                 raise ProjectionUnavailable("packed_projection_capture_incomplete")
             if any(snapshot.inputs.shape[1] > packed_tokens for snapshot in snapshots.values()):
                 raise ProjectionUnavailable("packed_projection_exceeds_token_estimate")
+            projection_report["retained_packed_bytes"] = sum(
+                tensor.numel() * tensor.element_size()
+                for snapshot in snapshots.values() for tensor in (snapshot.inputs, snapshot.output) if tensor is not None
+            )
             delta = study_projection(dit.blocks[cfg.feature_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
                                      chunk, projection_report, timing,
                                      seed_key(probe_seed, f"projection-control-{cfg.trial}"))
@@ -731,6 +742,12 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                 patched = Capture(spec, frame.grid, workspace, cfg.feature_block,
                                   projection_override=(original, delta))
                 predict("projection_component", capture=patched)
+                if patched.projection_realized_energy is None:
+                    raise ProjectionUnavailable("downstream_projection_hook_not_observed")
+                projection_report["downstream_requested_projection_l2"] = float(torch.linalg.vector_norm(delta))
+                projection_report["downstream_realized_projection_l2"] = float(patched.projection_realized_energy.sqrt())
+                if not math.isfinite(projection_report["downstream_realized_projection_l2"]):
+                    raise ProjectionUnavailable("downstream_projection_displacement_nonfinite")
                 downstream_clean = clean["projection_component"]
                 projection_report["downstream_clean_rms"] = rms(downstream_clean - clean["D00"])
                 projection_report["downstream_output"] = "generated_token_displacement_on_native_baseline"
@@ -747,6 +764,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                         workspace.release(snapshot.output)
                     capture_state.projection = None
             snapshots.clear()
+            snapshot = None
 
     stage["captured_bytes"] = workspace.peak
     stage["capture_transfer_bytes"] = workspace.transfer_bytes
