@@ -50,7 +50,22 @@ def compare(left, right):
     for name in ("mode", "injection_block", "conditioning", "frequency_cycles_per_grid_cell", "amplitude_check"):
         pairs[name] = (study0.get(name), study1.get(name))
     mismatches = [name for name, (a, b) in pairs.items() if a != b]
+    sites0, sites1 = study0["sites"], study1["sites"]
+    geometry = {}
+    for key in sorted(sites0.keys() | sites1.keys()):
+        if key not in sites0 or key not in sites1:
+            geometry[key] = "site_missing"
+            continue
+        a, b = sites0[key], sites1[key]
+        if a["status"] != "completed" or b["status"] != "completed":
+            geometry[key] = "measurement_unavailable"
+            continue
+        shape0 = a["comparisons"]["positive"]["shape_chw"]
+        shape1 = b["comparisons"]["positive"]["shape_chw"]
+        if shape0 != shape1 or a["coordinate"] != b["coordinate"]:
+            geometry[key] = "site_geometry_mismatch"
     return {"status": "matched_inputs" if not mismatches else "incompatible_inputs", "mismatched": mismatches,
+            "site_differences": geometry,
             "execution": [study.get("kernel_contract") for study in (study0, study1)],
             "checkpoint_provenance": [study.get("checkpoint_provenance") for study in (study0, study1)]}
 

@@ -9,6 +9,7 @@ from test_comfy_integration import conditions, draw, model, traces
 from mode_explorer.mechanism_runtime import Capture, Workspace
 from mode_explorer.nodes import ModeExplorerMechanistic
 from mode_explorer.mechanism import MechanisticSettings
+from tools.analyze_mechanism import compare, component_pair, load, profile
 
 
 def point(caplog):
@@ -119,6 +120,12 @@ def test_export_frozen_match_and_shared_reference_start(model, caplog, tmp_path,
     export_id = second["export_id"]
     manifest = loads((tmp_path / "modeexplorer_response" / export_id / "manifest.json").read_text())
     assert manifest["native_input_fp32_sha256"] == second["native_input_fp32_sha256"]
+    export_path, exported, study = load(tmp_path / "modeexplorer_response" / export_id)
+    assert compare((exported, study), (exported, study))["status"] == "matched_inputs"
+    assert profile(study, "conditioning_interaction")["clean"]["status"] == "comparison_missing"
+    components = component_pair(export_path, "complete_native_delta", export_path, "complete_native_delta")
+    assert components["displacement_cosine"] == pytest.approx(1)
+    assert components["spatial_energy_overlap"] == pytest.approx(1)
     decoded, sigmas = ModeExplorerLoadResponse().load(export_id, "D01_clean")
     assert decoded["samples"].shape == (1, 16, 1, 7, 11)
     replay = patched(model, frozen_state=export_id, sites="clean")

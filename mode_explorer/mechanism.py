@@ -22,7 +22,7 @@ FILTERS = ("all", "low", "mid", "high")
 class MechanisticSettings:
     mode: str = "signed"
     blocks: str = "5"
-    sites: str = "attention_pre,attention_post,projection_input,projection_output,after_attention,after_mlp"
+    sites: str = "velocity,clean"
     chunk: int = 8
     capture_mib: int = 2048
     low_cut: float = 0.125

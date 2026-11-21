@@ -10,7 +10,7 @@ import torch
 from .mechanism import UNAVAILABLE, conditioning_terms, filter_field, paired_measurement, signed_terms
 from .objectives import cell_size, feature_shift, seed_key, token_pool
 from .response import clean_candidate, flow_clean, latent_cell_bounds, rms, select_response, velocity_for_clean
-from .runtime import FRAME, Frame, Run, finite_json, isolated_reference, shadow_forward, spatial_image, token_slice
+from .runtime import FRAME, Frame, Run, isolated_reference, shadow_forward, spatial_image, token_slice
 
 _CAPTURE = ContextVar("modeexplorer_mechanistic_capture", default=None)
 _GLOBAL = {"final_projection", "velocity", "clean"}
