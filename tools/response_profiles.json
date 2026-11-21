@@ -1,0 +1,9 @@
+{
+  "native": {"method": "native", "response": {"mode": "latent_probe", "all_actual": true}},
+  "repel": {"method": "native", "response": {"mode": "joint_probe", "all_actual": true, "downstream": true}},
+  "reverse": {"method": "native", "response": {"mode": "joint_probe", "all_actual": true, "feature_direction": "reverse", "downstream": true}},
+  "tangent": {"method": "native", "response": {"mode": "joint_probe", "all_actual": true, "feature_direction": "tangent", "downstream": true}},
+  "spatial_random": {"method": "native", "response": {"mode": "joint_probe", "all_actual": true, "feature_direction": "spatial_random", "downstream": true}},
+  "latent_steer": {"method": "native", "response": {"mode": "latent_steer", "all_actual": true}},
+  "candidate_review": {"method": "native", "response": {"mode": "feature_steer", "selection": "export_only", "export": true}}
+}

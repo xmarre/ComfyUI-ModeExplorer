@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "node": "ModeExplorerMechanisticKrea2",
+  "usage": "Set these node inputs on the unchanged production planner. Connect alternate CONDITIONING for factorial experiments.",
+  "common": {
+    "feature_block": 5,
+    "feature_grid": "4",
+    "feature_strength": 0.025,
+    "feature_references": 1,
+    "min_sigma": 0.82,
+    "max_sigma": 1.0,
+    "evaluation": -1,
+    "export": true,
+    "memory_mb": 768,
+    "chunk": 8,
+    "analysis_device": "cuda",
+    "capture_vram_mib": 10240,
+    "cuda_chunk": 32
+  },
+  "profiles": {
+    "smoke": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "velocity,clean", "states": 1, "repeat_baseline": true, "auxiliary_budget": 6, "capture_mib": 2048},
+      "expected_calls_upper_bound": 6,
+      "checks": ["mechanistic.repeat_clean_rms", "mechanistic.signed_realized_edit", "mechanistic.sites.clean"]
+    },
+    "signed_full_resolution": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "attention_pre,attention_post,projection_input,projection_output,after_attention,after_mlp,final_projection_unpatched,clean", "states": 3, "amplitude_check": true, "auxiliary_budget": 21, "capture_mib": 8192},
+      "expected_calls_upper_bound": 21,
+      "checks": ["mechanistic.sites.b5.projection_input", "mechanistic.sites.final_projection_unpatched", "mechanistic.sites.clean", "mechanistic.amplitude", "export_status"]
+    },
+    "conditioning_fixed": {
+      "settings": {"experiment": "conditioning_fixed", "blocks": "5,12", "sites": "projection_input,after_mlp,clean", "states": 1, "auxiliary_budget": 6, "capture_mib": 8192},
+      "expected_calls_upper_bound": 6,
+      "checks": ["mechanistic.conditioning_realized_edit", "mechanistic.sites.clean.comparisons.conditioning_interaction"]
+    },
+    "active_component": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "clean", "states": 3, "component": "even", "band": "low", "treatment": "minimum_change", "auxiliary_budget": 15, "capture_mib": 2048},
+      "expected_calls_upper_bound": 15,
+      "checks": ["selected_candidate", "applied_clean_displacement_rms", "export_status"]
+    },
+    "precision_backend": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "attention_post,projection_input,clean", "states": 1, "repeat_baseline": true, "amplitude_check": true, "checkpoint_provenance": "alternate_execution", "match_cross_dtype": true, "auxiliary_budget": 8, "capture_mib": 4096},
+      "expected_calls_upper_bound": 8,
+      "checks": ["native_input_fp32_sha256", "mechanistic.kernel_contract", "mechanistic.amplitude", "mechanistic.repeat_clean_rms"]
+    },
+    "projection_smoke": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "projection_activation_check": true, "auxiliary_budget": 4, "capture_vram_mib": 16384},
+      "expected_calls_upper_bound": 4,
+      "local_projection_calls_per_state": 3,
+      "checks": ["mechanistic.projection.native_replay_status", "mechanistic.projection.effective_operator", "mechanistic.projection.activation_counterfactual.status"]
+    },
+    "projection_signed": {
+      "settings": {"experiment": "signed", "blocks": "5", "sites": "", "states": 3, "projection_study": "observe", "projection_activation_check": true, "projection_symmetric_check": true, "amplitude_check": true, "auxiliary_budget": 18, "capture_vram_mib": 24576},
+      "expected_calls_upper_bound": 18,
+      "local_projection_calls_per_state": 7,
+      "checks": ["mechanistic.projection.activation_counterfactual.components.even", "mechanistic.projection.half_over_full", "mechanistic.projection.symmetric_check", "export_status"]
+    },
+    "projection_conditioning": {
+      "settings": {"experiment": "conditioning_fixed", "blocks": "5", "sites": "", "evaluation": 0, "states": 1, "projection_study": "observe", "projection_activation_check": true, "auxiliary_budget": 5, "capture_vram_mib": 16384},
+      "expected_calls_upper_bound": 5,
+      "local_projection_calls_per_state": 4,
+      "checks": ["mechanistic.conditioning_realized_edit", "mechanistic.projection.native_replay_status", "mechanistic.projection.activation_counterfactual.components.conditioning_interaction"]
+
+    }
+  }
+}
