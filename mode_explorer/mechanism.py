@@ -35,6 +35,7 @@ class MechanisticSettings:
     amplitude_check: bool = False
     alternate: object = None
     checkpoint_provenance: str = ""
+    match_cross_dtype: bool = False
 
     @cached_property
     def block_ids(self):

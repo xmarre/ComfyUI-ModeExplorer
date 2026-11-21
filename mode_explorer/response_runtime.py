@@ -140,6 +140,12 @@ def _tensor_hash(tensor):
     return digest.hexdigest()
 
 
+def _tensor_value_hash(tensor):
+    if tensor is not None and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        tensor = tensor.detach().to(device="cpu", dtype=torch.float32)
+    return _tensor_hash(tensor)
+
+
 def read_export(export_id):
     from json import loads
     import folder_paths
@@ -313,7 +319,11 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     if cfg.scorer is not None and cfg.selection == "external":
         point["scorer"] = getattr(cfg.scorer, "__qualname__", type(cfg.scorer).__qualname__)
     if cfg.mechanistic is not None:
-        point["native_input_fp32_sha256"] = _tensor_hash(latent.float())
+        point["native_input_fp32_sha256"] = _tensor_value_hash(latent)
+        point["native_condition_values"] = {
+            "context": _tensor_value_hash(context), "mask": _tensor_value_hash(mask),
+            "references": [_tensor_value_hash(ref) for ref in refs or ()],
+        }
 
     def spend(rows):
         throw_exception_if_processing_interrupted()
@@ -352,9 +362,13 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 saved, data = read_export(cfg.frozen_state)
                 matched = ("sigma", "timestep", "input_dtype", "conditioning_sha256", "attention_mask_sha256",
                            "reference_latent_sha256", "reference_method", "branches", "noise_scale", "cfg_scale")
-                precision = cfg.mechanistic is not None and cfg.mechanistic.checkpoint_provenance == "alternate_execution"
-                if precision:
-                    matched = tuple(key for key in matched if key != "input_dtype")
+                precision = cfg.mechanistic is not None and cfg.mechanistic.match_cross_dtype
+                if precision and saved.get("input_dtype") != point["input_dtype"]:
+                    if saved.get("native_condition_values") != point["native_condition_values"]:
+                        raise ValueError("frozen_condition_values_mismatch")
+                    matched = tuple(key for key in matched if key not in {
+                        "input_dtype", "conditioning_sha256", "attention_mask_sha256", "reference_latent_sha256",
+                    })
                 if any(saved.get(key) != point.get(key) for key in matched):
                     raise ValueError("frozen_sigma_or_conditioning_mismatch")
                 with safe_open(data, framework="pt", device="cpu") as package:

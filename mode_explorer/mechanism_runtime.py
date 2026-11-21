@@ -234,7 +234,7 @@ def _amplitude(full_plus, full_minus, half_plus, half_minus, base):
 
 def research_response(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                       kwargs, native_velocity, point, spend, reference_sigma, initial_ordinal, ordinal, probe_seed):
-    from .response_runtime import _tensor_hash
+    from .response_runtime import _tensor_hash, _tensor_value_hash
 
     cfg = run.response.config
     spec = cfg.mechanistic
@@ -247,7 +247,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         "trajectory": "frozen_export" if cfg.frozen_state else "live_feature" if run.feature_active else "native_or_component",
         "sites": {}, "arms": [], "component": spec.component, "band": spec.band,
         "cell": spec.cell, "filter_transition": spec.transition, "symmetry_limit": spec.symmetry_limit,
-        "amplitude_check": spec.amplitude_check, "attention_mask_consumed_by_native_krea": False,
+        "amplitude_check": spec.amplitude_check, "match_cross_dtype": spec.match_cross_dtype,
+        "attention_mask_consumed_by_native_krea": False,
     }
     if reference_sigma is None:
         raise ValueError("feature_reference_start_not_observed")
@@ -274,7 +275,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         branches["C1"] = alt_context, alt_mask
     stage["conditioning"] = {
         key: {"sha256": _tensor_hash(ctx), "mask_sha256": _tensor_hash(msk),
-              "metadata_mask_sha256": _tensor_hash(metadata_masks[key]), "tokens": ctx.shape[1]}
+              "metadata_mask_sha256": _tensor_hash(metadata_masks[key]), "tokens": ctx.shape[1],
+              "context_values_sha256": _tensor_value_hash(ctx), "mask_values_sha256": _tensor_value_hash(msk)}
         for key, (ctx, msk) in branches.items()
     }
     stage["kernel_contract"] = {

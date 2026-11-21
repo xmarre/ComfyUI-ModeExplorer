@@ -43,11 +43,21 @@ def compare(left, right):
     fields = (
         "sigma", "timestep", "noise_scale", "probe_seed", "feature_reference_initial_sigma",
         "feature_reference_initial_sol_evaluations", "sol_evaluations", "feature_settings",
-        "reference_method", "reference_latent_sha256",
+        "reference_method",
     )
     pairs = {name: (point0.get(name), point1.get(name)) for name in fields}
     pairs["input_values"] = tuple(p.get("native_input_fp32_sha256", p.get("native_input_sha256")) for p in (point0, point1))
-    for name in ("mode", "injection_block", "conditioning", "frequency_cycles_per_grid_cell", "amplitude_check"):
+    pairs["references"] = tuple(
+        p.get("native_condition_values", {}).get("references", p.get("reference_latent_sha256")) for p in (point0, point1)
+    )
+
+    def condition_values(study):
+        return {key: (data.get("context_values_sha256", data["sha256"]),
+                      data.get("mask_values_sha256", data["mask_sha256"]), data["metadata_mask_sha256"], data["tokens"])
+                for key, data in study["conditioning"].items()}
+
+    pairs["conditioning"] = condition_values(study0), condition_values(study1)
+    for name in ("mode", "injection_block", "frequency_cycles_per_grid_cell", "amplitude_check"):
         pairs[name] = (study0.get(name), study1.get(name))
     mismatches = [name for name, (a, b) in pairs.items() if a != b]
     sites0, sites1 = study0["sites"], study1["sites"]

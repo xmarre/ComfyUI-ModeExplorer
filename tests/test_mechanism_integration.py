@@ -134,3 +134,39 @@ def test_export_frozen_match_and_shared_reference_start(model, caplog, tmp_path,
     assert frozen["status"] == "completed", frozen
     assert frozen["native_input_sha256"] == second["native_input_sha256"]
     assert frozen["mechanistic"]["sites"]["clean"] == second["mechanistic"]["sites"]["clean"]
+
+
+def test_cross_dtype_replay_matches_condition_values_and_rejects_changes(model, caplog, tmp_path, monkeypatch):
+    import folder_paths
+    import test_comfy_integration as fixture
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+
+    def rounded_conditions(*args, **kwargs):
+        p, n = conditions(*args, **kwargs)
+        p[0][0] = p[0][0].bfloat16().float()
+        return p, n
+
+    monkeypatch.setattr(fixture, "conditions", rounded_conditions)
+    dit = model.model.diffusion_model
+    dit.bfloat16()
+    dit.dtype = torch.bfloat16
+    draw(patched(model, evaluation=0, sites="clean", export=True))
+    src = point(caplog)
+    assert src["export_status"] == "completed" and src["input_dtype"] == "torch.bfloat16"
+    dit.float()
+    dit.dtype = torch.float32
+    options = dict(evaluation=0, sites="clean", frozen_state=src["export_id"])
+    draw(patched(model, **options))
+    assert point(caplog)["reason"] == "frozen_sigma_or_conditioning_mismatch"
+    cfg = patched(model, match_cross_dtype=True, **options)
+    assert torch.equal(draw(model, seed=19), draw(cfg, seed=19))
+    p = point(caplog)
+    assert p["status"] == "completed", p
+    assert p["native_input_fp32_sha256"] == src["native_input_fp32_sha256"]
+    assert p["input_dtype"] == "torch.float32" and p["conditioning_sha256"] != src["conditioning_sha256"]
+    assert p["native_condition_values"] == src["native_condition_values"]
+    monkeypatch.setattr(fixture, "conditions", conditions)
+    draw(cfg)
+    assert point(caplog)["reason"] == "frozen_condition_values_mismatch"

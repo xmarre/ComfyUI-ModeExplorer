@@ -275,6 +275,7 @@ class ModeExplorerMechanistic:
             "amplitude_check": ("BOOLEAN", {"default": False}),
             "repeat_baseline": ("BOOLEAN", {"default": False}),
             "all_actual": common["optional"]["all_actual"],
+            "match_cross_dtype": ("BOOLEAN", {"default": False, "tooltip": "Allow frozen replay across execution dtypes when the saved latent and conditioning values are exactly representable."}),
             "checkpoint_provenance": (["", "same_execution", "alternate_execution", "dequantized_approximation",
                                        "original_weights", "different_weights"], {"default": ""}),
             "trial": common["required"]["trial"],
