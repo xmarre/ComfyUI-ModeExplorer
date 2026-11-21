@@ -299,7 +299,8 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     for path in sorted((root / "examples").glob("*.json")):
         if path.name in ("spectrum_ab.json", "response_spectrum.json") and not spectrum_available:
             continue
-        if (path.name.startswith("projection_") or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json")) and not (
+        if (path.name.startswith("projection_") or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json",
+                                                                  "conditioning_contrast.json")) and not (
             scale_locked and spectrum_available
         ):
             continue
@@ -356,6 +357,24 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
                 assert research[key] == profile["settings"].get(key, False), (path.name, key)
             if path.name == "projection_conditioning.json":
                 assert research["alternate"] != planner["positive"]
+        elif path.name == "conditioning_contrast.json":
+            planner, = [item["inputs"] for item in api.values()
+                        if item["class_type"] == "Krea2TurboFlowAlignedRegenerate"]
+            research, = [item["inputs"] for item in api.values()
+                         if item["class_type"] == "ModeExplorerMechanisticKrea2"]
+            protocol = json.loads((root / "tools" / "conditioning_contrast_prompts.json").read_text())
+            case = protocol["cases"][0]
+            assert planner["regeneration_mode"] == "planner_final_upscale_only"
+            assert planner["cfg"] == 1 and planner["seed"] == case["seed"]
+            assert research["experiment"] == "conditioning_contrast" and research["component"] == "contrast"
+            assert research["sites"] == "clean" and research["band"] == "all"
+            assert research["projection_study"] == "off" and research["export"] and research["all_actual"]
+            assert research["evaluation"] == protocol["actual_evaluation"]
+            for key in ("states", "candidate_gain", "candidate_target_rms", "clean_limit", "repeat_baseline", "auxiliary_budget"):
+                assert research[key] == protocol[key]
+            assert research["alternate"] != planner["positive"]
+            assert api[research["alternate"][0]]["inputs"]["text"] == case["alternate"]
+            assert api[planner["positive"][0]]["inputs"]["text"] == case["prompt"]
         valid, error, *_ = asyncio.run(execution.validate_prompt(path.name, api, None))
         assert valid, (path.name, error)
 
