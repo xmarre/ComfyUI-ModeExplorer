@@ -402,6 +402,103 @@ def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, atten
     return capture_bytes, fft_bytes + output_bytes
 
 
+def _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
+                           kwargs, native_velocity, point, spend, ordinal, timing):
+    """Matched-state semantic contrast, with no feature replay or spectral capture."""
+    from .response_runtime import _tensor_hash, _tensor_value_hash
+
+    cfg, spec = run.response.config, run.response.config.mechanistic
+    stage = point["mechanistic"]
+    if (x.shape[0] != 1 or frame.offset != 0 or list(options.get("cond_or_uncond", ())) != [0]
+            or run.response.cfg_scale != 1.0 or run.feature_active or frame.attempted or cfg.frozen_state):
+        raise ValueError("contrast_requires_live_single_positive_native_cfg_one")
+    if not 1e-5 <= frame.sigma:
+        raise ValueError("flow_conversion_endpoint")
+    required = 1 + int(cfg.calibration != "off")
+    stage.update(analysis_device=str(latent.device), baseline_reused=True,
+                 auxiliary_calls_planned=required, feature_reference_calls=0,
+                 captured_bytes=0, capture_transfer_bytes=0, arms=["D00"],
+                 direction_scope="conditional_clean_prediction")
+    if run.response.forwards + required > cfg.auxiliary_budget:
+        raise ValueError("auxiliary_forward_budget")
+    alt, alt_mask, raw_mask = _alternate(spec.alternate, run.response.base_model, latent,
+                                          context, mask, refs, kwargs, executor.class_obj)
+    stage["conditioning"] = {
+        key: {"sha256": _tensor_hash(ctx), "mask_sha256": _tensor_hash(msk),
+              "metadata_mask_sha256": _tensor_hash(metadata_mask), "tokens": ctx.shape[1],
+              "context_values_sha256": _tensor_value_hash(ctx), "mask_values_sha256": _tensor_value_hash(msk)}
+        for key, ctx, msk, metadata_mask in (("C0", context, mask, run.response.positive_metadata_mask),
+                                             ("C1", alt, alt_mask, raw_mask))
+    }
+
+    def predict(ctx, msk):
+        spend(1)
+        with torch.no_grad(), isolated_reference(run, sol_evaluations=ordinal):
+            with timing.measure("auxiliary_dit", latent.device):
+                value = executor(latent, timesteps, ctx, msk, refs, options, **kwargs)
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError("contrast_nonfinite_velocity")
+        return flow_clean(latent, value, frame.sigma)
+
+    base = flow_clean(latent, native_velocity, frame.sigma)
+    if not bool(torch.isfinite(base).all()):
+        raise ValueError("nonfinite_baseline")
+    noise_floor = 0.
+    if cfg.calibration != "off":
+        noise_floor = rms(predict(context, mask) - base)
+        if not math.isfinite(noise_floor):
+            raise ValueError("nonfinite_repeat")
+    stage["repeat_clean_rms"] = noise_floor if cfg.calibration != "off" else None
+    other = predict(alt, alt_mask)
+    stage["arms"].append("D10")
+    delta = base - other
+    stage["contrast_rms"] = rms(delta)
+    if not math.isfinite(stage["contrast_rms"]):
+        raise ValueError("nonfinite_contrast")
+    point.update(status="completed", applied=False, selected_candidate="baseline",
+                 candidates=[{"arm": "baseline", "selected": True}])
+    tensors = {"frozen_native_input": latent, "baseline_clean": base, "D10_clean": other,
+               "contrast_native_delta": delta} if cfg.export else {}
+    if spec.component == "observe":
+        return native_velocity, tensors
+    direction = delta
+    if spec.component == "contrast_reverse":
+        direction = -delta
+    elif spec.component == "contrast_spatial":
+        h, w = delta.shape[-2:]
+        if h == w == 1:
+            raise ValueError("contrast_spatial_requires_spatial_extent")
+        shifts = (h // 2, w // 2)
+        direction = torch.roll(delta, shifts=shifts, dims=(-2, -1))
+        stage["control_shift_yx"] = list(shifts)
+    direction_rms = rms(direction)
+    denom = stage["contrast_rms"] * direction_rms
+    stage["direction_rms"] = direction_rms
+    stage["direction_cosine"] = float((direction * delta).mean()) / denom if denom else None
+    proposal, info = clean_candidate(base, direction, cfg, {"arm": spec.component})
+    corrected = velocity_for_clean(latent, proposal, frame.sigma).to(native_velocity.dtype)
+    candidate = flow_clean(latent, corrected, frame.sigma)
+    selected, baseline_score = select_response([(candidate, info)], base, cfg, noise_floor,
+                                                point, run.response.process_latent_out)
+    point["candidates"].append(info)
+    point["candidates"][0]["external_scores"] = baseline_score
+    if cfg.export and bool(torch.isfinite(candidate).all()):
+        tensors["candidate_clean"] = candidate
+    if cfg.steers and selected is not None:
+        actual = rms(frame.sigma * (corrected.float() - native_velocity.float()))
+        point["applied_clean_displacement_rms"] = actual
+        if (1e-8 < actual <= cfg.clean_limit
+                and (not cfg.candidate_target_rms
+                     or abs(actual - cfg.candidate_target_rms) <= .1 * cfg.candidate_target_rms)):
+            point.update(applied=True, selected_candidate=spec.component)
+            point["candidates"][0]["selected"] = False
+            if cfg.export:
+                tensors["applied_clean"] = candidate
+            return corrected, tensors
+        info["reason"] = "native_output_rounding_or_trust_bound"
+    return native_velocity, tensors
+
+
 def research_response(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                       kwargs, native_velocity, point, spend, reference_sigma, initial_ordinal, ordinal, probe_seed, timing):
     from .response_runtime import _tensor_hash, _tensor_value_hash
@@ -427,6 +524,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         "amplitude_check": spec.amplitude_check, "match_cross_dtype": spec.match_cross_dtype,
         "attention_mask_consumed_by_native_krea": False,
     }
+    if spec.mode == "conditioning_contrast":
+        return _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
+                                      kwargs, native_velocity, point, spend, ordinal, timing)
     projection_enabled = spec.projection_study != "off"
     projection_downstream = spec.projection_study not in ("off", "observe")
     if projection_enabled and analysis_device != latent.device:

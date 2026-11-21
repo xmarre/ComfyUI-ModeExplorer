@@ -341,3 +341,60 @@ def test_projection_diagnostic_oom_keeps_native_prediction(model, caplog, monkey
         assert torch.equal(native, draw(candidate))
     assert point(caplog)["reason"] == "mechanistic_out_of_memory"
     assert not point(caplog).get("applied", False)
+
+
+@pytest.mark.parametrize("component", ["observe", "contrast", "contrast_reverse", "contrast_spatial"])
+def test_conditioning_contrast_matched_native_state(model, caplog, monkeypatch, tmp_path, component):
+    import json
+    import folder_paths
+    from safetensors.torch import load_file
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    positive, _ = conditions()
+    alt = [[positive[0][0][:, :3] * -.75, {}]]
+    cfg = patched(model, experiment="conditioning_contrast", alternate=alt, sites="clean",
+                  treatment="export_only" if component == "observe" else "minimum_change",
+                  component=component, candidate_gain=1., candidate_target_rms=.0001,
+                  auxiliary_budget=1, export=True)
+    native = draw(model)
+    rng = torch.random.get_rng_state().clone()
+    result = draw(cfg)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    m = point(caplog)
+    assert m["status"] == "completed", m
+    assert m["auxiliary_dit_calls"] == 1
+    assert m["mechanistic"]["feature_reference_calls"] == 0
+    assert m["mechanistic"]["baseline_reused"]
+    assert m["mechanistic"]["contrast_rms"] > 0
+    assert m["export_status"] == "completed"
+    assert m["applied"] == (component != "observe")
+    assert torch.equal(result, native) == (component == "observe")
+    data = load_file(tmp_path / "modeexplorer_response" / m["export_id"] / "predictions.safetensors")
+    if component == "observe":
+        assert "candidate_clean" not in data
+    else:
+        delta = data["baseline_clean"] - data["D10_clean"]
+        if component == "contrast_reverse":
+            delta = -delta
+        if component == "contrast_spatial":
+            delta = torch.roll(delta, shifts=(delta.shape[-2] // 2, delta.shape[-1] // 2), dims=(-2, -1))
+        actual = data["applied_clean"] - data["baseline_clean"]
+        assert torch.nn.functional.cosine_similarity(actual.flatten(), delta.flatten(), dim=0) > .999
+        assert m["applied_clean_displacement_rms"] == pytest.approx(.0001, rel=.1)
+
+
+def test_conditioning_contrast_fail_closed(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    positive, _ = conditions()
+    options = dict(experiment="conditioning_contrast", alternate=positive, sites="clean",
+                   component="contrast", treatment="minimum_change", auxiliary_budget=1)
+    native = draw(model)
+    assert torch.equal(draw(patched(model, **options)), native)
+    assert not point(caplog)["applied"]
+    assert torch.equal(draw(patched(model, **{**options, "auxiliary_budget": 0})), native)
+    p = point(caplog)
+    assert p["reason"] == "auxiliary_forward_budget" and p["auxiliary_dit_calls"] == 0
+    cfg = patched(model, **options)
+    assert torch.equal(draw(cfg, cfg=2), draw(model, cfg=2))
+    assert torch.equal(draw(cfg, stage="highres"), native)

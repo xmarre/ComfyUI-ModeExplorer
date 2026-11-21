@@ -13,8 +13,8 @@ SITES = (
     "final_projection", "final_projection_unpatched", "velocity", "clean",
 )
 UNAVAILABLE = {"sigmoid_gate", "attention_contribution", "mlp_contribution"}
-MODES = ("signed", "conditioning_fixed", "conditioning_recomputed", "joint_fixed", "joint_recomputed")
-COMPONENTS = ("observe", "complete", "even", "odd", "interaction", "control")
+MODES = ("signed", "conditioning_fixed", "conditioning_recomputed", "joint_fixed", "joint_recomputed", "conditioning_contrast")
+COMPONENTS = ("observe", "complete", "even", "odd", "interaction", "control", "contrast", "contrast_reverse", "contrast_spatial")
 FILTERS = ("all", "low", "mid", "high", "sub_patch")
 
 
@@ -71,7 +71,7 @@ class MechanisticSettings:
 
     @property
     def core_arms(self):
-        return 2 + int(self.signed) + 2 * int(self.conditioning)
+        return 2 if self.mode == "conditioning_contrast" else 2 + int(self.signed) + 2 * int(self.conditioning)
 
     def __post_init__(self):
         if self.projection_study not in ("off", "observe", "linear", "residual", "executed", "control"):
@@ -88,6 +88,13 @@ class MechanisticSettings:
             raise ValueError("Projection replay tolerance or token chunk is out of range.")
         if self.mode not in MODES or self.component not in COMPONENTS or self.band not in FILTERS:
             raise ValueError("Unknown mechanistic mode, component or frequency band.")
+        if self.mode == "conditioning_contrast":
+            if (self.component not in ("observe", "contrast", "contrast_reverse", "contrast_spatial")
+                    or self.site_names != ("clean",) or self.band != "all" or self.cell != -1
+                    or self.projection_study != "off" or self.amplitude_check or self.match_cross_dtype):
+                raise ValueError("Conditioning contrast requires clean-only, all-band measurement without projection or localization.")
+        elif self.component.startswith("contrast"):
+            raise ValueError("Contrast components require the conditioning contrast experiment.")
         if set(self.site_names) - set(SITES) or not self.block_ids:
             raise ValueError("Unknown measurement site or empty block selection.")
         if not 1 <= self.chunk <= 64 or not 16 <= self.capture_mib <= 8192:
