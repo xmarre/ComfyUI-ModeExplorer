@@ -163,7 +163,7 @@ def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
 @dataclass
 class GuidanceRun:
     config: Guidance
-    seed: int
+    seed: int | None
     stage: str
     process_latent_out: object
     ordinal: int = 0
@@ -363,7 +363,7 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
     seed = extra_args.get("seed")
     model = model_wrap.inner_model
     batch = noise.shape[0]
-    state = GuidanceRun(config, seed, stage, model.process_latent_out)
+    state = GuidanceRun(config, seed if type(seed) is int else None, stage, model.process_latent_out)
     run = None
     completed = False
     begin = perf_counter()
@@ -420,7 +420,7 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
         completed = True
         return result
     finally:
-        payload = {"seed": seed, "stage": stage, "completed": completed, "batch": batch,
+        payload = {"seed": state.seed, "stage": stage, "completed": completed, "batch": batch,
                    "seconds": perf_counter() - begin, "native_dit_calls": run.native_dit_calls if run else None,
                    "spectrum_forecast_calls": run.spectrum_forecasts if run else None,
                    "spectrum_policy": "all_actual" if run and run.spectrum else "none",

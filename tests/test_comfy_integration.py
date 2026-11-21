@@ -328,7 +328,18 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
             assert port["link"] == ident and ident in output["links"]
             assert value == output["type"] == port["type"]
             api[str(dst)]["inputs"][port["name"]] = [str(src), source_slot]
-        if path.name.startswith("projection_"):
+        if path.name.startswith("projection_guidance_"):
+            planner, = [item["inputs"] for item in api.values()
+                        if item["class_type"] == "Krea2TurboFlowAlignedRegenerate"]
+            configured, = [item["inputs"] for item in api.values()
+                           if item["class_type"] == "ModeExplorerProjectionGuidanceKrea2"]
+            decoder, = [item["inputs"] for item in api.values() if item["class_type"] == "VAEDecode"]
+            assert planner["regeneration_mode"] == "planner_final_upscale_only"
+            assert planner["steps"] == 13 and planner["sampler_name"] == "er_sde"
+            assert decoder["samples"][1] == 1  # Native planner latent, not the target output.
+            assert configured["enabled"] and configured["block"] == 5 and configured["evaluations"] == 2
+            assert configured["scope"] == "planner" and not configured["export_clean"]
+        elif path.name.startswith("projection_"):
             planner, = [item["inputs"] for item in api.values()
                         if item["class_type"] == "Krea2TurboFlowAlignedRegenerate"]
             research, = [item["inputs"] for item in api.values()
