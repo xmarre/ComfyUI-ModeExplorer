@@ -423,3 +423,33 @@ def test_mechanistic_scale_locked_uses_original_planner_and_zero_target_evaluati
     assert {report["stage"] for report in logs(caplog, "Spectrum Krea 2 summary: ")} == {"planner"}
     point, = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"]
     assert point["stage"] == "planner" and point["status"] == "completed"
+
+
+@pytest.mark.skipif(not os.environ.get("MODEEXPLORER_SCALE_LOCKED"), reason="Scale-Locked is optional")
+def test_projection_guidance_scale_locked_spectrum_routes(caplog, model):
+    import asyncio
+
+    import nodes
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+    from test_comfy_integration import conditions
+
+    assert asyncio.run(nodes.load_custom_node(os.environ["MODEEXPLORER_SCALE_LOCKED"]))
+    node = nodes.NODE_CLASS_MAPPINGS["Krea2TurboFlowAlignedRegenerate"]()
+    caplog.set_level(logging.INFO)
+    positive, negative = conditions()
+    latent = {"samples": torch.zeros(1, 16, 1, 80, 80)}
+    guided, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, amplitude=.01)
+    with torch.inference_mode():
+        _, planner, _ = node.sample(spectrum(guided), positive, negative, latent, 902, .25, 0., 0.,
+                                   steps=6, composition_lock_sigma=.6, sampler_name="er_sde",
+                                   regeneration_mode="planner_final_upscale_only", handoff_diagnostics="off")
+    trace, = logs(caplog, "MODEEXPLORER_TRACE ")
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    assert trace["stage"] == report["stage"] == "planner"
+    assert trace["spectrum_policy"] == "all_actual"
+    assert trace["native_dit_calls"] > 0 and trace["spectrum_forecast_calls"] == 0
+    assert len(trace["projection_guidance"]["points"]) == 2
+    assert all(p["status"] == "applied" for p in trace["projection_guidance"]["points"])
+    assert "target denoiser evaluations=0" in caplog.text
+    assert torch.isfinite(planner["samples"]).all()
+    assert CURRENT.get() is None

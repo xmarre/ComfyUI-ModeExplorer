@@ -79,8 +79,10 @@ class ModeExplorer:
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
         active = enabled and (diagnostics or (strength != 0 and (feature != "native" or initialization)))
-        if active and guidance is not None:
-            raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")
+        if guidance is not None:
+            if active:
+                raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")
+            return (model,)
         if not active and not attached:
             return (model,)
         settings = Settings(feature="native")
@@ -101,11 +103,10 @@ class ModeExplorer:
         clone = model.clone()
         if attached:
             _remove_modeexplorer_wrappers(clone)
-        if active or response is not None or guidance is not None:
-            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response, guidance))
+        if active or response is not None:
+            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
-            if guidance is None:
-                clone.set_model_attn1_output_patch(attention_feature)
+            clone.set_model_attn1_output_patch(attention_feature)
         return (clone,)
 
     @staticmethod

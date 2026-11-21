@@ -69,7 +69,7 @@ def _norm2(values):
 
 def _scale_statistics(row, mode):
     tokens, channels = row.shape
-    scale2 = torch.zeros(channels if mode == "channel_aware" else tokens, device=row.device)
+    scale2 = torch.zeros(channels if mode == "channel_aware" else tokens, device=row.device, dtype=torch.float32)
     for start in range(0, tokens, CHUNK):
         part = row[start:start + CHUNK].float()
         if mode == "channel_aware":
@@ -95,7 +95,7 @@ def _noise(row, generator, weights, mode):
 def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
     """Return a validated replacement or None, leaving native storage untouched."""
     lo, hi = bounds
-    if output.ndim != 3 or output.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    if output.layout != torch.strided or output.ndim != 3 or output.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         info.update(status="skipped", reason="unsupported_projection_output")
         return None
     if not (0 <= lo < hi <= output.shape[1] and 0 <= offset < offset + batch <= output.shape[0]
@@ -119,13 +119,13 @@ def perturb(output, bounds, offset, batch, cfg, strength, seeds, info):
         if cfg.max_relative_rms:
             cap = torch.minimum(cap, native_rms * cfg.max_relative_rms)
         target = torch.minimum(requested, cap)
-        total = torch.zeros((), device=output.device)
+        total = torch.zeros((), device=output.device, dtype=torch.float32)
         generator.manual_seed(seed)
         for _, delta in _noise(row, generator, weights, cfg.mode):
             total.add_(_norm2(delta))
         factor = target / (total / n).sqrt().clamp_min(1e-12)
         generator.manual_seed(seed)
-        generated, realized, changed = (torch.zeros((), device=output.device) for _ in range(3))
+        generated, realized, changed = (torch.zeros((), device=output.device, dtype=torch.float32) for _ in range(3))
         for span, delta in _noise(row, generator, weights, cfg.mode):
             delta.mul_(factor)
             generated.add_(_norm2(delta))
@@ -170,16 +170,30 @@ class GuidanceRun:
     points: list = field(default_factory=list)
     reason: str | None = None
     exports: int = 0
+    cuda_device: torch.device | None = None
+    cuda_before: dict | None = None
 
     def record(self, point):
         if len(self.points) < TRACE_LIMIT:
             self.points.append(point)
 
     def report(self):
-        return {"schema": 1, "mode": self.config.mode, "block": self.config.block, "site": SITE,
+        report = {"schema": 1, "mode": self.config.mode, "block": self.config.block, "site": SITE,
                 "trial": self.config.trial, "positive_actual_evaluations": self.ordinal,
-                "auxiliary_dit_calls": 0, "auxiliary_projection_calls": 0, "reason": self.reason,
+                "auxiliary_dit_calls": 0, "auxiliary_projection_calls": 0, "auxiliary_projection_gemms": 0,
+                "reason": self.reason or ("no_matching_actual_evaluation" if not self.points else None),
                 "points": self.points}
+        if self.cuda_device is not None:
+            report["cuda_allocator"] = {"scope": "device_lifetime_peak_since_last_reset",
+                                        "before_first_intervention": self.cuda_before,
+                                        "at_sampler_exit": _cuda_snapshot(self.cuda_device)}
+        return report
+
+
+def _cuda_snapshot(device):
+    return {"allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(device)}
 
 
 @contextmanager
@@ -226,6 +240,9 @@ def _hooks(dit, grid, offset, batch, packed_rows, state, strength, point):
         stream = f"projection:{state.stage}:{point['evaluation']}:{point['sigma'].hex()}:{cfg.block}:{SITE}:{grid}:{width}:{cfg.trial}"
         seeds = [seed_key(state.seed, f"{stream}:{row}") for row in range(batch)]
         point["stream_seeds"] = seeds
+        if output.is_cuda and state.cuda_device is None:
+            state.cuda_device = output.device
+            state.cuda_before = _cuda_snapshot(output.device)
         begin = perf_counter()
         try:
             return perturb(output, bounds, offset, batch, cfg, strength, seeds, point)
@@ -265,10 +282,14 @@ def dispatch(forward, arguments, dit, run):
         state.reason = "unsupported_latent_shape"
         return forward(arguments)
     ordinal = state.ordinal
-    if cfg.evaluations and ordinal >= cfg.evaluations:
-        result = forward(arguments)
-        state.ordinal += 1
+    forecasts = run.spectrum_forecasts
+
+    def count_actual(result):
+        state.ordinal += int(run.spectrum_forecasts == forecasts)
         return result
+
+    if cfg.evaluations and ordinal >= cfg.evaluations:
+        return count_actual(forward(arguments))
     sigmas = options.get("sigmas")
     if not torch.is_tensor(sigmas) or sigmas.shape != (run.batch,):
         state.reason = "unverified_sigma_dispatch"
@@ -279,30 +300,37 @@ def dispatch(forward, arguments, dit, run):
         return forward(arguments)
     strength = cfg.strength(ordinal, low)
     if not strength:
-        result = forward(arguments)
-        state.ordinal += 1
-        return result
+        return count_actual(forward(arguments))
     offset = branches.index(0) * run.batch
     grid = tuple(math.ceil(size / dit.patch) for size in x.shape[-2:])
     point = dict(status="pending", evaluation=ordinal, sigma=low, grid=grid, branches=list(branches),
                  strength=strength, units=cfg.units)
     with _hooks(dit, grid, offset, run.batch, x.shape[0], state, strength, point) as marker:
         result = forward((*arguments[:-1], {**options, _FRAME_KEY: marker}))
-    state.ordinal += 1
+    if run.spectrum_forecasts != forecasts:
+        state.reason = "unexpected_spectrum_forecast"
+        return result
+    count_actual(result)
     if point["status"] == "pending":
         point.update(status="skipped", reason="projection_hook_not_reached")
     state.record(point)
     if cfg.export_clean and point["status"] in ("applied", "unchanged"):
-        _export_clean(state, x, result, offset, run, point, arguments[2:5])
+        try:
+            _export_clean(state, x, result, offset, run, point, arguments[2:5])
+        except torch.OutOfMemoryError:
+            point["export_status"] = "diagnostic_export_oom"
     return result
 
 
 def _export_clean(state, x, velocity, offset, run, point, conditioning):
     from types import SimpleNamespace
 
-    from .response_runtime import _export, _tensor_value_hash
+    from .response_runtime import MAX_EXPORT_BYTES, _export, _tensor_value_hash
 
     rows = slice(offset, offset + run.batch)
+    if x[rows].numel() * torch.float32.itemsize > MAX_EXPORT_BYTES - state.exports:
+        point["export_status"] = "export_budget"
+        return
     source = x[rows].float()
     clean = source - point["sigma"] * velocity[rows].float()
     context, mask, references = conditioning
@@ -325,7 +353,8 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
     from comfy.samplers import CFGGuider, KSAMPLER
 
     from .response_runtime import spectrum_all_actual
-    from .runtime import CONDITION_FLAGS, LOGGER, MAX_BATCH, RUN, STAGE, Run, finite_json, spatial_image, verify_patch_graph
+    from .runtime import (CONDITION_FLAGS, KEY, LOGGER, MAX_BATCH, RUN, STAGE, Run, finite_json, spatial_image,
+                          verify_patch_graph, wrappers)
 
     options = extra_args["model_options"]
     stage = options.get(STAGE, getattr(model_wrap, "model_options", {}).get(STAGE, "standalone"))
@@ -340,6 +369,8 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
     begin = perf_counter()
 
     def eligible():
+        if stage not in SCOPES[:-1]:
+            return "unsupported_sampler_stage"
         if type(seed) is not int:
             return "missing_seed"
         if type(executor.class_obj) is not KSAMPLER or type(model_wrap).predict_noise is not CFGGuider.predict_noise:
@@ -371,8 +402,12 @@ def sample_guidance(config, settings, executor, model_wrap, sigmas, extra_args, 
                 state.reason = str(exc)
         force_native = nullcontext()
         if state.reason is None and spectrum is not None:
-            force_native = spectrum_all_actual(spectrum)
-            if force_native is None:
+            order = tuple(wrappers(options).get("sampler_sample", {}))
+            if KEY not in order or order.index(KEY) > order.index("spectrum_krea2"):
+                state.reason = "projection_guidance_requires_outer_sampler_scope"
+            else:
+                force_native = spectrum_all_actual(spectrum)
+            if state.reason is None and force_native is None:
                 state.reason = "missing_spectrum_all_actual_contract"
         if state.reason is None:
             run = Run(settings, seed, 0., 1., batch, tuple(noise.shape), False,

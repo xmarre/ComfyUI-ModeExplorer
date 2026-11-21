@@ -513,3 +513,31 @@ def test_projection_guidance_stage_retry_and_local_oom(model, caplog, monkeypatc
         draw(guided, stage="planner", **settings)
     assert not block._forward_pre_hooks and not block.attn.wo._forward_hooks
     assert projection_guidance._ACTIVE.get() is None
+
+
+def test_projection_guidance_clean_export_has_single_native_conversion(model, caplog, monkeypatch, tmp_path):
+    import folder_paths
+    from safetensors.torch import load_file
+
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    process = model.model.process_latent_out
+    transformed = []
+
+    def convert(clean):
+        transformed.append(clean.detach().clone())
+        return process(clean)
+
+    monkeypatch.setattr(model.model, "process_latent_out", convert)
+    guided, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, scope="standalone",
+                                                    evaluations=1, export_clean=True, amplitude=.01)
+    with caplog.at_level(logging.INFO):
+        draw(guided, guider_basic=True)
+    point, = traces(caplog)[-1]["projection_guidance"]["points"]
+    assert point["export_status"] == "completed"
+    destination = tmp_path / "modeexplorer_response" / point["export_id"]
+    manifest = json.loads((destination / "manifest.json").read_text())
+    assert manifest["native_input_fp32_sha256"] and manifest["native_condition_values"]["context"]
+    assert len(transformed) == 2  # The selected clean prediction and the final sampled latent.
+    assert torch.equal(load_file(destination / "predictions.safetensors")["guided_clean"], process(transformed[0]))

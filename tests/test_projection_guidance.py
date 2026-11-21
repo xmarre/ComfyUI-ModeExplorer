@@ -50,7 +50,7 @@ def test_zero_energy_outlier_nonfinite_and_native_caps():
     assert apply(source, units="relative_rms")[1]["status"] == "unchanged"
     assert apply(source, mode="channel_aware")[1]["status"] == "applied"
     source.fill_(64.)
-    native, trace = apply(source, amplitude=.015, max_absolute_rms=.014)
+    native, trace = apply(source, amplitude=.025, max_absolute_rms=.02)
     assert native is None and trace["reason"] == "native_rounded_rms_limit"
     source[1, 2, 0] = torch.inf
     assert apply(source)[1]["reason"] == "nonfinite_projection_or_perturbation"
@@ -82,3 +82,19 @@ def test_explicit_schedule():
     sigma_only = Guidance(evaluations=0, min_sigma=.8, max_sigma=1., schedule="linear_decay")
     assert sigma_only.strength(13, .8) == Guidance.amplitude * .5
     assert sigma_only.strength(0, .79) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_production_projection_geometry_uses_bounded_cuda_workspace():
+    tokens = 154 * 102
+    source = torch.zeros((1, 512 + tokens, 6144), dtype=torch.float16, device="cuda")
+    torch.cuda.reset_peak_memory_stats(source.device)
+    baseline = torch.cuda.memory_allocated(source.device)
+    config = Guidance()
+    info = {}
+    result = perturb(source, (256, 256 + tokens), 0, 1, config, config.amplitude, [12347], info)
+    assert info["status"] == "applied"
+    assert info["rows"][0]["realized_rms"] == pytest.approx(config.amplitude, rel=1e-3)
+    assert torch.cuda.max_memory_allocated(source.device) - baseline <= info["estimated_owned_peak_bytes"]
+    assert torch.equal(result[:, :256], source[:, :256])
+    assert torch.equal(result[:, -256:], source[:, -256:])
