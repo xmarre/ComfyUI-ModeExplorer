@@ -580,6 +580,56 @@ def test_projection_guidance_clean_export_has_single_native_conversion(model, ca
     assert torch.equal(load_file(destination / "predictions.safetensors")["guided_clean"], process(transformed[0]))
 
 
+@pytest.mark.parametrize("mechanistic", [False, True])
+def test_compare_guidance_exports_from_combined_cfg(model, caplog, monkeypatch, tmp_path, mechanistic):
+    import folder_paths
+
+    from mode_explorer.nodes import ModeExplorerMechanistic, ModeExplorerProjectionGuidance, ModeExplorerResponse
+    from tools.analyze_guidance import compare
+
+    monkeypatch.setattr(type(model), "get_free_memory", lambda *_: 2**30)
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    guided, = ModeExplorerProjectionGuidance().apply(model, enabled=True, block=1, scope="standalone",
+                                                    evaluations=1, export_clean=True, amplitude=.01)
+    if mechanistic:
+        baseline, = ModeExplorerMechanistic().apply(
+            model, feature_block=1, blocks="1", sites="clean", evaluation=0, export=True, analysis_device="cpu",
+        )
+    else:
+        baseline, = ModeExplorerResponse().apply(model, evaluation=0, max_sigma=1., directions=1,
+                                                 calibration="off", export=True)
+    with caplog.at_level(logging.INFO, logger="ModeExplorer"):
+        draw(guided, cfg=2)
+        draw(baseline, cfg=2)
+
+    guided_trace, baseline_trace = traces(caplog)[-2:]
+    guided_point, = guided_trace["projection_guidance"]["points"]
+    baseline_point, = baseline_trace["response"]["points"]
+    assert guided_point["export_status"] == baseline_point["export_status"] == "completed"
+    assert guided_point["branches"] == baseline_point["branches"]
+    assert sorted(guided_point["branches"]) == [0, 1]
+    if mechanistic:
+        assert not baseline_point["mechanistic"]["baseline_reused"]
+    else:
+        assert baseline_point["baseline_reused"]
+    root = tmp_path / "modeexplorer_response"
+    guided_export, baseline_export = (root / point["export_id"] for point in (guided_point, baseline_point))
+    controls = [("mechanistic", baseline_export, "D01_clean")] if mechanistic else []
+    result = compare(guided_export, baseline_export, controls)
+    assert result["match_scope"] == "input_state"
+    assert result["model_equivalence"] == "requires_external_verification"
+    assert result["clean_displacement_rms"] > 0
+    if mechanistic:
+        assert -1 <= result["direction_alignment"]["mechanistic"] <= 1
+
+    manifest_path = baseline_export / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for field, value in (("native_condition_values", None), ("branches", list(reversed(baseline_point["branches"])))):
+        manifest_path.write_text(json.dumps({**manifest, field: value}))
+        with pytest.raises(ValueError, match=field):
+            compare(guided_export, baseline_export, controls)
+
+
 def test_projection_guidance_native_kitchen_int8_projection(model, caplog, monkeypatch):
     import comfy_kitchen as kitchen
     from comfy import ops

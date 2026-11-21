@@ -147,6 +147,13 @@ def _tensor_value_hash(tensor):
     return _tensor_hash(tensor)
 
 
+def _packed_condition_value_hashes(context, mask, refs):
+    return {
+        "context": _tensor_value_hash(context), "mask": _tensor_value_hash(mask),
+        "references": [_tensor_value_hash(ref) for ref in refs or ()],
+    }
+
+
 def read_export(export_id):
     from json import loads
     import folder_paths
@@ -334,12 +341,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                  native_input_sha256=_tensor_hash(latent), branches=list(options.get("cond_or_uncond", ())))
     if cfg.scorer is not None and cfg.selection == "external":
         point["scorer"] = getattr(cfg.scorer, "__qualname__", type(cfg.scorer).__qualname__)
-    if cfg.mechanistic is not None:
+    if cfg.mechanistic is not None or cfg.export:
         point["native_input_fp32_sha256"] = _tensor_value_hash(latent)
-        point["native_condition_values"] = {
-            "context": _tensor_value_hash(context), "mask": _tensor_value_hash(mask),
-            "references": [_tensor_value_hash(ref) for ref in refs or ()],
-        }
+        point["native_condition_values"] = _packed_condition_value_hashes(context, mask, refs)
 
     def spend(rows):
         throw_exception_if_processing_interrupted()
@@ -396,6 +400,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     raise ValueError("frozen_input_rounding_mismatch")
                 if cfg.mechanistic is not None:
                     point["frozen_source"] = {key: saved.get(key) for key in ("checkpoint_label", "input_dtype", "backend", "native_input_sha256")}
+                if cfg.mechanistic is not None or cfg.export:
                     point["native_input_fp32_sha256"] = _tensor_hash(saved_latent)
                 probe_seed = saved.get("probe_seed", saved.get("seed"))
                 if type(probe_seed) is not int:

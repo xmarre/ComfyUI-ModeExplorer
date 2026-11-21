@@ -91,10 +91,13 @@ def test_export_load_and_exact_frozen_replay(model, caplog, tmp_path, monkeypatc
     latent, sigmas = ModeExplorerLoadResponse().load(export_id, "baseline_clean")
     assert latent["samples"].shape == (1, 16, 1, 7, 11)
     assert torch.equal(sigmas, SIGMAS[[0, 1, -1]])
-    frozen = configured(model, frozen_state=export_id)
+    frozen = configured(model, frozen_state=export_id, export=True)
     assert torch.equal(draw(model, sigmas=sigmas, seed=89), draw(frozen, sigmas=sigmas, seed=89))
     new_point, = traces(caplog)[-1]["response"]["points"]
     assert new_point["native_input_sha256"] == point["native_input_sha256"]
+    assert new_point["export_status"] == "completed"
+    assert new_point["native_input_fp32_sha256"] == point["native_input_fp32_sha256"]
+    assert new_point["native_condition_values"] == point["native_condition_values"]
     assert not new_point["baseline_reused"]
     draw(frozen, sigmas=sigmas, reference=True)
     assert traces(caplog)[-1]["response"]["points"][0]["reason"] == "frozen_sigma_or_conditioning_mismatch"

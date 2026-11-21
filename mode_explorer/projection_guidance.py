@@ -366,7 +366,7 @@ def dispatch(forward, arguments, dit, run):
 def _export_clean(state, x, velocity, offset, run, point, conditioning):
     from types import SimpleNamespace
 
-    from .response_runtime import MAX_EXPORT_BYTES, _export, _tensor_value_hash
+    from .response_runtime import MAX_EXPORT_BYTES, _export, _packed_condition_value_hashes, _tensor_value_hash
 
     rows = slice(offset, offset + run.batch)
     if x[rows].numel() * torch.float32.itemsize > MAX_EXPORT_BYTES - state.exports:
@@ -374,15 +374,10 @@ def _export_clean(state, x, velocity, offset, run, point, conditioning):
         return
     source = x[rows].float()
     clean = source - point["sigma"] * velocity[rows].float()
-    context, mask, references = conditioning
     point.update(schema=1, stage=state.stage, seed=state.seed, trial=state.config.trial,
                  mode=state.config.mode, block=state.config.block, site=SITE,
                  native_input_fp32_sha256=_tensor_value_hash(source))
-    point["native_condition_values"] = {
-        "context": _tensor_value_hash(context[rows]),
-        "mask": _tensor_value_hash(mask[rows] if mask is not None and mask.ndim >= 3 and mask.shape[0] == x.shape[0] else mask),
-        "references": [_tensor_value_hash(ref[rows] if ref.shape[0] == x.shape[0] else ref) for ref in references or ()],
-    }
+    point["native_condition_values"] = _packed_condition_value_hashes(*conditioning)
     export = SimpleNamespace(exports=state.exports, process_latent_out=state.process_latent_out,
                              config=SimpleNamespace(export=True, mechanistic=None))
     _export(export, {"guided_clean": clean}, point)

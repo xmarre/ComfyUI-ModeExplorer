@@ -42,7 +42,11 @@ The weak and higher anchors test whether an independent weak edit has useful dow
 
 ## Optional downstream measurements
 
-Enable `export_clean` when a matched clean comparison is required. It saves the actual guided branch's clean prediction in the existing private response format within the shared 64 MiB per-pass payload limit. It adds CPU transfer, fingerprinting and file I/O and belongs outside the ordinary performance run. Use a same-state Response or Mechanistic export with `baseline_clean`. Following an earlier applied edit, later sampler evaluations normally see different noisy inputs. The comparison tool requires exact input and conditioning fingerprints and the same stage and sigma.
+Enable `export_clean` when a matched clean comparison is required. It saves the actual guided branch's clean prediction in the existing private response format within the shared 64 MiB per-pass payload limit. It adds CPU transfer, fingerprinting and file I/O and belongs outside the ordinary performance run. Use a same-state Response or Mechanistic export with `baseline_clean`. For the first actual evaluation near sigma 1, set the baseline's evaluation to 0 and its maximum sigma to 1.0. Following an earlier applied edit, later sampler evaluations normally see different noisy inputs.
+
+The comparison tool checks input-state equivalence using the positive noisy latent, packed conditioning tensors, CFG branch order, stage, and sigma. Independently verify the checkpoint weights, precision, LoRA patches, attention backend, and reference-processing method before interpreting the difference as a guidance effect. A Mechanistic baseline can come from an isolated positive replay, which can introduce numerical differences relative to the original packed dispatch. Its `sampler_velocity_baseline_rms_difference` records that discrepancy. Use an observational Response baseline with `baseline_reused=true` to compare the live packed predictions.
+
+Re-export older ordinary Response baselines that lack canonical fingerprints and older guided exports produced under combined CFG. Both arms must supply matching evidence before the tool will compare them.
 
 ```sh
 python -m tools.analyze_guidance GUIDED_EXPORT BASELINE_EXPORT \

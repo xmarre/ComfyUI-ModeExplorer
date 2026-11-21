@@ -1,4 +1,4 @@
-"""Compare clean predictions from matched frozen Krea 2 evaluations."""
+"""Compare Krea 2 clean predictions from inputs that match in externally verified equivalent models."""
 
 import argparse
 import json
@@ -29,9 +29,9 @@ def load(path, field):
 
 
 def matched(left, right):
-    for field in ("sigma", "stage", "native_input_fp32_sha256", "native_condition_values"):
+    for field in ("sigma", "stage", "branches", "native_input_fp32_sha256", "native_condition_values"):
         if field not in left or left[field] is None or left[field] != right.get(field):
-            raise ValueError(f"Frozen states differ or lack a verified {field}.")
+            raise ValueError(f"Input states differ or lack a verified {field}.")
 
 
 def l2(values):
@@ -50,7 +50,8 @@ def compare(guided_path, baseline_path, controls):
     fields = {"delta": ((1., delta),)}
     comparisons = {"guided": ((), ((1., "delta"),))}
     metrics = measure_comparisons(fields, comparisons, 16, .0625, .125, sample_stride=1, patch_size=2)["guided"]
-    result = {"sigma": guided["sigma"], "clean_space": "comfy_vae_latent",
+    result = {"match_scope": "input_state", "model_equivalence": "requires_external_verification",
+              "sigma": guided["sigma"], "clean_space": "comfy_vae_latent",
               "guidance_rms": intervention, "clean_displacement_rms": relative,
               "clean_to_projection_rms": relative / intervention if intervention else None,
               "clean_measurement": metrics, "direction_alignment": {}}
