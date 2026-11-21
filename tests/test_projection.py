@@ -155,7 +155,7 @@ def test_reference_uses_executed_runtime_weight_and_bias_functions():
 
 def test_emulation_epilogue_casts_before_adding_bias():
     from types import SimpleNamespace
-    from mode_explorer.projection_activation import ActivationStudy
+    from mode_explorer.projection_activation import ActivationStudy, CUDA
 
     ref = SimpleNamespace(storage=torch.ones((1, 1), dtype=torch.int8),
                           scale=torch.tensor([1.]), bias=torch.tensor([2.**-11], dtype=torch.float64))
@@ -164,7 +164,99 @@ def test_emulation_epilogue_casts_before_adding_bias():
     scaled_product = torch.tensor([[1. + 2.**-11]])
     output = study._epilogue(scaled_product, torch.ones(1, 1), torch.float16)
     assert output.item() == 1.
-    assert (scaled_product + ref.bias).half().item() == 1. + 2.**-10
+    fused = study._epilogue(scaled_product, torch.ones(1, 1), torch.float16, CUDA)
+    assert fused.item() == 1. + 2.**-10
+
+
+@pytest.mark.parametrize("group, fits, expected", [(256, True, "cuda_convrot64_fused"),
+                                                 (256, False, "cuda_split_convrot"),
+                                                 (64, True, "cuda_split_convrot"),
+                                                 (0, True, "cuda_rowwise")])
+def test_cuda_quantizer_dispatch_matches_audited_convrot_predicate(group, fits, expected):
+    from types import SimpleNamespace
+    from mode_explorer.projection_activation import CudaActivationPath
+
+    source = torch.zeros(1, 4, 6144, dtype=torch.float16)
+    rotation = torch.empty(group, group) if group else None
+    path = CudaActivationPath.__new__(CudaActivationPath)
+
+    def quantize(rows, *args):
+        assert rows.shape == (4, 6144) and rows.is_contiguous()
+        assert args == ((256,) if expected == "cuda_convrot64_fused" else ())
+        return rows.to(torch.int8), torch.ones(4, 1)
+
+    path.cuda = SimpleNamespace(
+        _CONVROT_FUSED_MAX_K=16384, _convrot_fused_shared_memory_fits=lambda *args: fits,
+        quantize_int8_rowwise_convrot64=quantize, quantize_int8_rowwise=quantize,
+        rotate_int8_convrot_weight=lambda value, size: value + size,
+    )
+    route, rotated, _, _ = path.quantize(source, rotation, lambda value, _: value + 1)
+    assert route == expected
+    if route == "cuda_convrot64_fused":
+        assert rotated is None
+        continuous = path.continuous_rotation(source[0], group)
+        assert continuous.dtype == torch.float32 and continuous[0, 0].item() == group
+    else:
+        assert rotated[0, 0].item() == 1
+
+
+def test_cuda_epilogue_uses_one_model_and_the_smallest_component_bound():
+    from mode_explorer.projection_activation import CUDA, EAGER, select_epilogue
+
+    signed = {
+        "odd": (20., ((.5, "plus"), (-.5, "minus"))),
+        "even": (1., ((.5, "plus"), (.5, "minus"), (-1., "base"))),
+    }
+
+    def checks(*errors):
+        return {arm: {"packed_bit_exact": error == 0., "packed_l2": error}
+                for arm, error in zip(("base", "plus", "minus"), errors)}
+
+    models = {CUDA: checks(.02, .02, .02), EAGER: checks(0., .15, 0.)}
+    selected, candidates = select_epilogue(models, signed, .05, allow_bounded=True)
+    assert selected == CUDA and candidates[CUDA]["qualification"] == "component_bounded"
+    assert candidates[CUDA]["components"]["even"]["model_l2_bound"] == pytest.approx(.04)
+    assert candidates[EAGER]["components"]["odd"]["qualified"]
+    assert not candidates[EAGER]["components"]["even"]["qualified"]
+    assert select_epilogue(models, signed, .05, allow_bounded=False)[0] is None
+    signed["even"] = (0., signed["even"][1])
+    assert select_epilogue(models, signed, .05, allow_bounded=True)[0] is None
+    models[EAGER] = checks(0., 0., 0.)
+    assert select_epilogue(models, signed, .05, allow_bounded=True)[0] == EAGER
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_native_cuda_fused_convrot_activation_replay():
+    import comfy_kitchen as kitchen
+    from importlib.metadata import version
+    from comfy_kitchen.registry import registry
+
+    backend = registry.list_backends().get("cuda", {})
+    if version("comfy-kitchen") not in ("0.2.40", "0.2.41") or not backend.get("available") or backend.get("disabled"):
+        pytest.skip("audited Kitchen CUDA extension is unavailable")
+    with torch.inference_mode(), kitchen.use_backend("cuda"):
+        device = "cuda"
+        generator = torch.Generator().manual_seed(112)
+        weight = torch.randn((256, 6144), generator=generator).to(device=device, dtype=torch.float16)
+        layer = ops.mixed_precision_ops(compute_dtype=torch.float16).Linear(6144, 256, device=device).eval()
+        layer.weight = torch.nn.Parameter(QuantizedTensor.from_float(
+            weight, "TensorWiseINT8Layout", convrot=True, convrot_groupsize=256, per_channel=True,
+        ), requires_grad=False)
+        layer.quant_format = "int8_tensorwise"
+        layer.layout_type = "TensorWiseINT8Layout"
+        layer.bias.copy_(torch.randn(256, generator=generator).to(device) * .125)
+        x = torch.randn((1, 8, 6144), generator=generator).to(device=device, dtype=torch.float16)
+        edit = torch.randn((1, 8, 6144), generator=generator).to(device=device, dtype=torch.float16) * .025
+        report = run_study(layer, record(layer, {"D00": x, "D01": x + edit, "D0minus": x - edit}),
+                           projection_activation_check=True)
+    activation = report["activation_counterfactual"]
+    assert activation["backend_dispatch_candidate"] == "cuda"
+    assert activation["status"] == "qualified", activation
+    assert all(route["quantizer"] == "cuda_convrot64_fused" for route in activation["packed_routes"].values())
+    assert activation["quantization_transitions"]["full"]["codes_one_sign_only"] > 0
+    for component in ("even", "odd"):
+        assert activation["component_floors"][component]["qualified"]
+        assert "activation_quantization" in activation["components"][component]
 
 
 @pytest.mark.parametrize("reject", ["mismatch", "backend"])

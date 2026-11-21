@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
 from .mechanism import measure_comparisons
-from .projection_activation import ActivationStudy, EagerAccumulationUnavailable, stage_metrics, transitions
+from .projection_activation import ActivationStudy, ActivationUnavailable, EAGER, select_epilogue, stage_metrics, transitions
 
 
 class ProjectionUnavailable(ValueError):
@@ -242,7 +242,7 @@ def _replay_error(result, cap, grid, spec, patch, chunk):
     return metrics
 
 
-def _activation_stages(reference, captures, spec, report, timing, interrupt):
+def _activation_stages(reference, captures, components, floors, spec, report, timing, interrupt):
     info = report["activation_counterfactual"] = {"status": "unqualified", "packed_emulation": {},
                                                  "reference_matmul_passes": 0}
     if reference.storage is None:
@@ -250,31 +250,54 @@ def _activation_stages(reference, captures, spec, report, timing, interrupt):
         return None
     if any(cap.inputs.dtype not in (torch.float16, torch.bfloat16, torch.float32) or
            cap.output.dtype != cap.inputs.dtype for cap in captures.values()):
-        info["reason"] = "unsupported_eager_activation_or_output_dtype"
+        info["reason"] = "unsupported_activation_or_output_dtype"
+        return None
+    backend = reference.contract["backend_dispatch_candidate"]
+    info["backend_dispatch_candidate"] = backend
+    if backend not in ("cuda", "eager"):
+        info["reason"] = "unsupported_activation_backend"
         return None
     try:
-        study = ActivationStudy(reference, spec, interrupt)
+        study = ActivationStudy(reference, spec, interrupt, backend)
     except ImportError:
-        info["reason"] = "eager_int8_contract_unavailable"
+        info["reason"] = "kitchen_int8_contract_unavailable"
+        return None
+    except ActivationUnavailable as exc:
+        info["reason"] = str(exc)
         return None
 
     arms = {}
+    checks = {model: {} for model in study.epilogues}
+    info["packed_routes"] = {}
     device = reference.weight.device
     with timing.measure("projection_activation_emulation", device):
         for name, cap in captures.items():
             try:
-                status, arm = study.qualify(cap.inputs, cap.output, cap.bounds)
-            except EagerAccumulationUnavailable:
-                info["reason"] = "eager_int8_accumulation_unavailable"
+                route, stats, arms[name] = study.replay(cap.inputs, cap.output, cap.bounds, study.epilogues)
+            except ActivationUnavailable as exc:
+                info["reason"] = str(exc)
                 return None
-            info["packed_emulation"][name] = status
-            if arm is not None:
-                arms[name] = arm
-        if len(arms) != len(captures):
-            info["reason"] = "packed_eager_emulation_mismatch"
+            info["packed_routes"][name] = route
+            for model, check in stats.items():
+                checks[model][name] = check
+        responses = {name: (floors[name]["native_l2"], terms) for name, terms in components.items()}
+        epilogue, candidates = select_epilogue(checks, responses, spec.projection_replay_fraction, backend == "cuda")
+        info["epilogue_candidates"] = candidates
+        if epilogue is None:
+            if backend == "eager":
+                info["packed_emulation"] = checks[EAGER]
+                info["reason"] = "packed_eager_emulation_mismatch"
+            else:
+                info["rejected_packed_emulations"] = checks
+                info["reason"] = "cuda_epilogue_exceeds_component_floor"
             return None
-        info["quantization_observation"] = "eager_emulated_codes_and_row_scales_after_packed_bitwise_match"
-        info["epilogue_model"] = "fp32_row_scale_times_weight_scale_then_product_output_cast_then_bias_add"
+        selected = candidates[epilogue]
+        info.update(packed_emulation=checks[epilogue], epilogue_model=epilogue,
+                    qualification=selected["qualification"], component_floors=selected["components"])
+        info["quantization_observation"] = (
+            "replayed_kitchen_cuda_quantizer_codes_and_row_scales" if backend == "cuda" else
+            "eager_emulated_codes_and_row_scales_after_packed_bitwise_match"
+        )
         qualify_pairs = {}
         if "D0minus" in arms:
             qualify_pairs["full"] = ("D01", "D0minus")
@@ -286,24 +309,36 @@ def _activation_stages(reference, captures, spec, report, timing, interrupt):
         }
 
     staged = {}
-    with timing.measure("projection_activation_reference", device):
-        for name, cap in captures.items():
-            arm = arms[name] if name == "D00" and spec.projection_symmetric_check else arms.pop(name)
-            staged[name] = study.without_quantization(cap.inputs, arm, cap.bounds, cap.output.dtype)
-            info["reference_matmul_passes"] += 1 + int(reference.rotation is not None)
+    try:
+        with timing.measure("projection_activation_reference", device):
+            for name, cap in captures.items():
+                arm = arms[name] if name == "D00" and spec.projection_symmetric_check else arms.pop(name)
+                staged[name] = study.without_quantization(cap.inputs, arm, cap.bounds, cap.output.dtype, epilogue)
+                info["reference_matmul_passes"] += 1 + int(reference.rotation is not None)
+    except ActivationUnavailable as exc:
+        info["reason"] = str(exc)
+        return None
     info.update(status="qualified", components={})
-    return study, staged, arms.get("D00")
+    return study, staged, arms.get("D00"), epilogue
 
 
-def _symmetric_activation(activation, source, native, bounds, name, info, timing):
-    study = activation[0]
+def _symmetric_activation(study, epilogue, source, native, bounds, name, info, timing):
     with timing.measure("projection_activation_emulation", source.device):
         try:
-            check, arm = study.qualify(source, native, bounds)
-        except EagerAccumulationUnavailable:
-            check, arm = {"packed_bit_exact": False, "reason": "eager_int8_accumulation_unavailable"}, None
-    info["packed_emulation"][name] = check
+            route, checks, arm = study.replay(source, native, bounds, (epilogue,))
+        except ActivationUnavailable as exc:
+            info["reason"] = str(exc)
+            return None
+    info["packed_routes"][name] = route
+    info["packed_emulation"][name] = checks[epilogue]
     return arm
+
+
+def _resolved_activation(metrics, model_floor):
+    metrics["model_l2_bound"] = model_floor["model_l2_bound"]
+    metrics["activation_quantization_resolved"] = (
+        metrics["activation_quantization"]["displacement_l2"] > 4 * model_floor["model_l2_bound"]
+    )
 
 
 def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timing, interrupt, activation):
@@ -338,11 +373,18 @@ def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timin
         return
     result = evaluate(x, base)
     if activation is not None:
-        stages_info = info["activation_counterfactual"] = {"status": "unqualified", "packed_emulation": {}}
-        plus_arm = _symmetric_activation(activation, x, result, base.bounds, "plus", stages_info, timing)
+        study, stages, base_arm, epilogue = activation
+        stages_info = info["activation_counterfactual"] = {
+            "status": "unqualified", "packed_emulation": {}, "packed_routes": {}, "epilogue_model": epilogue,
+        }
+        plus_arm = _symmetric_activation(study, epilogue, x, result, base.bounds, "plus", stages_info, timing)
         if plus_arm is not None:
-            with timing.measure("projection_activation_reference", device):
-                plus_stages = activation[0].without_quantization(x, plus_arm, base.bounds, result.dtype)
+            try:
+                with timing.measure("projection_activation_reference", device):
+                    plus_stages = study.without_quantization(x, plus_arm, base.bounds, result.dtype, epilogue)
+            except ActivationUnavailable as exc:
+                stages_info["reason"] = str(exc)
+                plus_arm = None
     plus = result[0, lo:hi].clone()
     del result
     with timing.measure("projection_reference", device):
@@ -351,12 +393,34 @@ def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timin
             x[:, start:stop] = 2 * base.inputs[:, start:stop].double() - x[:, start:stop].double()
     result = evaluate(x, base)
     minus = result[0, lo:hi]
-    if activation is not None:
-        minus_arm = _symmetric_activation(activation, x, result, base.bounds, "minus", stages_info, timing)
+    if activation is not None and plus_arm is not None:
+        minus_arm = _symmetric_activation(study, epilogue, x, result, base.bounds, "minus", stages_info, timing)
+        if minus_arm is not None:
+            # The positive image slice is retained by the native probe after
+            # its full packed output has been qualified and released.
+            native_pair = {"D00": base, "plus": ProjectionCapture((0, hi - lo), None, {}, plus.unsqueeze(0)),
+                           "minus": ProjectionCapture(base.bounds, None, {}, result)}
+            pair_checks = dict(stages_info["packed_emulation"], D00=report["activation_counterfactual"]["packed_emulation"]["D00"])
+            terms = {"odd": ((.5, "plus"), (-.5, "minus")),
+                     "even": ((.5, "plus"), (.5, "minus"), (-1., "D00"))}
+            sizes = {name: (_response_sizes(native_pair, ts, spec.projection_token_chunk), ts)
+                     for name, ts in terms.items()}
+            selected, candidates = select_epilogue({epilogue: pair_checks}, sizes, spec.projection_replay_fraction,
+                                                   study.cuda_path is not None)
+            stages_info["component_floors"] = candidates[epilogue]["components"]
+            stages_info["qualification"] = candidates[epilogue]["qualification"]
+            if selected is None:
+                stages_info["reason"] = ("cuda_epilogue_exceeds_component_floor" if study.cuda_path else
+                                         "packed_eager_emulation_mismatch")
+                minus_arm = None
         if plus_arm is not None and minus_arm is not None:
-            study, stages, base_arm = activation
-            with timing.measure("projection_activation_reference", device):
-                minus_stages = study.without_quantization(x, minus_arm, base.bounds, result.dtype)
+            try:
+                with timing.measure("projection_activation_reference", device):
+                    minus_stages = study.without_quantization(x, minus_arm, base.bounds, result.dtype, epilogue)
+            except ActivationUnavailable as exc:
+                stages_info["reason"] = str(exc)
+                minus_arm = None
+        if minus_arm is not None:
             with timing.measure("projection_activation_emulation", device):
                 stages_info["quantization_transitions"] = transitions(base_arm, plus_arm, minus_arm, study.token_chunk, interrupt)
             del plus_arm, minus_arm
@@ -374,11 +438,10 @@ def _symmetric_probe(captures, evaluate, spec, grid, patch, chunk, report, timin
                 n = even(plus, minus, base.output[0, lo:hi])
                 q, r = (even(p, m, b) for p, m, b in zip(plus_stages, minus_stages, c0))
             with timing.measure("projection_spectral", device):
-                stages_info["even"] = stage_metrics(n, q, r, torch.zeros_like(n), grid, spec, patch, chunk)
+                stages_info["even"] = stage_metrics(n, q, r, torch.zeros_like(n), grid, spec, patch, chunk, epilogue)
+            _resolved_activation(stages_info["even"], stages_info["component_floors"]["even"])
             stages_info.update(status="qualified",
                                reference_matmul_passes=2 * (1 + int(study.reference.rotation is not None)))
-        else:
-            stages_info["reason"] = "packed_eager_emulation_mismatch"
     with timing.measure("projection_spectral", device):
         y0 = base.output[0, lo:hi].float()
         pos, neg = plus.float() - y0, minus.float() - y0
@@ -485,7 +548,8 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
     report["reference_dtype"] = "torch.float64"
     report["reference_equivalence"] = "same_observed_operands_across_packed_native_replays"
     report["components"] = {}
-    activation = _activation_stages(reference, captures, spec, report, timing, interrupt) if spec.projection_activation_check else None
+    activation = (_activation_stages(reference, captures, components, floors, spec, report, timing, interrupt)
+                  if spec.projection_activation_check else None)
     chosen = None
     for name, terms in components.items():
         with timing.measure("projection_reference", device):
@@ -524,9 +588,11 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
         report["components"][name] = metrics
         if activation is not None:
             with timing.measure("projection_spectral", device):
-                report["activation_counterfactual"]["components"][name] = stage_metrics(
-                    native, no_quant, no_rotation, linear, grid, spec, patch, chunk,
+                stages_info = report["activation_counterfactual"]
+                metrics = stages_info["components"][name] = stage_metrics(
+                    native, no_quant, no_rotation, linear, grid, spec, patch, chunk, activation[3],
                 )
+                _resolved_activation(metrics, stages_info["component_floors"][name])
         if spec.projection_effect == name and spec.projection_study != "observe":
             if spec.projection_study == "control" and metrics["residual_resolved"]:
                 generator = torch.Generator(device=device).manual_seed(seed)
