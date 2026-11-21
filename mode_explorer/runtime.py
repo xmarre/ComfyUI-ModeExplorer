@@ -186,6 +186,7 @@ class Frame:
     tap_grid: int = 4
     sol_evaluations: int | None = None
     anchor_blocks: tuple[int, ...] = ()
+    mechanistic_capture: object = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -469,6 +470,8 @@ def attention_feature(output, options):
     if frame is None or options.get("block_type") != "single":
         return output
     block = options.get("block_index")
+    if frame.mechanistic_capture is not None:
+        return frame.mechanistic_capture.attention(output, options, frame)
     if frame.anchor_blocks:
         if block in frame.anchor_blocks:
             if block in frame.taps:
@@ -1022,7 +1025,8 @@ class SamplerWrapper:
                     eligibility = "missing_spectrum_all_actual_contract"
                     force_native = nullcontext()
             run.response = ResponseRun(response, model_wrap.inner_model.process_latent_out, eligibility,
-                                       cfg_scale=getattr(model_wrap, "cfg", None))
+                                       cfg_scale=getattr(model_wrap, "cfg", None),
+                                       base_model=model_wrap.inner_model if response.mechanistic is not None else None)
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:

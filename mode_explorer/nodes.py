@@ -227,6 +227,77 @@ class ModeExplorerResponse:
 
 
 
+class ModeExplorerMechanistic:
+    CATEGORY = ModeExplorer.CATEGORY
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    DESCRIPTION = "Measure signed or conditioning-dependent Krea 2 feature response at native image sites."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .mechanism import COMPONENTS, FILTERS, MODES, MechanisticSettings
+
+        common = ModeExplorerResponse.INPUT_TYPES()
+        defaults = MechanisticSettings()
+
+        def number(kind, name, lo, hi, **extra):
+            return (kind, {"default": getattr(defaults, name), "min": lo, "max": hi, **extra})
+
+        optional = {key: common["optional"][key] for key in (
+            "clean_limit", "candidate_gain", "candidate_target_rms", "feature_block", "feature_grid",
+            "feature_strength", "feature_references", "export", "checkpoint_label", "frozen_state",
+            "require_conditioning", "require_fidelity", "reference_min_sigma", "reference_start_sigma", "scorer",
+        )}
+        return {"required": {
+            "model": ("MODEL",), "enabled": ("BOOLEAN", {"default": True}),
+            "experiment": (list(MODES), {"default": defaults.mode}),
+            "blocks": ("STRING", {"default": defaults.blocks, "tooltip": "Comma-separated blocks or inclusive ranges."}),
+            "sites": ("STRING", {"default": defaults.sites, "tooltip": "See the mechanistic research guide for exact native sites."}),
+            "component": (list(COMPONENTS), {"default": defaults.component}),
+            "band": (list(FILTERS), {"default": defaults.band}),
+            "treatment": (["export_only", "minimum_change", "external"], {"default": "export_only"}),
+            "evaluation": common["required"]["evaluation"],
+            "states": ("INT", {"default": 1, "min": 1, "max": 3}),
+            "min_sigma": ("FLOAT", {"default": .82, "min": 0., "max": 1., "step": .00001}),
+            "max_sigma": ("FLOAT", {"default": 1., "min": 0., "max": 1., "step": .00001}),
+            "auxiliary_budget": ("INT", {"default": 24, "min": 0, "max": 48}),
+            "memory_mb": ("INT", {"default": 768, "min": 16, "max": 1024}),
+            "capture_mib": number("INT", "capture_mib", 16, 8192),
+        }, "optional": {
+            **optional,
+            "alternate": ("CONDITIONING",),
+            "chunk": number("INT", "chunk", 1, 64),
+            "cell": number("INT", "cell", -1, 255),
+            "low_cut": number("FLOAT", "low_cut", .001, .7, step=.001),
+            "high_cut": number("FLOAT", "high_cut", .001, .7, step=.001),
+            "transition": number("FLOAT", "transition", 0., .25, step=.001),
+            "symmetry_limit": number("FLOAT", "symmetry_limit", 0., 1., step=.001),
+            "amplitude_check": ("BOOLEAN", {"default": False}),
+            "repeat_baseline": ("BOOLEAN", {"default": False}),
+            "checkpoint_provenance": (["", "same_execution", "alternate_execution", "dequantized_approximation",
+                                       "original_weights", "different_weights"], {"default": ""}),
+            "trial": common["required"]["trial"],
+        }}
+
+    def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False, **options):
+        from .mechanism import MechanisticSettings
+
+        if not enabled:
+            return ModeExplorerResponse().apply(model, enabled=False)
+        spec_fields = MechanisticSettings.__dataclass_fields__.keys() - {"mode"}
+        spec = MechanisticSettings(mode=experiment, **{key: options.pop(key) for key in spec_fields & options.keys()})
+        for block in spec.block_ids:
+            ModeExplorer.verify_model(model, block)
+        if spec.component == "observe" and treatment != "export_only":
+            raise ValueError("Select a component for active mechanistic steering.")
+        return ModeExplorerResponse().apply(
+            model, mode="feature_replay" if treatment == "export_only" else "feature_steer",
+            selection=treatment, mechanistic=spec, all_actual=True,
+            calibration="repeat_and_half" if repeat_baseline else "off",
+            **{"min_sigma": .82, "max_sigma": 1., "auxiliary_budget": 24, "memory_mb": 768, **options},
+        )
+
+
 class ModeExplorerLoadResponse:
     CATEGORY = ModeExplorer.CATEGORY
     RETURN_TYPES = ("LATENT", "SIGMAS")

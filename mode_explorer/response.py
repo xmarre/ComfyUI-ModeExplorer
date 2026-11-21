@@ -68,6 +68,7 @@ class ResponseSettings:
     reference_min_sigma: float = -1.0
     reference_start_sigma: float = -1.0
     probe_precision: str = "auto"
+    mechanistic: object = None
 
     def __post_init__(self):
         for key, choices in (
@@ -82,7 +83,7 @@ class ResponseSettings:
                 raise ValueError(f"Unknown ModeExplorer response {key}.")
         for key, low, high in (
             ("probe_grid", 1, 16), ("directions", 1, 4), ("trial", 0, 65535),
-            ("evaluation", -1, 127), ("states", 1, MAX_STATES), ("auxiliary_budget", 0, 48),
+            ("evaluation", -1, 127), ("states", 1, 3 if self.mechanistic is not None else MAX_STATES), ("auxiliary_budget", 0, 48),
             ("memory_mb", 16, MAX_WORKSPACE_MIB), ("feature_block", 0, 63), ("feature_grid", 1, 16),
             ("latent_cell", -1, 255), ("head", -1, 255), ("cell", -1, 255), ("feature_references", 1, 3),
         ):

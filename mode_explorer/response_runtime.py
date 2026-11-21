@@ -34,6 +34,7 @@ class ResponseRun:
     points: list = field(default_factory=list)
     last_sigma: float | None = None
     cfg_scale: float | None = None
+    base_model: object = None
 
 
 class ResponseBudget(RuntimeError):
@@ -262,7 +263,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     latent = x[row]
     wants_latent = cfg.mode in ("latent_probe", "joint_probe", "latent_steer") or cfg.selection == "response_alignment"
     wants_latent |= cfg.feature_projection == "response_subspace"
-    wants_feature = cfg.mode in ("feature_replay", "joint_probe", "feature_steer")
+    wants_feature = cfg.mechanistic is None and cfg.mode in ("feature_replay", "joint_probe", "feature_steer")
     before, rows_before = response.forwards, response.rows
 
     # Account for retained latent-size fields plus temporary packed latents and
@@ -335,6 +336,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 saved, data = read_export(cfg.frozen_state)
                 matched = ("sigma", "timestep", "input_dtype", "conditioning_sha256", "attention_mask_sha256",
                            "reference_latent_sha256", "reference_method", "branches", "noise_scale", "cfg_scale")
+                precision = cfg.mechanistic is not None and cfg.mechanistic.checkpoint_provenance == "alternate_execution"
+                if precision:
+                    matched = tuple(key for key in matched if key != "input_dtype")
                 if any(saved.get(key) != point.get(key) for key in matched):
                     raise ValueError("frozen_sigma_or_conditioning_mismatch")
                 with safe_open(data, framework="pt", device="cpu") as package:
@@ -344,6 +348,9 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                 latent = saved_latent.to(device=latent.device, dtype=latent.dtype)
                 if not torch.equal(latent.float().cpu(), saved_latent):
                     raise ValueError("frozen_input_rounding_mismatch")
+                if cfg.mechanistic is not None:
+                    point["frozen_source"] = {key: saved.get(key) for key in ("checkpoint_label", "input_dtype", "backend", "native_input_sha256")}
+                    point["frozen_input_fp32_sha256"] = _tensor_hash(saved_latent)
                 probe_seed = saved.get("probe_seed", saved.get("seed"))
                 if type(probe_seed) is not int:
                     raise ValueError("frozen_probe_seed_missing")
@@ -376,6 +383,32 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
                 point.update(status="rejected", reason=str(exc) if isinstance(exc, ValueError) else "frozen_input_unavailable")
                 return velocity
+
+        if cfg.mechanistic is not None:
+            from .mechanism_runtime import CaptureLimit, research_response
+            from .runtime import finite_json
+
+            try:
+                result, tensors = research_response(
+                    executor, run, frame, latent, x, timesteps, context, mask, refs, clean_options,
+                    kwargs, velocity, point, spend, reference_sigma, initial_sol_evaluations, sol_evaluations, probe_seed,
+                )
+            except CaptureLimit as exc:
+                point.update(status="skipped", reason=str(exc))
+                return velocity
+            except ValueError as exc:
+                reason = str(exc)
+                point.update(status="skipped" if reason == "auxiliary_forward_budget" else "rejected", reason=reason)
+                return velocity
+            if tensors:
+                point["auxiliary_dit_calls"] = response.forwards - before
+                point["auxiliary_dit_rows"] = response.rows - rows_before
+                export_point = finite_json(point)
+                _export(response, tensors, export_point)
+                for key in ("export_status", "export_id"):
+                    if key in export_point:
+                        point[key] = export_point[key]
+            return result
 
         baseline_taps = {} if wants_feature and cfg.downstream else None
         baseline_frame = Frame(frame.grid, 1, frame.offset, "response_capture", run, sigma, taps=baseline_taps,
