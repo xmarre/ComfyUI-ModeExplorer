@@ -434,3 +434,82 @@ def test_optional_sol_isolation(caplog, model):
     assert sol._ACTIVE.get() is None and sol._EXECUTION.get() is None
     with pytest.raises(RuntimeError, match="before the verified Sol"):
         ModeExplorer().apply(sol.install(model, sol.Settings()))
+
+
+@pytest.mark.parametrize("split_cfg", [False, True])
+def test_projection_guidance_native_calls_cfg_batch_and_rng(model, caplog, split_cfg):
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    node = ModeExplorerProjectionGuidance()
+    assert node.apply(model)[0] is model
+    assert node.apply(model, enabled=True, amplitude=0)[0] is model
+    guided, = node.apply(model, enabled=True, block=2, scope="standalone", amplitude=.009)
+    original = model.get_model_object("diffusion_model")
+    projection = original.blocks[2].attn.wo
+    calls = []
+    handle = projection.register_forward_pre_hook(lambda *args: calls.append(1))
+    try:
+        initial = torch.random.get_rng_state()
+        kwargs = dict(cfg=2., batch=2, mixed=True, reference=True, split_cfg=split_cfg, sampler="er_sde")
+        with caplog.at_level(logging.INFO):
+            baseline = draw(model, **kwargs)
+            baseline_rng = torch.random.get_rng_state()
+            base_calls = len(calls)
+            torch.random.set_rng_state(initial)
+            edited = draw(guided, **kwargs)
+            assert torch.equal(torch.random.get_rng_state(), baseline_rng)
+            assert len(calls) == 2 * base_calls
+            torch.random.set_rng_state(initial)
+            repeated = draw(guided, **kwargs)
+    finally:
+        handle.remove()
+    assert torch.equal(edited, repeated)
+    assert not torch.equal(edited, baseline)
+    trace = traces(caplog)[-1]["projection_guidance"]
+    assert trace["auxiliary_dit_calls"] == trace["auxiliary_projection_calls"] == 0
+    first, second = trace["points"]
+    assert [first["evaluation"], second["evaluation"]] == [0, 1]
+    assert first["stream_seeds"] != second["stream_seeds"]
+    assert first["stream_seeds"][0] != first["stream_seeds"][1]
+    assert all(point["status"] == "applied" and point["generated_image_tokens"] == 24 for point in trace["points"])
+    assert not projection._forward_hooks and not original.blocks[2]._forward_pre_hooks
+    assert node.apply(guided, enabled=False)[0].get_wrappers("diffusion_model", KEY) == []
+    with pytest.raises(ValueError, match="separate MODEL"):
+        ModeExplorer().apply(guided)
+
+
+def test_projection_guidance_stage_retry_and_local_oom(model, caplog, monkeypatch):
+    from mode_explorer import projection_guidance
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    node = ModeExplorerProjectionGuidance()
+    guided, = node.apply(model, enabled=True, block=0, scope="planner", evaluations=1)
+    settings = dict(sigmas=torch.tensor([1., .99, .99, .85, 0.]))
+    baseline = draw(model, **settings)
+    assert torch.equal(draw(guided, stage="highres", **settings), baseline)
+    with caplog.at_level(logging.INFO):
+        assert not torch.equal(draw(guided, stage="planner", **settings), baseline)
+    assert len(traces(caplog)[-1]["projection_guidance"]["points"]) == 1
+    guided, = node.apply(guided, enabled=True, block=1, scope="planner", evaluations=0)
+
+    def oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("fixture")
+
+    monkeypatch.setattr(projection_guidance, "perturb", oom)
+    with caplog.at_level(logging.INFO):
+        assert torch.equal(draw(guided, stage="planner", **settings), baseline)
+    evidence = traces(caplog)[-1]["projection_guidance"]["points"]
+    assert [p["evaluation"] for p in evidence] == [0, 1, 2, 3]
+    assert evidence[1]["sigma"] == evidence[2]["sigma"] and evidence[1]["stream_seeds"] != evidence[2]["stream_seeds"]
+    assert {p["reason"] for p in evidence} == {"projection_workspace_oom"}
+    block = model.get_model_object("diffusion_model").blocks[1]
+    assert not block._forward_pre_hooks and not block.attn.wo._forward_hooks
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("native forward failed")
+
+    monkeypatch.setattr(block.attn.wo, "forward", fail)
+    with pytest.raises(RuntimeError, match="native forward failed"):
+        draw(guided, stage="planner", **settings)
+    assert not block._forward_pre_hooks and not block.attn.wo._forward_hooks
+    assert projection_guidance._ACTIVE.get() is None

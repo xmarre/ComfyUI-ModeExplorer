@@ -150,6 +150,7 @@ class Run:
     points: list[dict] = field(default_factory=list)
     reasons: set[str] = field(default_factory=set)
     response: object = None
+    guidance: object = None
 
 
 @dataclass
@@ -722,6 +723,11 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             })
         return result
 
+    if run.guidance is not None:
+        from .projection_guidance import dispatch
+
+        return dispatch(forward, arguments, executor.class_obj, run)
+
     response_active = run.response is not None and run.response.eligibility is None
     if not (run.feature_active or run.settings.diagnostics or response_active) or spatial_image(x) is None:
         return forward(arguments)
@@ -916,9 +922,10 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evalua
 
 
 class SamplerWrapper:
-    def __init__(self, settings, response=None):
+    def __init__(self, settings, response=None, guidance=None):
         self.settings = settings
         self.response = response
+        self.guidance = guidance
 
     def __call__(self, executor, model_wrap, sigmas, extra_args, callback, noise,
                  latent_image=None, denoise_mask=None, disable_pbar=False):
@@ -930,6 +937,10 @@ class SamplerWrapper:
 
         settings = self.settings
         model_options = extra_args["model_options"]
+        if self.guidance is not None:
+            from .projection_guidance import sample_guidance
+
+            return sample_guidance(self.guidance, settings, executor, model_wrap, sigmas, extra_args, noise, sample)
         if model_options.get(STAGE) == "highres" or getattr(model_wrap, "model_options", {}).get(STAGE) == "highres":
             return sample()
         spectrum, sol = verify_patch_graph(model_options, settings)

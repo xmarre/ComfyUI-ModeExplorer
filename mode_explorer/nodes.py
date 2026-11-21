@@ -76,8 +76,11 @@ class ModeExplorer:
         samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
         response = next((wrapper.response for wrapper in samplers
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
+        guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
         active = enabled and (diagnostics or (strength != 0 and (feature != "native" or initialization)))
+        if active and guidance is not None:
+            raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")
         if not active and not attached:
             return (model,)
         settings = Settings(feature="native")
@@ -98,10 +101,11 @@ class ModeExplorer:
         clone = model.clone()
         if attached:
             _remove_modeexplorer_wrappers(clone)
-        if active or response is not None:
-            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response))
+        if active or response is not None or guidance is not None:
+            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response, guidance))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
-            clone.set_model_attn1_output_patch(attention_feature)
+            if guidance is None:
+                clone.set_model_attn1_output_patch(attention_feature)
         return (clone,)
 
     @staticmethod
@@ -196,6 +200,8 @@ class ModeExplorerResponse:
         samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
         if not enabled and not any(getattr(wrapper, "response", None) is not None for wrapper in samplers):
             return (model,)
+        if any(getattr(wrapper, "guidance", None) is not None for wrapper in samplers):
+            raise ValueError("Use separate MODEL branches for projection guidance and Response or Mechanistic.")
         if "feature_grid" in options:
             options["feature_grid"] = int(options["feature_grid"])
         config = ResponseSettings(**options) if enabled else None
@@ -310,6 +316,65 @@ class ModeExplorerMechanistic:
             calibration="repeat_and_half" if repeat_baseline else "off",
             **{"min_sigma": .82, "max_sigma": 1., "auxiliary_budget": 24, "memory_mb": 768, **options},
         )
+
+
+class ModeExplorerProjectionGuidance:
+    CATEGORY = ModeExplorer.CATEGORY
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    DESCRIPTION = "Experimental Krea 2 image-token perturbation at the native attention output projection."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .projection_guidance import Guidance, MODES, SCHEDULES, SCOPES, UNITS
+
+        def number(kind, name, minimum, maximum, step=1):
+            return (kind, {"default": getattr(Guidance, name), "min": minimum, "max": maximum, "step": step})
+
+        return {"required": {
+            "model": ("MODEL",),
+            "enabled": ("BOOLEAN", {"default": False}),
+            "mode": (list(MODES), {"default": Guidance.mode}),
+            "units": (list(UNITS), {"default": Guidance.units}),
+            "amplitude": number("FLOAT", "amplitude", 0., 1., .000001),
+            "block": number("INT", "block", 0, 63),
+            "evaluations": ("INT", {"default": 2, "min": 0, "max": 64, "tooltip": "First N actual positive evaluations. 0 uses only the sigma window."}),
+            "min_sigma": number("FLOAT", "min_sigma", 0., 1.00001, .00001),
+            "max_sigma": number("FLOAT", "max_sigma", 0., 1.00001, .00001),
+            "schedule": (list(SCHEDULES), {"default": Guidance.schedule}),
+            "scope": (list(SCOPES), {"default": Guidance.scope}),
+            "trial": number("INT", "trial", 0, 2**31 - 1),
+            "max_absolute_rms": number("FLOAT", "max_absolute_rms", .000001, 1., .000001),
+            "max_relative_rms": ("FLOAT", {"default": 0., "min": 0., "max": 1., "step": .000001, "tooltip": "Optional additional limit relative to native projection RMS. 0 disables this limit."}),
+            "export_clean": ("BOOLEAN", {"default": False, "tooltip": "Save clean predictions at selected evaluations for matched diagnostic comparisons. Adds device-to-host work."}),
+        }}
+
+    def apply(self, model, enabled=False, **options):
+        from comfy.patcher_extension import WrappersMP
+
+        from .projection_guidance import Guidance
+
+        samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+        attached = any(getattr(wrapper, "guidance", None) is not None for wrapper in samplers)
+        config = Guidance(**options) if enabled and options.get("amplitude", Guidance.amplitude) != 0 else None
+        if config is None and not attached:
+            return (model,)
+        if config is not None:
+            if samplers and not attached:
+                raise ValueError("Use a separate MODEL branch for projection guidance.")
+            if has_spectrum(model.model_options, model.wrappers):
+                raise ValueError("Apply ModeExplorer Projection Guidance before Spectrum.")
+            ModeExplorer.verify_model(model, config.block)
+            _, sol = verify_patch_graph(model.model_options, Settings(feature="native"), model.wrappers)
+            if sol is not None:
+                raise ValueError("Apply ModeExplorer Projection Guidance before Sol-Krea2.")
+        clone = model.clone()
+        if attached:
+            _remove_modeexplorer_wrappers(clone)
+        if config is not None:
+            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(Settings(feature="native"), guidance=config))
+            clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
+        return (clone,)
 
 
 class ModeExplorerLoadResponse:
