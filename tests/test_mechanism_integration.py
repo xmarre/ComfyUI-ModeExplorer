@@ -345,7 +345,6 @@ def test_projection_diagnostic_oom_keeps_native_prediction(model, caplog, monkey
 
 @pytest.mark.parametrize("component", ["observe", "contrast", "contrast_reverse", "contrast_spatial"])
 def test_conditioning_contrast_matched_native_state(model, caplog, monkeypatch, tmp_path, component):
-    import json
     import folder_paths
     from safetensors.torch import load_file
 
@@ -392,9 +391,26 @@ def test_conditioning_contrast_fail_closed(model, caplog):
     native = draw(model)
     assert torch.equal(draw(patched(model, **options)), native)
     assert not point(caplog)["applied"]
+    assert point(caplog)["candidates"][-1]["reason"] == "identical_native_conditioning"
     assert torch.equal(draw(patched(model, **{**options, "auxiliary_budget": 0})), native)
     p = point(caplog)
     assert p["reason"] == "auxiliary_forward_budget" and p["auxiliary_dit_calls"] == 0
     cfg = patched(model, **options)
     assert torch.equal(draw(cfg, cfg=2), draw(model, cfg=2))
     assert torch.equal(draw(cfg, stage="highres"), native)
+
+
+def test_conditioning_contrast_repeat_budget(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    positive, _ = conditions()
+    alt = [[positive[0][0][:, :3] * -.75, {}]]
+    options = dict(experiment="conditioning_contrast", alternate=alt, sites="clean",
+                   component="observe", repeat_baseline=True, auxiliary_budget=2)
+    native = draw(model)
+    assert torch.equal(draw(patched(model, **options)), native)
+    p = point(caplog)
+    assert p["status"] == "completed" and p["auxiliary_dit_calls"] == 2
+    assert p["mechanistic"]["repeat_clean_rms"] == 0
+    assert torch.equal(draw(patched(model, **{**options, "auxiliary_budget": 1})), native)
+    p = point(caplog)
+    assert p["reason"] == "auxiliary_forward_budget" and p["auxiliary_dit_calls"] == 0

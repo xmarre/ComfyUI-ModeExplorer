@@ -410,7 +410,8 @@ def _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, 
     cfg, spec = run.response.config, run.response.config.mechanistic
     stage = point["mechanistic"]
     if (x.shape[0] != 1 or frame.offset != 0 or list(options.get("cond_or_uncond", ())) != [0]
-            or run.response.cfg_scale != 1.0 or run.feature_active or frame.attempted or cfg.frozen_state):
+            or run.response.cfg_scale != 1.0 or run.feature_active or run.settings.initialization
+            or frame.attempted or cfg.frozen_state):
         raise ValueError("contrast_requires_live_single_positive_native_cfg_one")
     if not 1e-5 <= frame.sigma:
         raise ValueError("flow_conversion_endpoint")
@@ -460,6 +461,13 @@ def _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, 
     tensors = {"frozen_native_input": latent, "baseline_clean": base, "D10_clean": other,
                "contrast_native_delta": delta} if cfg.export else {}
     if spec.component == "observe":
+        return native_velocity, tensors
+    if (stage["conditioning"]["C0"]["context_values_sha256"] == stage["conditioning"]["C1"]["context_values_sha256"]
+            and stage["conditioning"]["C0"]["mask_values_sha256"] == stage["conditioning"]["C1"]["mask_values_sha256"]):
+        point["candidates"].append({"arm": spec.component, "reason": "identical_native_conditioning"})
+        return native_velocity, tensors
+    if stage["contrast_rms"] <= max(2 * noise_floor, 1e-8):
+        point["candidates"].append({"arm": spec.component, "reason": "contrast_below_repeat_floor"})
         return native_velocity, tensors
     direction = delta
     if spec.component == "contrast_reverse":

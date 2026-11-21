@@ -53,6 +53,8 @@ Use [ModeExplorer Mechanistic](docs/mechanistic.md) for full-resolution native-s
 
 [Projection Guidance](docs/projection_guidance.md) is an opt-in in-forward experiment for native Krea 2. Gaussian, token-adaptive, and channel-aware edits use the existing attention output projection with zero auxiliary DiT or projection calls. The guide includes planner PNG comparisons and a predeclared screening and confirmation protocol.
 
+[Conditioning contrast](docs/mechanistic.md#conditioning-contrast-directional-research) tests a semantic direction derived from two conditional predictions at the same noisy state, with reversed and spatial controls. It uses one extra DiT evaluation per state, or two with an optional repeat, and the existing clean-response trust and acceptance rules. It is an exploratory experiment, not established quality guidance.
+
 The **ModeExplorer Response (Krea 2)** node measures input and feature response at a frozen denoising state. It supports projected Jacobians, head and cell ablations, local predicted-clean exports, and opt-in response-based steering. One default latent probe spends seven auxiliary DiT forwards. Packed CFG processes fourteen auxiliary rows for those seven forwards. Diagnostics follow the existing actual/forecast route unless the all-actual control is enabled.
 
 Start with the [latent probe workflow](examples/response_probe.json). The [response guide](docs/response.md) describes the measurements, Raw/Turbo pairing, candidate acceptance and GPU experiments. The [response profiles](tools/response_profiles.json) use the existing evaluator and blinded analyzer.
