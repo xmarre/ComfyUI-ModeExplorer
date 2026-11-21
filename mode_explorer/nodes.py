@@ -274,12 +274,14 @@ class ModeExplorerMechanistic:
             "symmetry_limit": number("FLOAT", "symmetry_limit", 0., 1., step=.001),
             "amplitude_check": ("BOOLEAN", {"default": False}),
             "repeat_baseline": ("BOOLEAN", {"default": False}),
+            "all_actual": common["optional"]["all_actual"],
             "checkpoint_provenance": (["", "same_execution", "alternate_execution", "dequantized_approximation",
                                        "original_weights", "different_weights"], {"default": ""}),
             "trial": common["required"]["trial"],
         }}
 
-    def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False, **options):
+    def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,
+              all_actual=False, **options):
         from .mechanism import MechanisticSettings
 
         if not enabled:
@@ -292,7 +294,7 @@ class ModeExplorerMechanistic:
             raise ValueError("Select a component for active mechanistic steering.")
         return ModeExplorerResponse().apply(
             model, mode="feature_replay" if treatment == "export_only" else "feature_steer",
-            selection=treatment, mechanistic=spec, all_actual=True,
+            selection=treatment, mechanistic=spec, all_actual=all_actual,
             calibration="repeat_and_half" if repeat_baseline else "off",
             **{"min_sigma": .82, "max_sigma": 1., "auxiliary_budget": 24, "memory_mb": 768, **options},
         )

@@ -1024,9 +1024,12 @@ class SamplerWrapper:
                 if force_native is None:
                     eligibility = "missing_spectrum_all_actual_contract"
                     force_native = nullcontext()
-            run.response = ResponseRun(response, model_wrap.inner_model.process_latent_out, eligibility,
-                                       cfg_scale=getattr(model_wrap, "cfg", None),
-                                       base_model=model_wrap.inner_model if response.mechanistic is not None else None)
+            is_mechanistic = response.mechanistic is not None and eligibility is None
+            run.response = ResponseRun(
+                response, model_wrap.inner_model.process_latent_out, eligibility, cfg_scale=getattr(model_wrap, "cfg", None),
+                base_model=model_wrap.inner_model if is_mechanistic else None,
+                positive_metadata_mask=conds["positive"][0].get("attention_mask") if is_mechanistic else None,
+            )
         options = {**model_options, "transformer_options": {**model_options.get("transformer_options", {}), RUN: run}}
         begin = time.perf_counter()
         if settings.diagnostics:

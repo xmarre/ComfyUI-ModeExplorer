@@ -1,6 +1,6 @@
 """Scoped native Krea 2 measurement and matched experiment scheduling."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
 import math
@@ -23,7 +23,7 @@ class CaptureLimit(ValueError):
 class Workspace:
     def __init__(self, limit):
         self.limit = limit
-        self.retained = 0
+        self.retained = self.peak = 0
 
     def stage(self, value):
         size = value.numel() * value.element_size()
@@ -31,6 +31,7 @@ class Workspace:
             raise CaptureLimit("mechanistic_capture_limit")
         result = value.detach().to("cpu", copy=True, memory_format=torch.contiguous_format)
         self.retained += size
+        self.peak = max(self.peak, self.retained)
         return result
 
     def release(self, value):
@@ -147,7 +148,7 @@ def _alternate(alt, base, latent, context, mask, refs, kwargs, dit):
     if len(alt) != 1 or not isinstance(alt[0], (list, tuple)) or len(alt[0]) != 2:
         raise ValueError("mechanistic_requires_single_global_alternate")
     raw, meta = alt[0]
-    metadata = {"reference_latents", "reference_latents_method", "attention_mask"}
+    metadata = {"reference_latents", "reference_latents_method", "attention_mask", "pooled_output"}
     if not isinstance(meta, dict) or any(key not in metadata for key in meta):
         raise ValueError("mechanistic_unsupported_alternate_metadata")
     if not torch.is_tensor(raw) or raw.ndim != 3 or raw.shape[0] != 1 or raw.shape[-1] != context.shape[-1]:
@@ -156,7 +157,7 @@ def _alternate(alt, base, latent, context, mask, refs, kwargs, dit):
     if set(extra) - {"c_crossattn", "ref_latents", "ref_latents_method", "attention_mask"}:
         raise ValueError("mechanistic_unsupported_native_conditioning")
     c1 = extra["c_crossattn"].process_cond(batch_size=1).cond.to(context)
-    alternate_mask = extra["attention_mask"].process_cond(batch_size=1).cond if "attention_mask" in extra else meta.get("attention_mask")
+    alternate_mask = extra["attention_mask"].process_cond(batch_size=1).cond if "attention_mask" in extra else None
     if alternate_mask is not None:
         alternate_mask = alternate_mask.to(device=latent.device, dtype=mask.dtype if mask is not None else alternate_mask.dtype)
     if (mask is None) != (alternate_mask is None):
@@ -169,7 +170,10 @@ def _alternate(alt, base, latent, context, mask, refs, kwargs, dit):
     new_method = extra["ref_latents_method"].cond if "ref_latents_method" in extra else dit.default_ref_method
     if new_method != kwargs.get("ref_latents_method", dit.default_ref_method):
         raise ValueError("mechanistic_alternate_reference_method_mismatch")
-    return c1, alternate_mask
+    raw_mask = meta.get("attention_mask")
+    if raw_mask is not None and not torch.is_tensor(raw_mask):
+        raise ValueError("mechanistic_alternate_mask_contract")
+    return c1, alternate_mask, raw_mask
 
 
 def _edit_pair(capture):
@@ -230,7 +234,7 @@ def _amplitude(full_plus, full_minus, half_plus, half_minus, base):
 
 def research_response(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                       kwargs, native_velocity, point, spend, reference_sigma, initial_ordinal, ordinal, probe_seed):
-    from .response_runtime import ResponseBudget, _tensor_hash
+    from .response_runtime import _tensor_hash
 
     cfg = run.response.config
     spec = cfg.mechanistic
@@ -245,8 +249,10 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         "cell": spec.cell, "filter_transition": spec.transition, "symmetry_limit": spec.symmetry_limit,
         "amplitude_check": spec.amplitude_check, "attention_mask_consumed_by_native_krea": False,
     }
-    if not frame.sigma <= (reference_sigma if reference_sigma is not None else -1):
-        raise ValueError("feature_reference_start_not_observed_or_after_probe")
+    if reference_sigma is None:
+        raise ValueError("feature_reference_start_not_observed")
+    if frame.sigma > reference_sigma:
+        raise ValueError("feature_reference_start_after_probe")
     row = slice(frame.offset, frame.offset + 1)
 
     def pick(value):
@@ -257,14 +263,20 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     options = {**options, "cond_or_uncond": [0]}
     if "uuids" in options:
         options["uuids"] = options["uuids"][row]
-    for key in ("sigmas",):
-        if torch.is_tensor(options.get(key)) and options[key].ndim:
-            options[key] = pick(options[key])
+    if torch.is_tensor(options.get("sigmas")) and options["sigmas"].ndim:
+        options["sigmas"] = pick(options["sigmas"])
     branches = {"C0": (context, mask)}
+    metadata_masks = {"C0": run.response.positive_metadata_mask}
     if spec.conditioning:
-        branches["C1"] = _alternate(spec.alternate, run.response.base_model, latent, context, mask, refs, kwargs, dit)
-    stage["conditioning"] = {key: {"sha256": _tensor_hash(ctx), "mask_sha256": _tensor_hash(msk), "tokens": ctx.shape[1]}
-                             for key, (ctx, msk) in branches.items()}
+        alt_context, alt_mask, metadata_masks["C1"] = _alternate(
+            spec.alternate, run.response.base_model, latent, context, mask, refs, kwargs, dit,
+        )
+        branches["C1"] = alt_context, alt_mask
+    stage["conditioning"] = {
+        key: {"sha256": _tensor_hash(ctx), "mask_sha256": _tensor_hash(msk),
+              "metadata_mask_sha256": _tensor_hash(metadata_masks[key]), "tokens": ctx.shape[1]}
+        for key, (ctx, msk) in branches.items()
+    }
     stage["kernel_contract"] = {
         "latent_device": str(latent.device), "latent_dtype": str(latent.dtype),
         "projection_operator": f"{type(dit.blocks[cfg.feature_block].attn.wo).__module__}.{type(dit.blocks[cfg.feature_block].attn.wo).__qualname__}",
@@ -283,10 +295,27 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     core_arms = 2 + int(spec.signed) + 2 * int(spec.conditioning)
     rebuild = reference_sigma != frame.sigma
     recomputed = spec.mode.endswith("recomputed")
-    reference_calls = (1 + int(rebuild)) * cfg.feature_references * (1 + int(recomputed))
+    ref_branches = ("C0", "C1") if recomputed else ("C0",)
+    response = run.response
+    reference_keys = {
+        branch: (
+            reference_sigma, initial_ordinal, probe_seed, str(latent.dtype), tuple(latent.shape),
+            stage["conditioning"][branch]["sha256"], stage["conditioning"][branch]["mask_sha256"],
+            tuple(point["reference_latent_sha256"]), point["reference_method"], point["backend"],
+        ) for branch in ref_branches
+    }
+    reused_anchors = {branch for branch, key in reference_keys.items()
+                      if rebuild and (cached := response.mechanistic_anchors.get(branch)) is not None
+                      and cached[0] == key}
+    reference_calls = cfg.feature_references * (len(ref_branches) + (len(ref_branches) - len(reused_anchors)) * int(rebuild))
+    stage["first_estimate_reused_for"] = sorted(reused_anchors)
     repeat = cfg.calibration != "off"
-    required = core_arms + reference_calls + 2 * int(spec.amplitude_check) + int(repeat)
-    stage.update(auxiliary_calls_planned=required, feature_reference_calls=reference_calls,
+    native_capture = any(site not in {"velocity", "clean"} | UNAVAILABLE for site in spec.site_names)
+    can_reuse = not (native_capture or cfg.frozen_state or frame.attempted or x.shape[0] != 1)
+    required = core_arms - int(can_reuse) + reference_calls + 2 * int(spec.amplitude_check) + int(repeat)
+    stage["baseline_reused"] = can_reuse
+    stage.update(auxiliary_calls_planned=required, feature_reference_calls_planned=reference_calls,
+                 feature_reference_calls=0,
                  feature_reference_origin="reconstructed_first_estimate" if rebuild else "initial_shadow")
     if run.response.forwards + required > cfg.auxiliary_budget:
         raise ValueError("auxiliary_forward_budget")
@@ -297,9 +326,14 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         dit.channels * dit.patch**2 if s == "final_projection" else channels
         for _, s in keys if s not in UNAVAILABLE and s not in {"velocity", "clean"}
     )
+    captured_arms = core_arms - int(can_reuse)
+    edited_arms = 1 + int(spec.signed) + int(spec.conditioning)
+    extra_edit_sites = 2 - (sum(s in spec.site_names for s in ("attention_pre", "attention_post"))
+                            if cfg.feature_block in spec.block_ids else 0)
     fft_bytes = max(points, math.prod(latent.shape[-2:])) * (128 * spec.chunk + 128)
     output_bytes = latent.numel() * 4 * (10 + (4 * core_arms) + 4 * int(spec.amplitude_check))
-    site_bytes = 4 * points * (site_channels * core_arms + channels * (2 * (core_arms - 1) + 4 * int(spec.amplitude_check)))
+    main_site_channels = site_channels * captured_arms + channels * extra_edit_sites * edited_arms
+    site_bytes = 4 * points * max(main_site_channels, 4 * channels * int(spec.amplitude_check))
     stage["capture_preflight_bytes"] = fft_bytes + output_bytes + site_bytes
     if stage["capture_preflight_bytes"] > stage["capture_budget_bytes"]:
         raise CaptureLimit("mechanistic_capture_preflight")
@@ -313,6 +347,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     gpu_bytes = 4 * (channels * (points + max_text + ref_tokens + 4 * frame.grid[1])
                      + latent.numel() * (12 + core_arms * 2)
                      + channels * cfg.feature_grid**2 * cfg.feature_references * 3)
+    # First-estimate anchors retain native FP32 clean and noise per reference.
+    gpu_bytes += 8 * latent.numel() * cfg.feature_references * len(ref_branches)
     point["estimated_working_bytes"] = max(gpu_bytes, point["estimated_working_bytes"])
     if point["estimated_working_bytes"] > cfg.memory_mb * 1024**2:
         raise CaptureLimit("research_memory_budget")
@@ -326,19 +362,30 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
 
     def references(branch):
         ctx, msk = branches[branch]
-        shadow_run = replace(replay_run, shadows={})
+        if branch in reused_anchors:
+            shadows = dict(response.mechanistic_anchors[branch][1])
+        else:
+            shadows = {}
+        shadow_run = replace(replay_run, shadows=shadows)
         ref_frame = Frame(frame.grid, 1, 0, "response", shadow_run, frame.sigma)
         initial_frame = Frame(frame.grid, 1, 0, "response", shadow_run, reference_sigma)
         initial_options = {**options, "sigmas": torch.full_like(options["sigmas"], reference_sigma)}
         pooled = []
-        for i in range(cfg.feature_references):
-            if rebuild:
+        if rebuild and branch not in reused_anchors:
+            response.mechanistic_anchors.pop(branch, None)
+            for i in range(cfg.feature_references):
                 spend(1)
+                stage["feature_reference_calls"] += 1
                 shadow_forward(executor, shadow_run, initial_frame, latent, torch.full_like(timesteps, reference_sigma),
                                ctx, msk, refs, initial_options, kwargs, i, sol_evaluations=initial_ordinal)
+            response.mechanistic_anchors[branch] = reference_keys[branch], dict(shadows)
+        for i in range(cfg.feature_references):
             spend(1)
+            stage["feature_reference_calls"] += 1
             pooled.append(shadow_forward(executor, shadow_run, ref_frame, latent, timesteps, ctx, msk, refs,
                                          options, kwargs, i, sol_evaluations=ordinal))
+        if not rebuild:
+            response.mechanistic_anchors[branch] = reference_keys[branch], dict(shadows)
         stage.setdefault("reference_slots", {})[branch] = ref_frame.reference_slots
         return torch.cat(pooled)
 
@@ -348,9 +395,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         ctx, msk = branches[branch]
         arm_frame = Frame(frame.grid, 1, 0, "response_capture", replay_run, frame.sigma, mechanistic_capture=capture)
         opts = {**options, FRAME: arm_frame} if capture is not None else {**options}
-        scope = capture.hooks(dit) if capture is not None else _no_capture()
+        scope = capture.hooks(dit) if capture is not None else nullcontext()
         spend(1)
-        with scope, isolated_reference(run, sol_evaluations=ordinal):
+        with torch.no_grad(), scope, isolated_reference(run, sol_evaluations=ordinal):
             value = executor(latent, timesteps, ctx, msk, refs, opts, **kwargs)
         if not bool(torch.isfinite(value).all()):
             raise ValueError("mechanistic_nonfinite_velocity")
@@ -363,9 +410,6 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     def capture(**edit):
         return Capture(spec, frame.grid, workspace, cfg.feature_block, **edit)
 
-    native_capture = any(site not in {"velocity", "clean"} | UNAVAILABLE for site in spec.site_names)
-    can_reuse = not (native_capture or cfg.frozen_state or frame.attempted or x.shape[0] != 1)
-    stage["baseline_reused"] = can_reuse
     if can_reuse:
         captures["D00"] = capture()
         velocities["D00"] = native_velocity[row]
@@ -383,6 +427,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     plus_edit = _edit_pair(plus)
     stage["proposal"] = {"C0_sha256": _tensor_hash(plus.proposal), "C0_compact_rms": rms(plus.proposal)}
     stage["realized_positive_l2"] = _edit_compare(plus_edit, plus_edit, 1, spec.chunk)["left_l2"]
+    stage["realized_positive_rms"] = stage["realized_positive_l2"] / math.sqrt(plus_edit[0].numel())
     if spec.signed:
         minus = capture(proposal=plus.proposal, scale=-1)
         predict("D0minus", capture=minus)
@@ -390,15 +435,6 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         symmetry["status"] = "matched" if (symmetry["relative_mismatch"] is not None
                                             and symmetry["relative_mismatch"] <= spec.symmetry_limit) else "unqualified"
         stage["signed_realized_edit"] = symmetry
-        if spec.amplitude_check:
-            light = replace(spec, sites="")
-            for name, sign in (("D0half_plus", .5), ("D0half_minus", -.5)):
-                predict(name, capture=Capture(light, frame.grid, workspace, cfg.feature_block,
-                                              proposal=plus.proposal, scale=sign))
-            half_symmetry = _edit_compare(_edit_pair(captures["D0half_plus"]), _edit_pair(captures["D0half_minus"]), -1, spec.chunk)
-            stage["half_realized_edit"] = half_symmetry
-            stage["amplitude"] = _amplitude(clean["D01"], clean["D0minus"],
-                                            clean["D0half_plus"], clean["D0half_minus"], clean["D00"])
     if spec.conditioning:
         predict("D10", "C1", capture())
         alt = capture(references=references("C1"), scale=1) if recomputed else capture(fixed=plus_edit)
@@ -408,13 +444,15 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                            if match["relative_mismatch"] is not None and match["relative_mismatch"] <= spec.symmetry_limit
                            else "unqualified")
         stage["conditioning_realized_edit"] = match
+        alt.fixed = None
         if recomputed:
             stage["proposal"]["C1_sha256"] = _tensor_hash(alt.proposal)
             stage["proposal"]["C1_compact_rms"] = rms(alt.proposal)
 
-    stage["captured_bytes"] = workspace.retained
+    del plus_edit
+    stage["sampler_velocity_baseline_rms_difference"] = rms(velocities["D00"].float() - native_velocity[row].float())
     stage["operators"] = captures["D00"].operators
-    main_arms = [arm for arm in captures if not arm.startswith("D0half")]
+    main_arms = tuple(captures)
     for key in keys:
         block, site = key
         name = site if block is None else f"b{block}.{site}"
@@ -431,19 +469,51 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
             if any(value is None for value in fields.values()):
                 info.update(status="incomplete", missing_arms=[arm for arm, value in fields.items() if value is None])
             else:
-                info.update(status="completed", comparisons=_site_metrics(fields, spec))
+                comparisons = _site_metrics(fields, spec)
+                info.update(status="completed", comparisons=comparisons)
+                if spec.signed:
+                    odd_power, even_power = (comparisons[part]["displacement_l2"]**2 for part in ("odd", "even"))
+                    info["even_energy_fraction"] = even_power / (odd_power + even_power) if odd_power + even_power else None
+                    fraction = {}
+                    for band, stats in comparisons["even"]["bands"].items():
+                        energy = stats["displacement"]
+                        total = energy + comparisons["odd"]["bands"][band]["displacement"]
+                        fraction[band] = energy / total if total else None
+                    info["even_energy_fraction_by_band"] = fraction
+            del fields
         stage["sites"][name] = info
         for arm in main_arms:
-            if key in captures[arm].fields and not (key in (captures[arm].edit or ())):
+            if key in captures[arm].fields:
                 workspace.release(captures[arm].fields.pop(key))
+    for arm in main_arms:
+        for value in captures[arm].fields.values():
+            workspace.release(value)
+        captures[arm].fields.clear()
+    # Release even the loop variable before staging the calibration pair.
+    value = None
+    if spec.amplitude_check:
+        light = replace(spec, sites="")
+        for name, sign in (("D0half_plus", .5), ("D0half_minus", -.5)):
+            predict(name, capture=Capture(light, frame.grid, workspace, cfg.feature_block,
+                                          proposal=plus.proposal, scale=sign))
+        half_symmetry = _edit_compare(_edit_pair(captures["D0half_plus"]), _edit_pair(captures["D0half_minus"]), -1, spec.chunk)
+        stage["half_realized_edit"] = half_symmetry
+        stage["amplitude"] = _amplitude(clean["D01"], clean["D0minus"],
+                                        clean["D0half_plus"], clean["D0half_minus"], clean["D00"])
+        for name in ("D0half_plus", "D0half_minus"):
+            captures.pop(name)
+            velocities.pop(name)
+            clean.pop(name)
+    stage["captured_bytes"] = workspace.peak
     point["status"] = "completed" if all(s["status"] != "incomplete" for s in stage["sites"].values()) else "incomplete"
     point.update(applied=False, selected_candidate="baseline", candidates=[{"arm": "baseline", "selected": True}])
     base = clean["D00"]
     delta = clean["D01"] - base
     components = {"complete": delta}
     if spec.signed:
-        components["odd"] = (clean["D01"] - clean["D0minus"]) * .5
-        components["even"] = (delta + clean["D0minus"] - base) * .5
+        negative_delta = clean["D0minus"] - base
+        components["odd"] = (delta - negative_delta) * .5
+        components["even"] = (delta + negative_delta) * .5
     if spec.conditioning:
         components["interaction"] = (clean["D11"] - clean["D10"]) - delta
 
@@ -508,8 +578,3 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         result[row] = corrected
         return result, tensors
     return native_velocity, tensors
-
-
-@contextmanager
-def _no_capture():
-    yield

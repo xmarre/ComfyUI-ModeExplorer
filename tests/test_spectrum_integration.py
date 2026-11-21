@@ -373,3 +373,52 @@ def test_core_attention_selector_preserves_guidance_and_spectrum(caplog, model, 
     assert torch.equal(native, draw(probe, sigmas=SIGMAS))
     arm = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"][0]["feature"][0]
     assert arm["status"] == "completed" and arm["realized_edit_l2"] > 0
+
+
+def test_mechanistic_preserves_passive_forecasts_and_forces_active_native(caplog, model):
+    from mode_explorer.nodes import ModeExplorerMechanistic
+
+    caplog.set_level(logging.INFO)
+    base = draw(spectrum(model), sigmas=SIGMAS)
+    node = ModeExplorerMechanistic()
+    options = dict(feature_block=1, blocks="1", sites="projection_input,clean", evaluation=1)
+    passive, = node.apply(model, **options)
+    assert torch.equal(base, draw(spectrum(passive), sigmas=SIGMAS))
+    passive_report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    passive_point, = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"]
+    assert passive_report["forecast"] > 0
+    assert passive_point["status"] == "completed"
+    active, = node.apply(model, treatment="minimum_change", component="complete", **options)
+    draw(spectrum(active), sigmas=SIGMAS)
+    active_report = logs(caplog, "Spectrum Krea 2 summary: ")[-1]
+    active_point, = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"]
+    assert active_report["forecast"] == 0
+    assert active_point["applied"]
+    assert CURRENT.get() is None
+
+
+@pytest.mark.skipif(not os.environ.get("MODEEXPLORER_SCALE_LOCKED"), reason="Scale-Locked is optional")
+def test_mechanistic_scale_locked_uses_original_planner_and_zero_target_evaluations(caplog, model):
+    import asyncio
+
+    import nodes
+    from mode_explorer.nodes import ModeExplorerMechanistic
+    from test_comfy_integration import conditions
+
+    assert asyncio.run(nodes.load_custom_node(os.environ["MODEEXPLORER_SCALE_LOCKED"]))
+    node = nodes.NODE_CLASS_MAPPINGS["Krea2TurboFlowAlignedRegenerate"]()
+    caplog.set_level(logging.INFO)
+    p, n = conditions()
+    latent = {"samples": torch.zeros(1, 16, 1, 80, 80)}
+    patched, = ModeExplorerMechanistic().apply(model, feature_block=1, blocks="1", sites="clean", evaluation=0)
+    options = dict(steps=6, composition_lock_sigma=.60, sampler_name="er_sde")
+    with torch.inference_mode():
+        _, baseline_planner, _ = node.sample(spectrum(model), p, n, latent, 902, .25, 0., 0., **options)
+        caplog.clear()
+        _, planner, _ = node.sample(spectrum(patched), p, n, latent, 902, .25, 0., 0., **options,
+                                   regeneration_mode="planner_final_upscale_only", handoff_diagnostics="off")
+    assert torch.equal(planner["samples"], baseline_planner["samples"])
+    assert "target denoiser evaluations=0" in caplog.text
+    assert {report["stage"] for report in logs(caplog, "Spectrum Krea 2 summary: ")} == {"planner"}
+    point, = logs(caplog, "MODEEXPLORER_TRACE ")[-1]["response"]["points"]
+    assert point["stage"] == "planner" and point["status"] == "completed"

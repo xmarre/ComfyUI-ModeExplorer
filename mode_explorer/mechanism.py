@@ -1,6 +1,7 @@
 """Full-resolution spatial and spectral measurements of native model tensors."""
 
 from dataclasses import dataclass
+from functools import cached_property
 import math
 
 import torch
@@ -35,7 +36,7 @@ class MechanisticSettings:
     alternate: object = None
     checkpoint_provenance: str = ""
 
-    @property
+    @cached_property
     def block_ids(self):
         result = []
         for field in self.blocks.split(","):
@@ -45,7 +46,7 @@ class MechanisticSettings:
             result.extend(range(endpoints[0], endpoints[-1] + 1))
         return tuple(dict.fromkeys(result))
 
-    @property
+    @cached_property
     def site_names(self):
         return tuple(dict.fromkeys(name.strip() for name in self.sites.split(",") if name.strip()))
 
@@ -113,7 +114,7 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
     if len(shape) != 3 or any(t.shape != shape or t.device != fields[0].device for t in fields):
         raise ValueError("Incompatible channel-first spatial tensors.")
     device = fields[0].device
-    weights = band_weights(shape, low, high, device)
+    weights = band_weights(shape, low, high, device).double().T
     powers = torch.zeros((4, 4), dtype=torch.float64, device=device)
     totals = torch.zeros(4, dtype=torch.float64, device=device)
     spatial = torch.zeros(shape[-2:], dtype=torch.float64, device=device)
@@ -126,11 +127,11 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
         totals += torch.stack((base.square().sum(dtype=torch.float64), arm.square().sum(dtype=torch.float64),
                                delta.square().sum(dtype=torch.float64), (base * arm).sum(dtype=torch.float64)))
         a = torch.fft.rfft2(base, norm="ortho")
-        b = torch.fft.rfft2(arm, norm="ortho")
-        d = b - a
+        d = torch.fft.rfft2(delta, norm="ortho")
+        b = a + d
         per_bin = torch.stack((a.abs().square(), b.abs().square(), d.abs().square(),
                                2 * (a.conj() * d).real)).sum(dim=1).flatten(1)
-        powers += per_bin.double() @ weights.double().T
+        powers += per_bin.double() @ weights
     if not torch.isfinite(totals).all() or not torch.isfinite(powers).all():
         raise ValueError("Nonfinite spatial or spectral measurement.")
     base, arm, delta, dot = totals.tolist()
@@ -140,13 +141,19 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
     ordered = spatial.flatten()
     top = {str(p): float(ordered.topk(max(1, math.ceil(ordered.numel() * p / 100))).values.sum()) / delta
            if delta else None for p in (1, 10, 25)}
+    # Sum disjoint spatial tiles so the map is comparable to total displacement
+    # energy and never mixes channels, overlapping windows, or normalized activations.
+    h, w = shape[-2:]
+    ty, tx = min(4, h), min(4, w)
+    tiles = [[float(spatial[i*h//ty:(i+1)*h//ty, j*w//tx:(j+1)*w//tx].sum())
+              for j in range(tx)] for i in range(ty)]
     result = {}
     for name, (b, a, d, cross) in zip(("dc", "low", "mid", "high"), powers.T.tolist()):
         result[name] = {
-            "baseline": b, "edited": a, "displacement": d, "cross_term": cross, "net_change": a - b,
+            "baseline": b, "edited": a, "displacement": d, "cross_term": cross, "net_change": d + cross,
             "baseline_fraction": b / base if base else None, "edited_fraction": a / arm if arm else None,
             "displacement_fraction": d / delta if delta else None,
-            "relative_net_change": (a - b) / b if b else None,
+            "relative_net_change": (d + cross) / b if b else None,
         }
     return {
         "shape_chw": list(shape), "baseline_dtype": str(baseline[0][1].dtype),
@@ -154,7 +161,7 @@ def paired_measurement(baseline, edited, chunk=8, low=0.125, high=0.25):
         "displacement_l2": dn, "baseline_rms": bn / math.sqrt(n), "edited_rms": an / math.sqrt(n),
         "displacement_rms": dn / math.sqrt(n), "relative_displacement": dn / bn if bn else None,
         "cosine": cosine, "normalized_displacement": math.sqrt(max(0., 2 - 2 * cosine)) if cosine is not None else None,
-        "top_spatial_percent_energy_fraction": top, "bands": result,
+        "top_spatial_percent_energy_fraction": top, "spatial_tile_energy": tiles, "bands": result,
     }
 
 

@@ -35,6 +35,11 @@ class ResponseRun:
     last_sigma: float | None = None
     cfg_scale: float | None = None
     base_model: object = None
+    positive_metadata_mask: torch.Tensor | None = None
+    mechanistic_anchors: dict = field(default_factory=dict)
+
+
+MECHANISTIC_MANIFEST_LIMIT = 16 * 1024**2
 
 
 class ResponseBudget(RuntimeError):
@@ -149,11 +154,14 @@ def read_export(export_id):
     data = (folder / "predictions.safetensors").resolve()
     if manifest.parent != folder or data.parent != folder:
         raise ValueError("invalid_response_export_files")
-    if manifest.stat().st_size > 512 * 1024 or data.stat().st_size > MAX_EXPORT_BYTES + 65536:
+    manifest_bytes = manifest.stat().st_size
+    if manifest_bytes > MECHANISTIC_MANIFEST_LIMIT or data.stat().st_size > MAX_EXPORT_BYTES + 65536:
         raise ValueError("response_export_size_limit")
     info = loads(manifest.read_text())
     if not isinstance(info, dict) or info.get("schema") != 1:
         raise ValueError("unknown_response_export_schema")
+    if manifest_bytes > 512 * 1024 and not isinstance(info.get("mechanistic"), dict):
+        raise ValueError("response_export_size_limit")
     return info, data
 
 
@@ -185,7 +193,13 @@ def _export(response, tensors, point):
         run_dir = Path(tempfile.mkdtemp(prefix="response-", dir=directory))
         save_file(payload, run_dir / "predictions.safetensors",
                   metadata={"modeexplorer_response": "1", "clean_format": "comfy_vae_latent"})
-        (run_dir / "manifest.json").write_text(json.dumps(point, allow_nan=False, indent=2) + "\n")
+        manifest = (json.dumps(point, allow_nan=False, separators=(",", ":")) if "mechanistic" in point
+                    else json.dumps(point, allow_nan=False, indent=2)) + "\n"
+        if len(manifest.encode("utf-8")) > (MECHANISTIC_MANIFEST_LIMIT if "mechanistic" in point else 512 * 1024):
+            shutil.rmtree(run_dir)
+            point["export_status"] = "manifest_budget"
+            return
+        (run_dir / "manifest.json").write_text(manifest)
         point["export_status"] = "completed"
         point["export_id"] = run_dir.name
         response.exports += size
@@ -298,6 +312,8 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                  native_input_sha256=_tensor_hash(latent), branches=list(options.get("cond_or_uncond", ())))
     if cfg.scorer is not None and cfg.selection == "external":
         point["scorer"] = getattr(cfg.scorer, "__qualname__", type(cfg.scorer).__qualname__)
+    if cfg.mechanistic is not None:
+        point["native_input_fp32_sha256"] = _tensor_hash(latent.float())
 
     def spend(rows):
         throw_exception_if_processing_interrupted()
@@ -350,7 +366,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     raise ValueError("frozen_input_rounding_mismatch")
                 if cfg.mechanistic is not None:
                     point["frozen_source"] = {key: saved.get(key) for key in ("checkpoint_label", "input_dtype", "backend", "native_input_sha256")}
-                    point["frozen_input_fp32_sha256"] = _tensor_hash(saved_latent)
+                    point["native_input_fp32_sha256"] = _tensor_hash(saved_latent)
                 probe_seed = saved.get("probe_seed", saved.get("seed"))
                 if type(probe_seed) is not int:
                     raise ValueError("frozen_probe_seed_missing")
