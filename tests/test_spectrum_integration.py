@@ -491,3 +491,24 @@ def test_projection_guided_spectrum_pece_retains_all_actual(caplog, model):
     assert trace["spectrum_policy"] == "all_actual" and report["forecast"] == 0
     assert len(trace["projection_guidance"]["points"]) == 2
     assert CURRENT.get() is None
+
+
+def test_projection_guided_spectrum_enters_and_leaves_sigma_window(caplog, model):
+    from mode_explorer.nodes import ModeExplorerProjectionGuidance
+
+    caplog.set_level(logging.INFO)
+    patched, = ModeExplorerProjectionGuidance().apply(
+        model, enabled=True, block=1, scope="standalone", amplitude=.01,
+        evaluations=0, min_sigma=.8, max_sigma=.94,
+    )
+    draw(spectrum(patched, warmup=1), sigmas=SIGMAS, sampler="euler")
+    trace, = logs(caplog, "MODEEXPLORER_TRACE ")
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    routes = {item["step"]: item["route"] for item in report["denoiser_decisions"]}
+    assert routes[1] == "bootstrap"
+    assert [routes[i] for i in (2, 3, 4)] == ["actual", "actual", "actual"]
+    assert any(route in ("bootstrap", "regression") for index, route in routes.items() if index > 4)
+    assert report["actual_reasons"]["ModeExplorer early-feature regime transition"] == 2
+    points = trace["projection_guidance"]["points"]
+    assert [point["evaluation"] for point in points] == [1, 2]
+    assert [point["sigma"] for point in points] == pytest.approx([.92, .85])

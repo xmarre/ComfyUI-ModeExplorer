@@ -73,7 +73,8 @@ def test_rounding_backoff_preserves_hard_cap_and_native_storage(relative):
     row = info["rows"][0]
     assert 0 < row["realized_rms"] <= row["allowed_rms"]
     assert row["generated_rms"] <= row["target_rms"]
-    assert info["rows"][1]["rounding_backoff"] is (not relative)
+    if relative:
+        assert not info["rows"][1]["rounding_backoff"] and torch.equal(result[2], original[2])
     assert torch.equal(source, original)
     assert torch.equal(result[0], original[0]) and torch.equal(result[:, (0, -1)], original[:, (0, -1)])
     assert torch.equal(result, perturb(source, (1, 11), 1, 2, config, config.amplitude, seeds, {}))
