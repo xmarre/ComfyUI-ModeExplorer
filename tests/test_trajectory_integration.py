@@ -302,6 +302,30 @@ def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model
     assert not torch.equal(results[0][0], results[1][0])
     assert not torch.equal(results[0][0], results[2][0])
 
+    from mode_explorer.trajectory_review import ModeExplorerTrajectoryReview, TEMPORAL
+
+    class FixtureVAE:
+        calls = 0
+
+        def decode(self, samples):
+            self.calls += 1
+            return torch.full((1, 8, 8, 3), .5)
+
+    vae = FixtureVAE()
+    plan = {"case": "fixture", "experiment": "temporal", "resolution": [8, 8],
+            "crops": {"fixed_crop": [1, 2, 5, 7]},
+            "arms": {arm: {"id": data["states"][0]["export_id"].split("/")[0]}
+                     for arm, (_, data, _) in zip(TEMPORAL, results)}}
+    ModeExplorerTrajectoryReview().review(vae, json.dumps(plan))
+    review, = (tmp_path / "modeexplorer_phase_iv").glob("*/manifest.json")
+    report = json.loads(review.read_text())
+    assert report["decode_tensor"] == "solver_clean"
+    assert report["auxiliary_dit_calls"] == 0
+    assert vae.calls == report["vae_decodes"] == (len(route) - route.count("F")) * 4
+    assert (review.parent / "step_00" / "fixed_crop.png").is_file()
+    assert (review.parent / "step_00" / "full.png").is_file()
+    assert not (review.parent / f"step_{route.index('F'):02d}").exists()
+
     wrong, = ModeExplorer().apply(model, **common, feature_application="first_only", ablation_route="A" * len(route))
     with pytest.raises(RuntimeError, match="ablation_route_mismatch"):
         draw(spectrum(wrong), **options)

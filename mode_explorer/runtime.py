@@ -722,6 +722,9 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         return tensor[row] if tensor is not None and tensor.shape[0] == x.shape[0] else tensor
 
     run.reference_calls += 1
+    if settings.ablation_route:
+        LOGGER.info("ModeExplorer temporal reference: actual evaluation %d, sigma %.10g, slot %d (%d/2)",
+                    run.native_dit_calls - 1, frame.sigma, slot, run.reference_calls)
     with isolated_reference(run, sol_evaluations=sol_evaluations):
         velocity = executor(
             shadow, timestep[row], context[row], row_of(mask),
@@ -1091,6 +1094,7 @@ class SamplerWrapper:
                                        "sampler_post_cfg_function", "sampler_cfg_function")))
         if settings.ablation_route and (not capture_solver or not feature_active or batch != 1
                                         or spectrum is None or self.response is not None
+                                        or model_options.get(STAGE) != "planner"
                                         or len(settings.ablation_route) != len(sigmas) - 1):
             raise RuntimeError("Temporal ablation requires CFG 1, native ER-SDE ending at zero, verified guarded Spectrum and two eligible reference calls.")
         if not (feature_active or initialize or settings.diagnostics or settings.trajectory_label or self.response is not None):
@@ -1186,6 +1190,8 @@ class SamplerWrapper:
                     trajectory = run.trajectory.save(completed, run)
                 except (MemoryError, OSError, RuntimeError, ValueError) as exc:
                     trajectory = {"status": "failed", "reason": str(exc)}
+                    if settings.ablation_route and completed:
+                        run.trajectory.ablation.update(status="unqualified", reason="trajectory_write_failed")
             if settings.diagnostics or run.response is not None or trajectory is not None:
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
@@ -1216,3 +1222,5 @@ class SamplerWrapper:
                         "points": rep.points,
                     }
                 LOGGER.info("MODEEXPLORER_TRACE %s", json.dumps(finite_json(payload), separators=(",", ":"), allow_nan=False))
+            if completed and settings.ablation_route and trajectory["status"] != "completed":
+                raise RuntimeError("ModeExplorer temporal ablation could not export its qualified trajectory.")

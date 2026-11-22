@@ -53,6 +53,8 @@ SERIALIZED_FIELDS = {
     "PrimitiveBoolean": ["value"],
     "ComfySwitchNode": ["switch"],
     "SaveImage": ["filename_prefix"],
+    "VAELoader": ["vae_name"],
+    "ModeExplorerTrajectoryReviewKrea2": ["review_plan"],
 }
 
 
@@ -72,7 +74,7 @@ def validate_widget_serialization(graph):
         require(isinstance(named, dict) and isinstance(values, list),
                 f"{kind}: invalid named widget representation")
         if kind == "ModeExplorerKrea2":
-            names = widget_fields(ModeExplorer)
+            names = _feature_widget_fields(values)
         elif kind == "ModeExplorerMechanisticKrea2":
             names = widget_fields(ModeExplorerMechanistic)
         else:
@@ -83,8 +85,18 @@ def validate_widget_serialization(graph):
                 f"{kind}: conflicting or incomplete named widgets")
 
 
+
+def _feature_widget_fields(values):
+    names = widget_fields(ModeExplorer)
+    # Historical Phase I–III archives predate the two trailing ablation controls.
+    if isinstance(values, list) and len(values) == len(names) - 2:
+        return names[:-2]
+    return names
+
 def widgets(node, cls):
-    return dict(zip(widget_fields(cls), node["widgets_values"], strict=True))
+    entries = node["widgets_values"]
+    names = _feature_widget_fields(entries) if cls is ModeExplorer else widget_fields(cls)
+    return dict(zip(names, entries, strict=True))
 
 
 def require(condition, detail):
@@ -165,7 +177,11 @@ def validate(graph, case, arm, *, private=False):
     if not factorial or private:
         feature = find("ModeExplorerKrea2")
         cfg = widgets(feature, ModeExplorer)
-        expected_mode = "feature_cosine" if arm in ("sham", "active") else "native"
+        scheduled = arm in ("first_only", "second_only")
+        expected_mode = "feature_cosine" if arm in ("sham", "active") or scheduled else "native"
+        if scheduled:
+            require(cfg.get("feature_application") == arm and cfg.get("ablation_route", "").startswith("AA"),
+                    "temporal arm has no guarded application schedule")
         require(cfg["enabled"] and cfg["feature"] == expected_mode and cfg["sham"] == (arm == "sham")
                 and cfg["strength"] == strength and cfg["fidelity"] == .70 and cfg["feature_block"] == 1
                 and cfg["feature_grid"] == "4" and not cfg["adaptive"] and not cfg["full_spectrum"]
@@ -174,7 +190,7 @@ def validate(graph, case, arm, *, private=False):
                 and cfg["reference_trajectories"] == 1 and cfg["reference_selection"] == "all"
                 and cfg["reference_continuation"] == "first_estimate" and cfg["feature_update"] == "bounded"
                 and cfg["feature_direction"] == "repel"
-                and cfg["trajectory_label"] == ("" if factorial else f"{case}_{arm}"), "wrong feature or sham recipe")
+                and cfg["trajectory_label"] == ("" if factorial else f"{case}_iv_{arm}" if scheduled else f"{case}_{arm}"), "wrong feature or sham recipe")
 
         if factorial:
             require(linked(study, "model")[0] == feature, "factorial feature base is miswired")

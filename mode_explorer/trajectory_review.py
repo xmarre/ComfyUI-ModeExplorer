@@ -28,6 +28,9 @@ def _manifest(folder):
     data = json.loads(path.read_text())
     if not isinstance(data, dict) or data.get("schema") != 1:
         raise ValueError("Unsupported trajectory manifest format.")
+    if any(state.get("export_id") != f"{folder.name}/{idx:03d}" or state.get("ordinal") != idx
+           for idx, state in enumerate(data.get("states", ()))):
+        raise ValueError("A trajectory state refers to a different archive or ordinal.")
     return data
 
 
@@ -219,6 +222,7 @@ class ModeExplorerTrajectoryReview:
                   "coordinate": "exact_solver_vae_latent" if exact else "vae_latent_from_cast_dit_input",
                   "auxiliary_dit_calls": 0, "vae_decodes": len(common) * len(expected),
                   "arms": {arm: {"id": folder.name, "routes": data["routes"],
+                                "solver_terminal": data.get("solver_terminal"),
                                 "forecast_steps": [r["solver_step"] for r in data["routes"] if r["route"] == "forecast"]}
                            for arm, (folder, data) in folders.items()},
                   "evaluations": [], "crop_boxes_xyxy": plan["crops"], "final_planner_comparison": {}}
@@ -254,8 +258,12 @@ class ModeExplorerTrajectoryReview:
                 if key == common[0] and (set(proposals) != set(TEMPORAL if temporal else ("sham", "active"))
                                          or len(set(proposals.values())) != 1):
                     raise ValueError("The first compact feature proposals do not match across the feature arms.")
-                if not temporal and fingerprints["native"] != fingerprints["native_repeat"]:
-                    raise ValueError("The native repeat differs in captured clean coordinates.")
+                if not temporal and (fingerprints["native"] != fingerprints["native_repeat"]
+                                     or _pixel_hash(images[0][1]) != _pixel_hash(images[1][1])):
+                    raise ValueError("The native repeat differs in captured clean coordinates or decoded pixels.")
+                if temporal and key == common[1] and any(proposals.get(a) != proposals.get(b)
+                        for a, b in (("sham", "second_only"), ("active", "first_only"))):
+                    raise ValueError("The second compact proposals differ within a matched pre-intervention state.")
                 caption = f"step {step}  sigma {sigma:.9f}"
                 _sheet(images, caption).save(frame_dir / "full.png")
                 for name, box in plan["crops"].items():
