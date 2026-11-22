@@ -92,12 +92,13 @@ class ModeExplorer:
 
         if mode not in MODES:
             raise ValueError(f"Unknown ModeExplorer mode: {mode!r}.")
+        if mode != "Original":
+            advanced.pop("ablation_route", None)
         ablation = advanced.get("ablation_route", "")
-        application = advanced.get("feature_application", "all")
-        if ablation and (mode != "Original" or not enabled):
-            raise ValueError("Temporal ablation requires enabled Original mode.")
-        if mode == "Original" and application != "all" and not ablation:
-            raise ValueError("Use Custom for a production application schedule or supply a research ablation route.")
+        if ablation and not enabled:
+            raise ValueError("Enable the ModeExplorer node to run a temporal ablation.")
+        if mode == "Original" and not ablation:
+            advanced["feature_application"] = "all"
         if mode in STRUCTURAL_MODES:
             advanced.update(feature_block=STRUCTURAL_MODES[mode], feature_application="first_only")
 

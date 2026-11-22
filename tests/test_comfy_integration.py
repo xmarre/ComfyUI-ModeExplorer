@@ -130,9 +130,10 @@ def test_production_modes_keep_strength_and_resolve_against_loaded_depth(model, 
 
     blocks = model.get_model_object("diffusion_model").blocks
     blocks.extend(copy.deepcopy(blocks[0]) for _ in range(4))
-    kwargs = dict(feature_block=6, strength=.037, fidelity=.71, reference_budget=3)
+    kwargs = dict(feature_block=6, strength=.037, fidelity=.71, reference_budget=3,
+                  feature_application="second_only")
     if mode != "Original":
-        kwargs["feature_application"] = "second_only"
+        kwargs["ablation_route"] = "AAFA"  # Only Original consumes the research route.
     patched, = ModeExplorer().apply(model, mode=mode, **kwargs)
     sampler, = patched.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
     assert (sampler.settings.feature_block, sampler.settings.feature_application) == (block, schedule)
@@ -149,8 +150,8 @@ def test_production_modes_validate_depth_and_bypass_disabled_strength(model):
     ):
         with pytest.raises(ValueError, match="outside the native single-stream range"):
             node.apply(model, **kwargs)
-    with pytest.raises(ValueError, match="requires enabled Original"):
-        node.apply(model, mode="Early Structural (B1)", ablation_route="AAFA")
+    with pytest.raises(ValueError, match="Enable the ModeExplorer node"):
+        node.apply(model, enabled=False, ablation_route="AAFA")
     assert node.apply(model, mode="Amplified Structural (B5)", enabled=False)[0] is model
     assert node.apply(model, mode="Amplified Structural (B5)", strength=0)[0] is model
 
