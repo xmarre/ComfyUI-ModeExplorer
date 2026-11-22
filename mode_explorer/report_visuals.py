@@ -74,6 +74,9 @@ def pixel_metrics(sham, edited):
 
 
 def encode(image, codec, **kwargs):
+    if image.info:
+        image = image.copy()
+        image.info.clear()
     stream = BytesIO()
     image.save(stream, codec, **kwargs)
     return stream.getvalue()
@@ -100,18 +103,41 @@ def panel(images):
     return sheet
 
 
-def make_visuals(cases, plan, output, interrupt):
+def blind_labels(plan):
+    seed = plan.get("blind_seed")
+    if seed is None:
+        return None
+
+    def shuffled(names, scope):
+        def order(name):
+            payload = json.dumps([seed, scope, name], separators=(",", ":"))
+            return hashlib.sha256(payload.encode()).digest()
+
+        return sorted(names, key=order)
+
+    return {
+        case: {"name": f"case_{i:02d}",
+               "arms": {arm: f"arm_{j:02d}" for j, arm in enumerate(shuffled(spec["arms"], [case, "arms"]), 1)},
+               "regions": {region: f"region_{j:02d}" for j, region in enumerate(shuffled(spec["crops"], [case, "regions"]), 1)}}
+        for i, case in enumerate(shuffled(plan["cases"], "cases"), 1)
+        for spec in (plan["cases"][case],)
+    }
+
+
+def make_visuals(cases, plan, output, interrupt, presentation=None):
     from PIL import features
 
     codec, extension = ("WEBP", "webp") if features.check("webp") else ("PNG", "png")
     lossless = {"lossless": True, "method": 4} if codec == "WEBP" else {}
-    files, mapping, panels = {}, {}, {}
+    files, panels = {}, {}
     for case_name, spec in plan["cases"].items():
         report = cases[case_name]
-        if report["qualification"] != "qualified":
+        if report["comparison_status"] == "unavailable":
             continue
         images = {}
         for arm, pin in spec["arms"].items():
+            if report["arms"][arm]["qualification"] != "qualified":
+                continue
             interrupt()
             try:
                 pixels, provenance = open_final(output, pin, pin["final"], spec["resolution"])
@@ -120,11 +146,10 @@ def make_visuals(cases, plan, output, interrupt):
                 continue
             images[arm] = pixels
             report["arms"][arm]["final_image"] = {"status": "qualified", **provenance}
-        ordered = list(images)
-        if plan.get("blind_seed"):
-            ordered.sort(key=lambda arm: hashlib.sha256(f"{plan['blind_seed']}:{case_name}:{arm}".encode()).digest())
-        names = {arm: f"arm_{i+1:02d}" if plan.get("blind_seed") else arm for i, arm in enumerate(ordered)}
-        mapping[case_name] = {name: arm for arm, name in names.items()}
+        entry = presentation[case_name] if presentation is not None else None
+        names = entry["arms"] if entry else {arm: arm for arm in images}
+        case_label = entry["name"] if entry else case_name
+        ordered = [arm for arm in names if arm in images]
         if "sham" in images:
             for arm, pixels in images.items():
                 report["arms"][arm]["final_image"]["pixel_delta_from_sham"] = pixel_metrics(images["sham"], pixels)
@@ -132,11 +157,10 @@ def make_visuals(cases, plan, output, interrupt):
         for arm in ordered:
             interrupt()
             for region, box in spec.get("visual_crops", spec["crops"]).items():
-                basename = f"visual/{case_name}/crops/{region}/{names[arm]}.{extension}"
+                region_label = entry["regions"][region] if entry else region
+                basename = f"visual/{case_label}/crops/{region_label}/{names[arm]}.{extension}"
                 files[basename] = encode(images[arm].crop(box), codec, **lossless)
-        panels[case_name] = [(names[arm], preview(images[arm], 560)) for arm in ordered]
-    if plan.get("blind_seed"):
-        files["unblinding.json"] = json.dumps(mapping, indent=2).encode()
+        panels[case_label] = [(names[arm], preview(images[arm], 560)) for arm in ordered]
     return files, panels
 
 

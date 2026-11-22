@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import tempfile
+from secrets import token_hex
 from io import StringIO
 from pathlib import Path
 from time import perf_counter
@@ -16,8 +17,8 @@ from safetensors import SafetensorError
 
 from .objectives import direction_control
 from .report_inputs import PROVENANCE, STATE_KEYS, key, load_state, require, resolve_arm
-from .report_metrics import cosine, norms, odd_even, proposal_metrics, ratio, region_metrics, response_geometry, spectral
-from .report_visuals import encode, jpeg_evidence, make_visuals, panel, preview
+from .report_metrics import cosine, norms, odd_even, proposal_metrics, ratio, region_metrics, response_geometry, restrict_geometry, spectral
+from .report_visuals import blind_labels, encode, jpeg_evidence, make_visuals, panel, preview
 from .trajectory import LABEL, _root
 
 LOGGER = logging.getLogger("ModeExplorer")
@@ -29,6 +30,9 @@ MIB = 1024**2
 def _validate_plan(plan):
     name, cases = plan["name"], plan["cases"]
     budget = plan.get("budget_mib", 15)
+    seed = plan.get("blind_seed")
+    require(seed is None or type(seed) is int or isinstance(seed, str) and 0 < len(seed) <= 256,
+            "invalid_blinding_seed")
     require(isinstance(name, str) and LABEL.fullmatch(name) and isinstance(cases, dict) and 0 < len(cases) <= 4
             and type(budget) is int and 2 <= budget <= 30, "invalid_campaign_name_case_count_or_zip_budget")
     for case, spec in cases.items():
@@ -48,9 +52,14 @@ def _validate_plan(plan):
                 "visual_crop_must_be_inside_registered_region")
         require(len(set(spec.get("intermediate_steps", []))) <= 2, "select_at_most_two_intermediate_steps")
         require(len(set(pin["label"] for pin in arms.values())) == len(arms), "duplicate_arm_labels")
+        require(all(type(pin.get("require_runtime_telemetry", False)) is bool for pin in arms.values()),
+                "invalid_runtime_telemetry_policy")
         require(not arms["sham"]["applied"] and "id" in arms["sham"], "sham_must_be_a_pinned_unedited_control")
         require(spec.get("direction_reference") is None or spec["direction_reference"] in arms,
                 "unknown_direction_reference_arm")
+        require(type(spec.get("allow_partial", False)) is bool, "invalid_partial_comparison_policy")
+        require(not spec.get("allow_partial") or not (spec.get("direction_reference") or plan.get("regressions")),
+                "partial_comparisons_require_independent_arms_without_positional_regressions")
 
 
 def _record_failure(report, arm, check, reason):
@@ -125,8 +134,56 @@ def _check_direction(records, spec, report):
     return {str(block): response_geometry(group) for block, group in groups.items()}
 
 
-def analyze_case(name, spec, root, interrupt, vae=None):
-    report = {"qualification": "qualified", "arms": {}, "evaluations": [], "sham": "sham"}
+def _check_initial(records, report):
+    baseline = records["sham"][0]
+    solvers = {arm: row[0]["solver_input"] for arm, row in records.items() if "solver_input" in row[0]}
+    # Without an exact control, disagreement makes the exact input origin
+    # ambiguous for every provider. Legacy comparisons retain their own basis.
+    exact = solvers.get("sham") if "sham" in solvers else next(iter(solvers.values()), None)
+    ambiguous = "sham" not in solvers and any(not torch.equal(exact, field) for field in solvers.values())
+    for arm, (tensors, *_) in records.items():
+        if not torch.equal(baseline["frozen_native_input"], tensors["frozen_native_input"]) or (
+                arm in solvers and (ambiguous or not torch.equal(exact, solvers[arm]))):
+            _record_failure(report, arm, "initial_noisy_input", "initial_noisy_input_mismatch")
+        else:
+            report["arms"][arm]["checks"]["initial_noisy_input"] = (
+                "native_and_solver_exact_among_available" if arm in solvers else "native_exact_solver_unavailable")
+
+
+def _check_histories(records, report):
+    histories = {arm: row[1]["reference_history"] for arm, row in records.items() if "reference_history" in row[1]}
+    if not histories:
+        return
+    baseline = histories.get("sham", next(iter(histories.values())))
+    divergent = [arm for arm, history in histories.items() if history != baseline]
+    if divergent:
+        for arm in divergent if "sham" in histories else histories:
+            _record_failure(report, arm, "matched_reference_history", "non_equivalent_reference_history")
+
+
+def _restrict_case(report, surviving):
+    for row in report["evaluations"]:
+        row["arms"] = {arm: value for arm, value in row["arms"].items() if arm in surviving}
+        row["response_geometry"] = restrict_geometry(row["response_geometry"], surviving)
+    groups = report["initial_proposal_groups_by_block"]
+    report["initial_proposal_groups_by_block"] = {
+        block: restrict_geometry(group, surviving)
+        for block, group in groups.items() if surviving.intersection(group["arms"])
+    }
+
+
+def _check_runtime_telemetry(state, intervention, required):
+    if required and intervention is not None:
+        require(state.get("feature_geometry") is not None and intervention["objective_after"] is not None,
+                "missing_runtime_feature_geometry_or_post_edit_objective")
+        if state["feature_applied"]:
+            error = intervention["realization_error_rms"]
+            require(error is not None and math.isfinite(error) and error >= 0, "missing_runtime_realization_error")
+
+
+def analyze_case(name, spec, root, interrupt, vae=None, presentation=None):
+    report = {"qualification": "qualified", "comparison_status": "unavailable", "arms": {}, "evaluations": [], "sham": "sham"}
+    allow_partial = spec.get("allow_partial", False)
     selected, base_data = {}, None
     for arm in ("sham", *(a for a in spec["arms"] if a != "sham")):
         interrupt()
@@ -180,6 +237,7 @@ def analyze_case(name, spec, root, interrupt, vae=None):
                 intervention = (proposal_metrics(tensors["compact_feature_proposal"], state, data["settings"],
                                                 tensors["baseline_clean"].shape)
                                 if "compact_feature_proposal" in tensors else None)
+                _check_runtime_telemetry(state, intervention, spec["arms"][arm].get("require_runtime_telemetry"))
             except INPUT_ERRORS as exc:
                 _record_failure(report, arm, f"tensor_state_{i:03d}", exc)
                 continue
@@ -193,30 +251,21 @@ def analyze_case(name, spec, root, interrupt, vae=None):
         step, opportunity, sigma = key(next(iter(records.values()))[1])
         LOGGER.info("ModeExplorer report %s: checked actual step %d (%d/%d)", name, step, i+1,
                     len(next(iter(selected.values()))[1]["states"]))
-        if i == 0 and len(records) == len(spec["arms"]):
-            initial = records["sham"][0]["frozen_native_input"]
-            solver = next((value["solver_input"] for value, *_ in records.values() if "solver_input" in value), None)
-            for arm, (tensors, *_) in records.items():
-                identical = torch.equal(initial, tensors["frozen_native_input"])
-                if solver is not None and "solver_input" in tensors:
-                    identical = identical and torch.equal(solver, tensors["solver_input"])
-                if not identical:
-                    _record_failure(report, arm, "initial_noisy_input", "initial_noisy_input_mismatch")
-                else:
-                    report["arms"][arm]["checks"]["initial_noisy_input"] = (
-                        "native_and_solver_exact_among_available" if "solver_input" in tensors else "native_exact_solver_unavailable")
+        if i == 0 and "sham" in records:
+            _check_initial(records, report)
+        if i < 2:
+            _check_histories(records, report)
+        records = {arm: row for arm, row in records.items() if report["arms"][arm]["qualification"] == "qualified"}
+        if "sham" not in records or len(records) < 2 or (not allow_partial and report["qualification"] != "qualified"):
+            continue
+        if i == 0:
             report["initial_proposal_groups_by_block"] = _check_direction(records, spec, report)
+            if report["qualification"] != "qualified" and not allow_partial:
+                continue
             if spec.get("direction_reference") and all(v[3] is not None for v in records.values()):
                 rounded = [v[3]["native_rounded_realized_rms"] for arm, v in records.items() if arm != "sham"]
                 report["initial_realized_rms_relative_spread"] = (max(rounded) / min(rounded) - 1
                                                                 if rounded and all(rounded) else None)
-        if i < 2 and len(records) == len(spec["arms"]):
-            histories = {arm: row[1]["reference_history"] for arm, row in records.items() if "reference_history" in row[1]}
-            if histories and any(history != next(iter(histories.values())) for history in histories.values()):
-                for arm in histories:
-                    _record_failure(report, arm, "matched_reference_history", "non_equivalent_reference_history")
-        if report["qualification"] != "qualified" or len(records) != len(spec["arms"]):
-            continue
         interrupt()
         deltas, measurements = _measure_evaluation(records, records["sham"][0], chosen, first, spec, step)
         measurements.update(solver_step=step, opportunity=opportunity, sigma=sigma)
@@ -231,11 +280,11 @@ def analyze_case(name, spec, root, interrupt, vae=None):
 
             begin = perf_counter()
             LOGGER.info("ModeExplorer report %s: decoding selected actual step %d", name, step)
-            imgs = []
+            imgs = {}
             for arm, (tensors, *_) in records.items():
                 interrupt()
-                imgs.append((arm, preview(decode_rgb(vae, tensors[chosen]), 480)))
-            intermediate[f"visual/{name}/intermediate_step_{step:02d}.jpg"] = encode(panel(imgs), "JPEG", quality=86)
+                imgs[arm] = preview(decode_rgb(vae, tensors[chosen]), 480)
+            intermediate[step] = imgs
             decode_time += perf_counter() - begin
     report["vae_decode_seconds"] = decode_time
     for arm, value in report["arms"].items():
@@ -243,16 +292,29 @@ def analyze_case(name, spec, root, interrupt, vae=None):
             value["checks"]["tensor_states"] = "verified"
         if value["checks"].get("initial_noisy_input") == "pending_tensor_verification":
             value["checks"]["initial_noisy_input"] = "unavailable_incomplete_case"
-    if report["qualification"] != "qualified":
+    surviving = {arm for arm, value in report["arms"].items() if value["qualification"] == "qualified"}
+    if ("sham" not in surviving or len(surviving) < 2 or not report["evaluations"]
+            or (not allow_partial and report["qualification"] != "qualified")):
         for field in ("initial_proposal_groups_by_block", "initial_realized_rms_relative_spread"):
             report.pop(field, None)
         report["evaluations"].clear()
         return report, {}
+    if report["qualification"] != "qualified":
+        _restrict_case(report, surviving)
+        report["comparison_status"] = "qualified_subset"
+    else:
+        report["comparison_status"] = "qualified"
     report["terminal_summary"] = {
         arm: {field: data[field] for field in ("clean_delta", "norm_amplification_from_initial", "cosine_to_initial")}
         for arm, data in report["evaluations"][-1]["arms"].items() if arm != "sham"
     }
-    return report, intermediate
+    labels = presentation["arms"] if presentation else {arm: arm for arm in spec["arms"]}
+    case_label = presentation["name"] if presentation else name
+    return report, {
+        f"visual/{case_label}/intermediate_step_{step:02d}.jpg":
+        encode(panel([(label, images[arm]) for arm, label in labels.items() if arm in surviving]), "JPEG", quality=86)
+        for step, images in intermediate.items()
+    }
 
 
 def regression_results(cases, expectations):
@@ -278,6 +340,8 @@ def _summary(report):
              "No DiT forwards were executed by this report.", ""]
     for name, case in report["cases"].items():
         lines.extend([f"## {name}", "", f"Numerical qualification: {case['qualification']}."])
+        if case["comparison_status"] == "qualified_subset":
+            lines.append("Evidence is included for the qualified subset. The complete case gate failed.")
         if case.get("clean_coordinate"):
             lines.append(f"Clean coordinate: `{case['clean_coordinate']}`.")
         for arm, entry in case["arms"].items():
@@ -301,8 +365,6 @@ def _csv(cases):
     writer.writerow(("case", "arm", "solver_step", "opportunity", "actual_ordinal", "sigma", "applied",
                      "clean_rms", "clean_l2", "velocity_rms", "solver_input_rms", "amplification", "initial_cosine"))
     for name, data in cases.items():
-        if data["qualification"] != "qualified":
-            continue
         for row in data["evaluations"]:
             for arm, m in row["arms"].items():
                 writer.writerow((name, arm, row["solver_step"], row["opportunity"], m["actual_ordinal"], row["sigma"], m["applied"],
@@ -350,6 +412,49 @@ def write_report(path, report, files, budget, interrupt):
     return True
 
 
+def _blind_review(report, presentation, review_id):
+    cases = {}
+    for name, labels in presentation.items():
+        case = report["cases"][name]
+        cases[labels["name"]] = {
+            "comparison_status": case["comparison_status"],
+            "arms": {label: {"final_image": "available" if case["arms"][arm].get("final_image", {}).get("status")
+                            == "qualified" else "unavailable"} for arm, label in labels["arms"].items()},
+        }
+    return {"schema": "modeexplorer.blind_review/1", "review_id": review_id, "cases": cases,
+            "qualification": report["qualification"], "visual_evidence": report["visual_evidence"]}
+
+
+BLIND_SUMMARY = (
+    b"# Blinded visual review\n\nUse only the anonymous case and arm IDs to record ratings. "
+    b"The same IDs are used in previews, registered crops and selected intermediate panels. "
+    b"Missing images have no score. Lock ratings before opening the local analysis and mapping.\n"
+)
+
+
+def _publish_blind_report(staging, final, folder, report, presentation, review, interrupt):
+    private = folder / "private"
+    private.mkdir(mode=0o700, exist_ok=True)
+    sidecar = private / f"{review['review_id']}.json"
+    fd, name = tempfile.mkstemp(prefix="analysis_", suffix=".part", dir=private)
+    pending = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"schema": "modeexplorer.blind_review_private/1", "review_id": review["review_id"],
+                       "shareable_zip": final.name, "presentation": presentation, "report": report, "review": review},
+                      f, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        interrupt()
+        pending.replace(sidecar)
+        try:
+            staging.replace(final)
+        except BaseException:
+            sidecar.unlink(missing_ok=True)
+            raise
+    finally:
+        pending.unlink(missing_ok=True)
+    return sidecar
+
+
 class ModeExplorerResearchReport:
     CATEGORY = "model_patches/ModeExplorer"
     RETURN_TYPES = ()
@@ -372,6 +477,7 @@ class ModeExplorerResearchReport:
         require(len(campaign) <= 128 * 1024, "campaign_configuration_too_large")
         plan = json.loads(campaign)
         _validate_plan(plan)
+        presentation = blind_labels(plan)
         require(vae is not None or not any(s.get("intermediate_steps") for s in plan["cases"].values()),
                 "selected_intermediates_require_connected_production_vae")
         report = {"schema": SCHEMA, "name": plan["name"], "qualification": "qualified", "cases": {}, "analysis_device": "cpu",
@@ -379,7 +485,8 @@ class ModeExplorerResearchReport:
         intermediate = {}
         LOGGER.info("ModeExplorer report: qualifying %s on CPU", plan["name"])
         for name, spec in plan["cases"].items():
-            case, previews = analyze_case(name, spec, _root(), interrupt, vae)
+            case, previews = analyze_case(name, spec, _root(), interrupt, vae,
+                                          presentation[name] if presentation else None)
             report["cases"][name] = case
             intermediate.update(previews)
         report["regression"] = regression_results(report["cases"], plan.get("regressions", []))
@@ -388,28 +495,40 @@ class ModeExplorerResearchReport:
             report["qualification"] = "unqualified"
         output = Path(folder_paths.get_output_directory()).resolve()
         LOGGER.info("ModeExplorer report: assembling final-image evidence")
-        visuals, panels = make_visuals(report["cases"], plan, output, interrupt)
+        visuals, panels = make_visuals(report["cases"], plan, output, interrupt, presentation)
         report["visual_evidence"] = "complete" if all(
             arm.get("final_image", {}).get("status") == "qualified" for case in report["cases"].values()
             for arm in case["arms"].values()) else "partial_or_unavailable"
-        base = {**visuals, **intermediate, "SUMMARY.md": _summary(report), "evaluations.csv": _csv(report["cases"])}
+        base = {**visuals, **intermediate}
+        if presentation:
+            review_id = f"blind_review_{token_hex(12)}"
+            upload = _blind_review(report, presentation, review_id)
+            base["SUMMARY.md"] = BLIND_SUMMARY
+        else:
+            review_id = plan["name"]
+            upload = report
+            base.update({"SUMMARY.md": _summary(report), "evaluations.csv": _csv(report["cases"])})
         folder = output / "modeexplorer_research_reports"
         folder.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=f"{plan['name']}_", suffix=".part", dir=folder)
+        fd, temporary = tempfile.mkstemp(prefix=f"{review_id}_", suffix=".part", dir=folder)
         os.close(fd)
         staging = Path(temporary)
         budget = plan.get("budget_mib", 15) * MIB
         try:
             LOGGER.info("ModeExplorer report: writing ZIP with a %d MiB budget", budget // MIB)
             for width, quality in ((560, 90), (480, 86), (384, 82)):
-                report["preview"] = {"width_px": width, "jpeg_quality": quality, "crops": "lossless_native_pixels"}
+                upload["preview"] = {"width_px": width, "jpeg_quality": quality, "crops": "lossless_native_pixels"}
+                upload["archive_budget_bytes"] = budget
                 report["report_generation_seconds_before_zip"] = perf_counter() - started
-                report["archive_budget_bytes"] = budget
-                if write_report(staging, report, {**base, **jpeg_evidence(panels, width, quality)}, budget, interrupt):
+                if write_report(staging, upload, {**base, **jpeg_evidence(panels, width, quality)}, budget, interrupt):
                     final = staging.with_suffix(".zip")
-                    staging.replace(final)
+                    if presentation:
+                        local = _publish_blind_report(staging, final, folder, report, presentation, upload, interrupt)
+                        LOGGER.info("ModeExplorer private analysis and arm mapping: %s", local)
+                    else:
+                        staging.replace(final)
                     LOGGER.info("ModeExplorer report complete: %s, %d bytes, %s, %.2fs",
-                                final, report["archive_size_bytes"], report["qualification"], perf_counter() - started)
+                                final, upload["archive_size_bytes"], report["qualification"], perf_counter() - started)
                     return ()
             raise ValueError("Lossless evidence exceeds the report budget. Narrow the report's fixed crop policy or increase its budget.")
         finally:

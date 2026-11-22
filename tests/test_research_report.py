@@ -275,3 +275,163 @@ def test_final_png_requires_executable_prompt_and_unambiguous_pixels(tmp_path):
     write(3, "white")
     with pytest.raises(ValueError, match="ambiguous_non_equivalent_final_images"):
         open_final(tmp_path, pin, final, [32, 32])
+
+
+def add_alternate(root, spec, corrupt_stage=None):
+    source = root / "trajectory-bbbbbb02"
+    added = root / "trajectory-cccccc03"
+    shutil.copytree(source, added)
+    raw = (added / "manifest.json").read_text().replace(source.name, added.name)
+    data = json.loads(raw)
+    data["label"] = "alternate"
+    data["settings"]["feature_block"] = 0
+    if corrupt_stage == "route":
+        data["routes"][2]["route"] = "actual"
+    if corrupt_stage == "terminal":
+        path = added / "002.safetensors"
+        tensors = load_file(path)
+        tensors["solver_clean"].add_(1)
+        save_file(tensors, path)
+    (added / "manifest.json").write_text(json.dumps(data))
+    spec["arms"]["alternate"] = {**spec["arms"]["edit"], "label": "alternate", "block": 0}
+
+
+@pytest.mark.parametrize("failure", ["route", "terminal"])
+def test_partial_case_segregates_rejected_arm_at_all_evaluations(campaign, failure):
+    root, spec = campaign
+    complete, _ = analyze_case("fixture", spec, root, lambda: None)
+    add_alternate(root, spec, failure)
+    spec["allow_partial"] = True
+    subset, _ = analyze_case("fixture", spec, root, lambda: None)
+    assert subset["qualification"] == "unqualified"
+    assert subset["comparison_status"] == "qualified_subset"
+    assert subset["arms"]["alternate"]["qualification"] == "unqualified"
+    assert subset["evaluations"] == complete["evaluations"]
+    assert subset["initial_proposal_groups_by_block"] == complete["initial_proposal_groups_by_block"]
+    assert subset["terminal_summary"] == complete["terminal_summary"]
+
+    spec["allow_partial"] = False
+    strict, _ = analyze_case("fixture", spec, root, lambda: None)
+    assert strict["comparison_status"] == "unavailable"
+    assert strict["evaluations"] == []
+
+
+def test_partial_case_requires_qualified_sham(campaign):
+    root, spec = campaign
+    (root / "trajectory-aaaaaa01/002.safetensors").unlink()
+    spec["allow_partial"] = True
+    case, _ = analyze_case("fixture", spec, root, lambda: None)
+    assert case["comparison_status"] == "unavailable"
+    assert case["evaluations"] == []
+
+
+def test_refreshed_arm_requires_runtime_feature_telemetry(campaign):
+    root, spec = campaign
+    spec["arms"]["edit"]["require_runtime_telemetry"] = True
+    case, _ = analyze_case("fixture", spec, root, lambda: None)
+    assert case["arms"]["edit"]["reason"] == "missing_runtime_feature_geometry_or_post_edit_objective"
+    for i in range(2):
+        def complete(data, state):
+            state.update(feature_geometry={"block": 2, "patch_grid": [2, 2], "channels": 4,
+                                           "proposal_shape": [1, 4, 2, 2]},
+                         objective_after=[.6], realization_error_rms=[.001] if i == 0 else None)
+
+        modify(root, complete, ordinal=i)
+    case, _ = analyze_case("fixture", spec, root, lambda: None)
+    assert case["qualification"] == "qualified"
+    first = case["evaluations"][0]["arms"]["edit"]["proposal"]
+    assert first["sources"]["geometry"] == "recomputed_and_verified_against_runtime"
+    assert first["realization_error_rms"] == .001
+
+
+def test_blind_zip_can_be_shared_without_private_evidence(campaign):
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+    from mode_explorer.report_visuals import blind_labels
+
+    root, spec = campaign
+
+    class FixtureVAE:
+        def decode(self, samples):
+            return torch.full((1, 32, 32, 3), .5)
+
+    spec["intermediate_steps"] = [0]
+    for arm, color in (("sham", (243, 0, 0)), ("edit", (0, 0, 251))):
+        prefix = f"private_{arm}_name"
+        spec["arms"][arm]["final"] = {"prefix": prefix}
+        metadata = PngInfo()
+        metadata.add_text("prompt", "{}")
+        metadata.add_text("private_metadata", "source_word")
+        Image.new("RGB", (32, 32), color).save(root.parent / f"{prefix}_00001_.png", pnginfo=metadata)
+    plan = {"name": "private_campaign_title", "blind_seed": 0,
+            "cases": {"recognizable_case_title": spec}}
+    presentation = blind_labels(plan)
+    assert presentation == blind_labels(json.loads(json.dumps(plan, sort_keys=True)))
+
+    ModeExplorerResearchReport().report(json.dumps(plan), vae=FixtureVAE())
+    out = root.parent / "modeexplorer_research_reports"
+    public, = out.glob("*.zip")
+    local, = (out / "private").glob("*.json")
+    private = json.loads(local.read_text())
+    assert public.name.startswith("blind_review_") and private["shareable_zip"] == public.name
+    assert private["presentation"] == presentation
+    assert private["report"]["configuration"] == plan
+    assert private["report"]["cases"]["recognizable_case_title"]["arms"]["edit"]["archive_id"] == "trajectory-bbbbbb02"
+    with ZipFile(public) as archive:
+        review = json.loads(archive.read("report.json"))
+        assert review["review_id"] == private["review_id"] == local.stem
+        assert review["schema"] == "modeexplorer.blind_review/1"
+        assert set(review) == {"schema", "review_id", "cases", "qualification", "visual_evidence",
+                               "preview", "archive_budget_bytes", "inventory", "archive_size_bytes", "first_zip_write_seconds"}
+        assert set(review["cases"]) == {"case_01"}
+        assert set(review["cases"]["case_01"]["arms"]) == {"arm_01", "arm_02"}
+        assert "visual/case_01/intermediate_step_00.jpg" in archive.namelist()
+        assert len([p for p in archive.namelist() if "/final/arm_" in p]) == 2
+        for item in archive.namelist():
+            assert item in ("SUMMARY.md", "report.json") or item.startswith("visual/case_01/")
+            assert "left" not in item and "private" not in item
+            raw = archive.read(item)
+            for secret in (b"source_word", b"private_", b"recognizable_case_title", b"trajectory-",
+                           b"blind_seed", b"pixel_sha256", b"solver_clean", b"pixel_delta_from_sham", b"sham"):
+                assert secret not in raw
+
+
+def test_blind_publish_removes_mapping_if_zip_publish_fails(campaign, monkeypatch):
+    from pathlib import Path
+
+    root, spec = campaign
+    original = Path.replace
+
+    def fail_zip(self, target):
+        if target.suffix == ".zip":
+            raise OSError("simulated_publish_error")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_zip)
+    with pytest.raises(OSError, match="simulated_publish_error"):
+        ModeExplorerResearchReport().report(json.dumps({"name": "fixture", "blind_seed": "secret",
+                                                         "cases": {"paired": spec}}))
+    folder = root.parent / "modeexplorer_research_reports"
+    assert not [path for path in folder.rglob("*") if path.is_file()]
+
+
+def test_partial_report_only_packages_qualified_arms(campaign):
+    from PIL import Image
+
+    root, spec = campaign
+    add_alternate(root, spec, "terminal")
+    spec["allow_partial"] = True
+    for arm in spec["arms"]:
+        spec["arms"][arm]["final"] = {"prefix": arm}
+        Image.new("RGB", (32, 32)).save(root.parent / f"{arm}_00001_.png")
+    ModeExplorerResearchReport().report(json.dumps({"name": "partial", "cases": {"paired": spec}}))
+    final, = (root.parent / "modeexplorer_research_reports").glob("*.zip")
+    with ZipFile(final) as archive:
+        result = json.loads(archive.read("report.json"))
+        assert result["qualification"] == "unqualified"
+        assert result["cases"]["paired"]["comparison_status"] == "qualified_subset"
+        assert "qualified subset" in archive.read("SUMMARY.md").decode()
+        assert result["cases"]["paired"]["arms"]["alternate"]["reason"].endswith("solver clean fingerprint mismatch.")
+        assert any("/final/edit.jpg" in name for name in archive.namelist())
+        assert all("alternate" not in name for name in archive.namelist())
+        assert b"alternate" not in archive.read("evaluations.csv")

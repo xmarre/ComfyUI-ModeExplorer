@@ -35,6 +35,10 @@ def response_geometry(vectors):
     for i, left in enumerate(values):
         for j in range(i + 1):
             gram[i][j] = gram[j][i] = _dot(left, values[j])
+    return geometry_from_gram(names, gram)
+
+
+def geometry_from_gram(names, gram):
     lengths = [math.sqrt(row[i]) for i, row in enumerate(gram)]
     eig = torch.linalg.eigvalsh(torch.tensor(gram, dtype=torch.float64)).clamp_min(0).flip(0)
     total = float(eig.sum())
@@ -46,6 +50,13 @@ def response_geometry(vectors):
                             for i in range(len(names))],
             "singular_values_sampled_responses": eig.sqrt().tolist(),
             "entropy_effective_rank_sampled_responses": effective}
+
+
+def restrict_geometry(geometry, arms):
+    names = geometry["arms"]
+    indices = [i for i, name in enumerate(names) if name in arms]
+    gram = geometry["gram"]
+    return geometry_from_gram([names[i] for i in indices], [[gram[i][j] for j in indices] for i in indices])
 
 
 def cosine(left, right):
@@ -91,7 +102,9 @@ def proposal_metrics(proposal, state, settings, latent_shape):
             "reference_slots": state["reference_slots"], "reference_history": state.get("reference_history"),
             "applied_actual_ordinal": state["ordinal"] if state["feature_applied"] else None,
             "sources": {"compact_and_expanded": "recomputed", "realized_rms_and_objective": "runtime_telemetry",
-                        "realized_l2": "derived_from_runtime_rms_and_element_count", "realized_tensor": "unavailable"}}
+                        "realized_l2": "derived_from_runtime_rms_and_element_count", "realized_tensor": "unavailable",
+                        "geometry": ("recomputed_and_verified_against_runtime" if state.get("feature_geometry") is not None
+                                     else "recomputed_runtime_geometry_unavailable")}}
 
 
 def region_metrics(delta, crops, resolution):
