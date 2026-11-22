@@ -1,0 +1,25 @@
+{
+  "protocol": 1,
+  "screening": [
+    {"id": "portrait", "seed": 962314701, "prompt": "An unretouched editorial photograph of a ceramicist by a north-facing workshop window, holding a small celadon cup between both hands. Visible pores, ash on the apron, bounced daylight, sparse background."},
+    {"id": "anatomy", "seed": 439821507, "prompt": "A full-body documentary photograph of a bicycle courier kneeling to thread a chain through the rear derailleur at a curb. Show both shoes, one hand on the pedal and the other guiding the chain, rain-dark pavement, candid posture."},
+    {"id": "interaction", "seed": 728019333, "prompt": "Two people at a crowded night market pass a paper-wrapped bundle over a low counter, with each person's hands visibly gripping opposite ends. A vendor's balance scale stands separately at the right, warm lights and realistic distances."},
+    {"id": "architecture", "seed": 170483029, "prompt": "Photograph straight down a vaulted stone railway arcade, repeating columns and parallel floor joints converging toward a single vanishing point. The last arch opens onto a bright courtyard, no people, faithful construction geometry."},
+    {"id": "texture", "seed": 547901121, "prompt": "Macro product photograph of a scratched brass compass half-open on coarse indigo linen next to a fractured white shell. Distinguish the directional weave, shallow metal scratches and the shell's layered edge, subdued afternoon light."},
+    {"id": "layout", "seed": 813656705, "prompt": "A documentary photograph of a red kettle on the left end of a black workbench, a clear jar of screws directly behind the kettle, and a folded blue cloth on the far right. In a mirror above the bench the same objects appear in a consistent reflection."}
+  ],
+  "confirmation": [
+    {"id": "portrait", "seed": 479215026, "prompt": "A candid photograph of an elderly watchmaker wearing magnifying glasses, face turned slightly toward a lamp, both hands holding the same small watch movement. Keep the skin and lenses realistic."},
+    {"id": "anatomy", "seed": 641507389, "prompt": "Full-length reportage image of a woman carrying a folded wooden chair up three steep steps, one foot planted on a step, both hands visibly supporting the chair, side lighting on a rainy day."},
+    {"id": "interaction", "seed": 326149153, "prompt": "Two climbers at ground level exchange a rope coil, both people visible from boots to heads. The near person wears green and the far person wears orange, hands and rope clearly separated from the rocky background."},
+    {"id": "architecture", "seed": 902875618, "prompt": "Wide interior photograph of an empty concrete staircase wrapping a rectangular light well. Continuous straight rails, parallel repeating landings, and physically consistent skylight shadows."},
+    {"id": "texture", "seed": 514209632, "prompt": "Photograph a rough jagged geode beside a fine nylon repair patch and a piece of smooth slate. Three materially distinct surfaces in the same shallow light, no oversharpening halos."},
+    {"id": "layout", "seed": 268751460, "prompt": "A low camera faces three separate glass containers on a pale kitchen counter. A green pear sits behind the left container, the middle container holds three dark plums, and the right container is empty. Preserve the ordering and transparent glass boundaries."}
+  ],
+  "optional_identity": {
+    "screening_seed": 693824155,
+    "confirmation_seed": 147652841,
+    "screening_prompt": "{identity}, natural shoulder-up photograph on a windy station platform, side light and a dark wool coat.",
+    "confirmation_prompt": "{identity}, candid seated indoor photograph in soft window light, neutral expression and light knit clothing."
+  }
+}
