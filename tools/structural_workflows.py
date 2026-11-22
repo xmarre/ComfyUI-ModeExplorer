@@ -89,9 +89,9 @@ def validate_widget_serialization(graph):
 
 def _feature_widget_fields(values):
     names = widget_fields(ModeExplorer)
-    # Historical Phase I–III archives predate the two trailing ablation controls.
-    if isinstance(values, list) and len(values) == len(names) - 2:
-        return names[:-2]
+    # Published examples and campaign exports predate different trailing inputs.
+    if isinstance(values, list) and len(values) in (len(names) - 5, len(names) - 3, len(names) - 1):
+        return names[:len(values)]
     return names
 
 def widgets(node, cls):

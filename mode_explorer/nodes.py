@@ -6,6 +6,15 @@ from .runtime import (
     diffusion_wrapper, has_spectrum, verify_patch_graph,
 )
 
+STRUCTURAL_MODES = {
+    "Early Structural (B0)": 0,
+    "Early Structural (B1)": 1,
+    "Early Structural (B2)": 2,
+    "Amplified Structural (B5)": 5,
+    "Middle Refinement": -1,
+}
+MODES = ("Original", *STRUCTURAL_MODES, "Custom")
+
 
 def _remove_modeexplorer_wrappers(clone):
     from comfy.patcher_extension import WrappersMP
@@ -27,7 +36,7 @@ class ModeExplorer:
     CATEGORY = "model_patches/ModeExplorer"
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
-    DESCRIPTION = "Experimental early-flow feature guidance and optional initial-noise optimization for Krea 2."
+    DESCRIPTION = "Selectable early-flow feature guidance and optional initial-noise optimization for native Krea 2."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -47,7 +56,7 @@ class ModeExplorer:
             "full_spectrum": ("BOOLEAN", {"default": Settings.full_spectrum,
                 "tooltip": "Experimental: leave Spectrum's forecast policy/history untouched. Forecasted steps cannot receive guidance; cross-regime extrapolation is unvalidated."}),
         }, "optional": {
-            "feature_block": ("INT", {"default": Settings.feature_block, "min": -1, "max": 63, "tooltip": "Zero-based native single-stream block. -1 resolves to floor(block count / 2) on the loaded Krea 2 model."}),
+            "feature_block": ("INT", {"default": Settings.feature_block, "min": -1, "max": 0x7fffffff, "tooltip": "Original and Custom: zero-based native single-stream block. -1 resolves to floor(block count / 2) on the loaded Krea 2 model."}),
             "feature_grid": ([str(grid) for grid in FEATURE_GRIDS], {"default": str(Settings.feature_grid), "tooltip": "Maximum spatial cells on each axis."}),
             "cosine_temperature": ("FLOAT", {"default": Settings.cosine_temperature, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Cosine objective only. Changes the weighting for cohorts of at least three valid members."}),
             "volume_bandwidth": ("FLOAT", {"default": Settings.volume_bandwidth, "min": 0.25, "max": 1.25, "step": 0.05, "tooltip": "RBF objective only, for cohorts of at least three. Ignored when median bandwidth is enabled."}),
@@ -64,16 +73,29 @@ class ModeExplorer:
             "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
             "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
             "trajectory_roi": ("STRING", {"default": "", "tooltip": "Optional pre-gate token ROI at the feature block, y0,y1,x0,x1 in patch-grid coordinates. At most 64 tokens."}),
-            "feature_application": (list(FEATURE_APPLICATIONS), {"default": "all", "tooltip": "Gate feature application independently of proposal and reference computation."}),
-            "ablation_route": ("STRING", {"default": "", "tooltip": "Expected actual/forecast route (A/F) for temporal ablation. Empty uses normal production behavior."}),
+            "feature_application": (list(FEATURE_APPLICATIONS), {"default": "all", "tooltip": "Custom: apply all, the first or the second eligible proposal. Original uses all unless a research ablation route is supplied."}),
+            "ablation_route": ("STRING", {"default": "", "tooltip": "Original only: expected actual/forecast route (A/F) for research ablation. Leave empty for production."}),
+            # Preserve the positional widget indices of archived workflows.
+            "mode": (list(MODES), {"default": "Original", "tooltip": "Original keeps the historical controls. Structural presets set depth and apply only the first eligible proposal. Custom uses the block and application widgets."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
               strength=Settings.strength, fidelity=Settings.fidelity, min_sigma=Settings.min_sigma,
               adaptive=Settings.adaptive, similarity=Settings.similarity, operation=Settings.operation,
               reference_budget=Settings.reference_budget, diagnostics=Settings.diagnostics,
-              full_spectrum=Settings.full_spectrum, **advanced):
+              full_spectrum=Settings.full_spectrum, mode="Original", **advanced):
         from comfy.patcher_extension import WrappersMP
+
+        if mode not in MODES:
+            raise ValueError(f"Unknown ModeExplorer mode: {mode!r}.")
+        ablation = advanced.get("ablation_route", "")
+        application = advanced.get("feature_application", "all")
+        if ablation and (mode != "Original" or not enabled):
+            raise ValueError("Temporal ablation requires enabled Original mode.")
+        if mode == "Original" and application != "all" and not ablation:
+            raise ValueError("Use Custom for a production application schedule or supply a research ablation route.")
+        if mode in STRUCTURAL_MODES:
+            advanced.update(feature_block=STRUCTURAL_MODES[mode], feature_application="first_only")
 
         base_options = model.model_options
         wrapper_types = (WrappersMP.SAMPLER_SAMPLE, WrappersMP.DIFFUSION_MODEL)
@@ -82,9 +104,8 @@ class ModeExplorer:
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
-        if (advanced.get("ablation_route") or advanced.get("feature_application", "all") != "all") and not enabled:
-            raise ValueError("Enable the ModeExplorer node to run a temporal ablation.")
-        active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi") or advanced.get("ablation_route") or advanced.get("feature_application", "all") != "all" or (strength != 0 and (feature != "native" or initialization)))
+        active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi")
+                              or ablation or (strength != 0 and (feature != "native" or initialization)))
         if guidance is not None:
             if active:
                 raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")

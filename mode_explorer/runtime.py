@@ -49,6 +49,7 @@ REFERENCE_SELECTIONS = ("all", "closest")
 REFERENCE_CONTINUATIONS = ("first_estimate", "rolling_euler")
 FEATURE_UPDATES = ("bounded", "verified")
 FEATURE_APPLICATIONS = ("all", "first_only", "second_only")
+APPLICATION_ORDINALS = {"first_only": 1, "second_only": 2}
 FEATURE_DIRECTIONS = ("repel", "reverse", "channel_sign")
 FEATURE_GRIDS = (2, 4, 6, 8)
 CONDITION_FLAGS = frozenset({
@@ -95,7 +96,7 @@ class Settings:
     def __post_init__(self):
         if self.feature_application not in FEATURE_APPLICATIONS:
             raise ValueError("Unknown ModeExplorer feature application schedule.")
-        if self.feature_application != "all" or self.ablation_route:
+        if self.ablation_route:
             if (not 2 <= len(self.ablation_route) <= 32 or not self.ablation_route.startswith("AA")
                     or set(self.ablation_route) - {"A", "F"} or not self.trajectory_label
                     or self.feature == "native" or self.strength <= 0 or self.initialization or self.full_spectrum
@@ -126,8 +127,10 @@ class Settings:
             raise ValueError("ModeExplorer reference_budget must be an integer in [0, 4]")
         if type(self.initialization_trials) is not int or not 1 <= self.initialization_trials <= 3:
             raise ValueError("ModeExplorer initialization_trials must be an integer in [1, 3]")
+        if type(self.feature_block) is not int or self.feature_block < 0:
+            raise ValueError("ModeExplorer feature_block must be a nonnegative integer.")
         for key, low, high in (
-            ("feature_block", 0, 63), ("reference_bank_size", 2, 256),
+            ("reference_bank_size", 2, 256),
             ("reference_trajectories", 1, 3),
         ):
             value = getattr(self, key)
@@ -562,8 +565,11 @@ def attention_feature(output, options):
     if settings.feature_update == "verified":
         areas = cell_areas(height, width, *current.shape[-2:], settings.feature_grid, output.device)
     frame.run.feature_attempts += 1
+    # Research qualifies fixed actual-evaluation ordinals. Production counts
+    # eligible proposals, so forecasts and negative-only calls cannot spend one.
+    ordinal = frame.run.native_dit_calls if settings.ablation_route else frame.run.feature_attempts
     apply_edit = not settings.sham and (
-        settings.feature_application == "all" or frame.run.native_dit_calls == FEATURE_APPLICATIONS.index(settings.feature_application)
+        settings.feature_application == "all" or ordinal == APPLICATION_ORDINALS[settings.feature_application]
     )
     frame.attempted = apply_edit
     shift, redundancy, loss = feature_shift(
@@ -699,7 +705,7 @@ def reference_slot(settings, seed, index):
 
 
 def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, options, kwargs, index,
-                   *, sol_evaluations=None, capture_blocks=()):
+                   *, sol_evaluations=None, capture_blocks=(), retain_state=True):
     from comfy.model_management import throw_exception_if_processing_interrupted
 
     throw_exception_if_processing_interrupted()
@@ -753,10 +759,11 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
     observed = anchor.taps.keys() == set(capture_blocks) if capture_blocks else anchor.seen
     if not observed:
         raise RuntimeError("ModeExplorer did not reach the expected Krea 2 attention hook during the reference forward.")
-    if rolling:
-        state.latent, state.velocity, state.sigma = shadow.float(), velocity.float(), frame.sigma
-    elif state.clean is None:
-        state.clean = shadow.float() - frame.sigma * velocity.float()
+    if retain_state:
+        if rolling:
+            state.latent, state.velocity, state.sigma = shadow.float(), velocity.float(), frame.sigma
+        elif state.clean is None:
+            state.clean = shadow.float() - frame.sigma * velocity.float()
     if settings.ablation_route:
         state.last_sampled_sigma = frame.sigma
     return anchor.taps if capture_blocks else anchor.pooled
@@ -850,7 +857,10 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         return forward(arguments)
     # All native solver rows share the same scalar. Verify custom schedules
     # defensively so guidance never couples distinct timesteps.
-    low, high = as_list(torch.stack((sigmas.amin(), sigmas.amax())))
+    if run.batch == 1:
+        low = high = float(sigmas[0].float())
+    else:
+        low, high = as_list(torch.stack((sigmas.amin(), sigmas.amax())))
     if not math.isfinite(low) or high != low:
         run.reasons.add("nonuniform_sigma")
         return forward(arguments)
@@ -872,15 +882,19 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     if active and run.batch == 1:
         def prepare():
             remaining = run.settings.reference_budget - run.reference_calls
-            indices = range(min(run.settings.reference_trajectories, remaining))
+            indices = [index for index in range(min(run.settings.reference_trajectories, remaining))
+                       if index not in run.shadows or low <= run.shadows[index].sigma]
+            retain_state = (len(indices) < remaining or run.settings.diagnostics
+                            or run.trajectory is not None or run.response is not None)
             references = [
                 shadow_forward(executor, run, frame, x, timesteps, context, attention_mask,
-                               ref_latents, options, kwargs, index)
+                               ref_latents, options, kwargs, index, retain_state=retain_state)
                 for index in indices
-                if index not in run.shadows or low <= run.shadows[index].sigma
             ]
+            if not retain_state:
+                run.shadows.clear()
             if references:
-                frame.reference = torch.cat(references, dim=0)
+                frame.reference = references[0] if len(references) == 1 else torch.cat(references, dim=0)
         frame.prepare = prepare
         if not spectrum_can_prepare(run, options):
             prepare_native_options({FRAME: frame})
