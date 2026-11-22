@@ -138,6 +138,7 @@ def test_production_modes_keep_strength_and_resolve_against_loaded_depth(model, 
     sampler, = patched.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
     assert (sampler.settings.feature_block, sampler.settings.feature_application) == (block, schedule)
     assert (sampler.settings.strength, sampler.settings.fidelity, sampler.settings.reference_budget) == (.037, .71, 3)
+    assert sampler.settings.adaptive is (mode in ("Original", "Custom"))
     assert not (sampler.settings.diagnostics or sampler.settings.trajectory_label or sampler.settings.ablation_route)
 
 
@@ -154,6 +155,32 @@ def test_production_modes_validate_depth_and_bypass_disabled_strength(model):
         node.apply(model, enabled=False, ablation_route="AAFA")
     assert node.apply(model, mode="Amplified Structural (B5)", enabled=False)[0] is model
     assert node.apply(model, mode="Amplified Structural (B5)", strength=0)[0] is model
+
+
+def test_structural_preset_bypasses_closed_adaptive_gate(model, caplog):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    node = ModeExplorer()
+    options = dict(strength=.03, fidelity=.70, diagnostics=True)
+    custom = dict(mode="Custom", feature_block=1, feature_application="first_only")
+
+    gated, = node.apply(model, **custom, **options)
+    assert torch.equal(draw(gated), draw(model))
+    trace = traces(caplog)[-1]
+    points = [p for p in trace["points"] if "shift_rms" in p]
+    assert points[0]["nearest_cosine"][0] < .70
+    assert points[0]["shift_rms"] == [0.0]
+
+    preset, = node.apply(model, mode="Early Structural (B1)", **options)
+    result = draw(preset)
+    trace = traces(caplog)[-1]
+    points = [p for p in trace["points"] if "shift_rms" in p]
+    assert trace["feature_attempts"] == trace["feature_reference_dit_calls"] == 2
+    assert [p["edit_applied"] for p in points] == [True, False]
+    assert points[0]["applied_pooled_shift_rms"][0] > 0
+    assert not torch.equal(result, draw(model))
+
+    fixed, = node.apply(model, adaptive=False, **custom, **options)
+    assert torch.equal(result, draw(fixed))
 
 
 @pytest.mark.parametrize("mode,application,applied", [

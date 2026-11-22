@@ -48,8 +48,8 @@ class ModeExplorer:
             "strength": ("FLOAT", {"default": Settings.strength, "min": 0.0, "max": 1.0, "step": 0.001}),
             "fidelity": ("FLOAT", {"default": Settings.fidelity, "min": 0.0, "max": 1.0, "step": 0.01}),
             "min_sigma": ("FLOAT", {"default": Settings.min_sigma, "min": 0.5, "max": 1.0, "step": 0.01, "tooltip": "Absolute flow sigma. Only the initial empty-latent pass is eligible."}),
-            "adaptive": ("BOOLEAN", {"default": Settings.adaptive, "tooltip": "Scale a feature edit by redundancy above the similarity threshold."}),
-            "similarity": ("FLOAT", {"default": Settings.similarity, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Used only when Adaptive is enabled."}),
+            "adaptive": ("BOOLEAN", {"default": Settings.adaptive, "tooltip": "Original and Custom: scale the feature edit by redundancy above the similarity threshold."}),
+            "similarity": ("FLOAT", {"default": Settings.similarity, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Used by Adaptive in Original and Custom."}),
             "operation": (list(OPERATIONS), {"default": Settings.operation}),
             "reference_budget": ("INT", {"default": Settings.reference_budget, "min": 0, "max": 4, "tooltip": "Maximum extra positive transformer forwards for a single image. Batch guidance uses none."}),
             "diagnostics": ("BOOLEAN", {"default": Settings.diagnostics}),
@@ -76,10 +76,10 @@ class ModeExplorer:
             "feature_application": (list(FEATURE_APPLICATIONS), {"default": "all", "tooltip": "Custom: apply all, the first or the second eligible proposal. Original uses all unless a research ablation route is supplied."}),
             "ablation_route": ("STRING", {"default": "", "tooltip": "Original only: expected actual/forecast route (A/F) for research ablation. Leave empty for production."}),
             # Preserve the positional widget indices of archived workflows.
-            "mode": (list(MODES), {"default": "Original", "tooltip": "Original keeps the historical controls. Structural presets set depth and apply only the first eligible proposal. Custom uses the block and application widgets."}),
+            "mode": (list(MODES), {"default": "Original", "tooltip": "Structural presets apply the first eligible proposal with Adaptive off. Start at strength 0.03 and fidelity 0.70. Custom uses the block, application and Adaptive controls."}),
         }}
         for name, (_, options) in inputs["optional"].items():
-            if name != "mode":
+            if name not in ("feature_block", "feature_application", "mode"):
                 options["advanced"] = True
         return inputs
 
@@ -101,6 +101,7 @@ class ModeExplorer:
             advanced["feature_application"] = "all"
         if mode in STRUCTURAL_MODES:
             advanced.update(feature_block=STRUCTURAL_MODES[mode], feature_application="first_only")
+            adaptive = False
 
         base_options = model.model_options
         wrapper_types = (WrappersMP.SAMPLER_SAMPLE, WrappersMP.DIFFUSION_MODEL)

@@ -92,6 +92,13 @@ def test_mode_is_appended_and_legacy_widget_encodings_round_trip():
                 validate_widget_serialization(round_trip)
 
 
+def test_custom_mode_controls_are_visible_in_the_standard_widget_group():
+    optional = ModeExplorer.INPUT_TYPES()["optional"]
+    for name in ("mode", "feature_block", "feature_application"):
+        assert not optional[name][1].get("advanced")
+    assert optional["trajectory_label"][1]["advanced"]
+
+
 @pytest.mark.parametrize("filename,mode", [
     ("turbo.json", "Early Structural (B1)"),
     ("scale_locked_spectrum.json", "Early Structural (B2)"),

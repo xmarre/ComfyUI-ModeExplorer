@@ -23,9 +23,9 @@ The core Model Attention Backend can select PyTorch or Comfy Kitchen upstream. A
 | **Middle Refinement** | Floor of half the loaded block count | First eligible proposal only |
 | **Custom** | Feature block, or −1 for the loaded middle | All, first only or second only, as set by Feature application |
 
-The five depth presets set only depth and application schedule. Feature kind, strength, fidelity, reference settings and the optional sham and direction controls retain their widget values. A forced research ablation route requires Original mode. The advanced menu exposes the legacy and research widgets on frontends that support advanced inputs.
+The five depth presets set the block, apply the first eligible proposal and disable adaptive similarity scaling. Feature kind, strength, fidelity, reference settings and the optional sham and direction controls use their widget values. Feature block and Feature application are visible in the standard widget group for Custom. A forced research ablation route requires Original mode.
 
-An eligible proposal comes from a positive actual evaluation in the configured sigma window with the required reference or batch inputs. Forecasts never consume a proposal ordinal. A computed proposal can round to zero or be zero under the adaptive gate. In guarded Spectrum, reference eligibility and the history transition still follow the reference budget and sigma window. Spectrum determines the route at runtime.
+An eligible proposal comes from a positive actual evaluation in the configured sigma window with the required reference or batch inputs. Forecasts never consume a proposal ordinal. Custom with Adaptive enabled can use a scheduled application on a zero shift if the similarity gate is closed. A computed proposal can still be zero if the feature objective produces no shift or the edit rounds to zero in native precision. In guarded Spectrum, reference eligibility and the history transition still follow the reference budget and sigma window. Spectrum determines the route at runtime.
 
 Existing graphs and API prompts that omit Mode use Original. The new widget is appended after the historical fields. When generating workflow JSON, write matching values if supplying both positional and named widgets, and omit obsolete embedded copies of the graph.
 
@@ -37,7 +37,7 @@ Existing graphs and API prompts that omit Mode use Original. The new widget is a
 | **Feature** | Native, cosine or RBF volume. Select Native with Initialization enabled for initialization-only. |
 | **Strength / Fidelity** | Defaults 0.45 and 0.55. Strength scales the feature and noise proposals in 0.001 increments. Fidelity tightens the feature bound and the initialization clean-latent trust region. Feature magnitude depends on the local activation scale, proposal direction and optional adaptive gate. Equal strength across depths can yield different absolute and relative displacements. |
 | **Min sigma** | Absolute minimum flow sigma for feature guidance. Applies to the first full-noise empty-latent pass. Tagged Scale-Locked high-resolution passes bypass ModeExplorer. |
-| **Adaptive / Similarity** | Adaptive scales the edit from zero at the similarity threshold toward its maximum at cosine 1. Fixed mode keeps the fidelity bound. |
+| **Adaptive / Similarity** | Original and Custom can scale the edit from zero at the similarity threshold toward its maximum at cosine 1. The fidelity bound applies in every mode. |
 | **Operation** | Auto selects sequential for one image and batch for 2–8. Batch guides equally conditioned positive rows with zero auxiliary feature forwards. |
 | **Reference budget** | Zero to four auxiliary positive transformer forwards per sequential sample across the invocation. The budget can run out before reaching Min sigma. |
 | **Initialization** | At most six auxiliary guider calls and twelve transformer forwards. Accepts a trial only when measured log-volume increases inside the predicted-clean trust region. The 45-second deadline stops new auxiliary launches and allows an in-flight call to finish. Hitting the deadline can change which initialization candidates are evaluated at a fixed seed. |
@@ -46,13 +46,15 @@ Existing graphs and API prompts that omit Mode use Original. The new widget is a
 
 ## Low-strength starting configuration
 
-For a sequential comparison, start with **Early Structural (B1)** or **Early Structural (B2)**, cosine guidance, strength **0.03**, fidelity **0.70**, adaptive off and reference budget **2**. Keep grid 4, one bank reference per actual evaluation, first-estimate continuation, bounded updates, initialization off and min sigma 0.82. Use guarded Spectrum when installed.
+For a sequential comparison, start with **Early Structural (B1)** or **Early Structural (B2)**, cosine guidance, strength **0.03**, fidelity **0.70** and reference budget **2**. Keep grid 4, one bank reference per actual evaluation, first-estimate continuation, bounded updates, initialization off and min sigma 0.82. Use guarded Spectrum when installed.
 
 Compare a fixed seed and prompt with Enabled off, then switch modes while holding the model, conditioning and sampler settings fixed. Use Custom to select another available block or change when the proposal is applied. See the [low-strength profile](tools/low_strength_profiles.json) and [validation guide](docs/validation.md) for matched comparisons.
 
 ## Compute and compatibility
 
 With the default two-forward budget and one reference per evaluation, sequential guidance spends up to two extra positive DiT forwards and computes up to two proposals when both evaluations are eligible. The structural presets apply at most one. Original and Custom All can apply both. Batch guidance uses zero extra feature forwards and can compute a proposal on each eligible actual evaluation. Initialization is an independent opt-in cost.
+
+A reference budget of **1** caps sequential guidance at one reference forward and one proposal. Treat it as a separate sampling configuration. Spending the budget sooner can move the guarded Spectrum history transition and change which evaluations forecast.
 
 Each proposal pools image-token attention at one block and computes a shift on the coarse feature grid. Applying it clones the native attention result once and adds bounded cell offsets in native dtype before the model's own gate and projection. Production skips trajectory fingerprints, spectra, spatial measurements and VAE work. After spending the reference budget, the ordinary path releases shadow latents and skips continuation updates for the last reference group. A single reference is reused directly and a one-row sigma check reads one scalar. The guarded route can still alter the count of actual evaluations when Spectrum is active.
 

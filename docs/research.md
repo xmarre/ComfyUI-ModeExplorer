@@ -19,7 +19,7 @@ The production depth modes share the existing feature update. Cosine and RBF vol
 
 Projection Gaussian and token-adaptive edits, response-informed steering and conditioning contrast act at different sites or derive their directions from different evidence. Their existing experimental nodes retain the corresponding trust gates, capture options and scope controls. The production depth presets are based on the localized attention-output intervention. Reverse, channel-sign and sham are causal controls available in the advanced settings.
 
-The production first-only schedule applies the first eligible feature proposal. It retains subsequent reference and proposal work so guarded Spectrum keeps the same eligibility predicate and history-transition policy. The archive qualification path still requires its explicit expected route and fixed actual-evaluation ordinals.
+The production depth presets apply the first eligible feature proposal with adaptive similarity scaling disabled. They retain subsequent reference and proposal work so guarded Spectrum keeps the same eligibility predicate and history-transition policy. The archive qualification path uses Original, its configured adaptive setting, the explicit expected route and fixed actual-evaluation ordinals.
 
 ## Feature edits
 

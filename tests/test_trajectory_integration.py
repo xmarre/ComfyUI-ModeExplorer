@@ -270,7 +270,7 @@ def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model
     common = dict(strength=.03, fidelity=.7, adaptive=False, trajectory_label="ablation")
 
     def run(**widgets):
-        patched, = ModeExplorer().apply(model, **common, **widgets)
+        patched, = ModeExplorer().apply(model, **(common | widgets))
         final = draw(spectrum(patched), **options)
         trace = traces(caplog)[-1]
         folder = tmp_path / "modeexplorer_trajectory" / trace["trajectory"]["id"]
@@ -287,7 +287,7 @@ def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model
     arms = (("all", True, []), ("first_only", False, [0]), ("second_only", False, [1]), ("all", False, [0, 1]))
     results = [run(sham=sham, feature_application=app, ablation_route=route) for app, sham, _ in arms]
     assert torch.equal(rng, torch.random.get_rng_state())
-    production, prod, _ = run(mode="Early Structural (B1)")
+    production, prod, _ = run(mode="Early Structural (B1)", adaptive=True)
     assert torch.equal(production, results[1][0])
     assert prod["routes"] == results[1][1]["routes"]
     assert not prod.get("ablation")
