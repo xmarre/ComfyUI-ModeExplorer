@@ -47,6 +47,7 @@ REFERENCE_SOURCES = ("bank", "per_seed")
 REFERENCE_SELECTIONS = ("all", "closest")
 REFERENCE_CONTINUATIONS = ("first_estimate", "rolling_euler")
 FEATURE_UPDATES = ("bounded", "verified")
+FEATURE_APPLICATIONS = ("all", "first_only", "second_only")
 FEATURE_DIRECTIONS = ("repel", "reverse", "channel_sign")
 FEATURE_GRIDS = (2, 4, 6, 8)
 CONDITION_FLAGS = frozenset({
@@ -87,8 +88,19 @@ class Settings:
     direction_trial: int = 0
     trajectory_label: str = ""
     trajectory_roi: str = ""
+    feature_application: str = "all"
+    ablation_route: str = ""
 
     def __post_init__(self):
+        if self.feature_application not in FEATURE_APPLICATIONS:
+            raise ValueError("Unknown ModeExplorer feature application schedule.")
+        if self.feature_application != "all" or self.ablation_route:
+            if (not 2 <= len(self.ablation_route) <= 32 or not self.ablation_route.startswith("AA")
+                    or set(self.ablation_route) - {"A", "F"} or not self.trajectory_label
+                    or self.feature == "native" or self.strength <= 0 or self.initialization or self.full_spectrum
+                    or self.reference_budget != 2 or self.reference_trajectories != 1 or self.operation == "batch"
+                    or self.sham and self.feature_application != "all"):
+                raise ValueError("Temporal ablation requires two reference evaluations, a guarded route and a trajectory label.")
         if self.trajectory_label:
             from .trajectory import LABEL
 
@@ -175,6 +187,7 @@ class Shadow:
     clean: torch.Tensor | None = None
     latent: torch.Tensor | None = None
     velocity: torch.Tensor | None = None
+    last_sampled_sigma: float | None = None
 
 
 @dataclass
@@ -205,6 +218,8 @@ class Frame:
     realized_rms: torch.Tensor | None = None
     trajectory_proposal: torch.Tensor | None = None
     trajectory_roi: torch.Tensor | None = None
+    proposal_relative_rms: torch.Tensor | None = None
+    reference_history: list = field(default_factory=list)
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -544,7 +559,10 @@ def attention_feature(output, options):
     if settings.feature_update == "verified":
         areas = cell_areas(height, width, *current.shape[-2:], settings.feature_grid, output.device)
     frame.run.feature_attempts += 1
-    frame.attempted = not settings.sham
+    apply_edit = not settings.sham and (
+        settings.feature_application == "all" or frame.run.native_dit_calls == FEATURE_APPLICATIONS.index(settings.feature_application)
+    )
+    frame.attempted = apply_edit
     shift, redundancy, loss = feature_shift(
         current, pairs, settings.feature, settings.strength, settings.fidelity,
         settings.adaptive, settings.similarity, temperature=settings.cosine_temperature,
@@ -556,6 +574,9 @@ def attention_feature(output, options):
         shift = direction_control(shift, settings.feature_direction, frame.run.seed, settings.direction_trial)
     if observing:
         frame.trajectory_proposal = shift[:frame.batch]
+        if settings.ablation_route:
+            base_rms = current[:frame.batch].square().mean(dim=(1, 2, 3)).sqrt()
+            frame.proposal_relative_rms = shift[:frame.batch].square().mean(dim=(1, 2, 3)).sqrt() / base_rms.clamp_min(1e-12)
     trace_edit = observing or (settings.diagnostics and len(frame.run.points) < MAX_POINTS)
     if trace_edit:
         frame.metrics = (
@@ -576,7 +597,7 @@ def attention_feature(output, options):
         sy, sx = cell_size(height, width, settings.feature_grid)
         feature_delta(shift, current, output, view, sy, sx, frame)
         return result
-    if settings.sham:
+    if not apply_edit:
         if trace_edit:
             frame.edit_metrics = pooled_edit_metrics(current, current, pairs, shift, repulsion, frame.batch, areas)
         return output
@@ -645,7 +666,7 @@ def record(frame, x, velocity):
     if frame.metrics is not None:
         cosine, loss, rms = frame.metrics
         point.update(nearest_cosine=as_list(cosine), objective=as_list(loss), shift_rms=as_list(rms),
-                     edit_applied=not frame.run.settings.sham, reference_slots=frame.reference_slots)
+                     edit_applied=frame.attempted, reference_slots=frame.reference_slots)
     if frame.edit_metrics is not None:
         point.update({key: as_list(value) for key, value in frame.edit_metrics.items()})
     frame.run.points.append(point)
@@ -668,6 +689,15 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
     rolling = settings.reference_continuation == "rolling_euler"
     slot = reference_slot(settings, run.seed, index)
     frame.reference_slots.append(slot)
+    if settings.ablation_route:
+        from .response_runtime import _tensor_hash
+
+        frame.reference_history.append({
+            "slot": slot, "sigma": frame.sigma, "continuation": settings.reference_continuation,
+            "first_sigma": frame.sigma if state is None else state.first_sigma,
+            "previous_sigma": None if state is None else state.last_sampled_sigma,
+            "previous_clean_sha256": _tensor_hash(state.clean) if state is not None else None,
+        })
     if state is None:
         noise = reference_noise(x[row], slot).float() * run.noise_scale
         state = Shadow(noise, frame.sigma, frame.sigma)
@@ -704,6 +734,8 @@ def shadow_forward(executor, run, frame, x, timestep, context, mask, refs, optio
         state.latent, state.velocity, state.sigma = shadow.float(), velocity.float(), frame.sigma
     elif state.clean is None:
         state.clean = shadow.float() - frame.sigma * velocity.float()
+    if settings.ablation_route:
+        state.last_sampled_sigma = frame.sigma
     return anchor.taps if capture_blocks else anchor.pooled
 
 
@@ -988,6 +1020,8 @@ class SamplerWrapper:
 
             return sample_guidance(self.guidance, settings, executor, model_wrap, sigmas, extra_args, noise, sample)
         if model_options.get(STAGE) == "highres" or getattr(model_wrap, "model_options", {}).get(STAGE) == "highres":
+            if settings.ablation_route:
+                raise RuntimeError("Temporal ablation must use the planner-only output.")
             return sample()
         spectrum, sol = verify_patch_graph(model_options, settings)
         if type(executor.class_obj) is not KSAMPLER:
@@ -1001,6 +1035,8 @@ class SamplerWrapper:
         ):
             raise RuntimeError("ModeExplorer requires Krea 2's native flow prediction and noise scaling.")
         if len(sigmas) <= 1:
+            if settings.ablation_route:
+                raise RuntimeError("Temporal ablation requires an ER-SDE schedule.")
             return sample()
         seed = extra_args.get("seed")
         start = float(sigmas[0])
@@ -1045,6 +1081,18 @@ class SamplerWrapper:
             LOGGER.info("ModeExplorer sequential feature guidance has zero reference budget (seed=%s)", seed)
             feature_active = False
             reasons.add("zero_reference_budget")
+        from comfy.k_diffusion.sampling import sample_er_sde
+
+        capture_solver = (bool(settings.trajectory_label) and executor.class_obj.sampler_function is sample_er_sde
+                          and float(sigmas[-1]) == 0 and getattr(model_wrap, "cfg", None) == 1.0
+                          and denoise_mask is None
+                          and not any(model_options.get(key) for key in
+                                      ("disable_cfg1_optimization", "sampler_pre_cfg_function",
+                                       "sampler_post_cfg_function", "sampler_cfg_function")))
+        if settings.ablation_route and (not capture_solver or not feature_active or batch != 1
+                                        or spectrum is None or self.response is not None
+                                        or len(settings.ablation_route) != len(sigmas) - 1):
+            raise RuntimeError("Temporal ablation requires CFG 1, native ER-SDE ending at zero, verified guarded Spectrum and two eligible reference calls.")
         if not (feature_active or initialize or settings.diagnostics or settings.trajectory_label or self.response is not None):
             return sample()
 
@@ -1060,10 +1108,12 @@ class SamplerWrapper:
             run.trajectory = Trajectory(run, executor.class_obj, sigmas, noise, model_wrap.inner_model,
                                         getattr(model_wrap, "cfg", None))
 
-            def sample_callback(step, *args):
+            def sample_callback(step, denoised, noisy, total):
+                if capture_solver:
+                    run.trajectory.observe_solver(step, denoised, noisy)
                 run.trajectory.step = int(step) + 1
                 if callback is not None:
-                    return callback(step, *args)
+                    return callback(step, denoised, noisy, total)
         force_native = nullcontext()
         response = self.response
         if response is not None:
@@ -1122,6 +1172,10 @@ class SamplerWrapper:
                     initial = optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evaluation_sigma)
             with force_native:
                 result = sample({**extra_args, "model_options": options}, initial, sample_callback)
+            if capture_solver and run.trajectory is not None:
+                run.trajectory.verify_terminal(result)
+            if settings.ablation_route:
+                run.trajectory.verify_ablation(run)
             completed = True
             return result
         finally:
@@ -1148,6 +1202,8 @@ class SamplerWrapper:
                 }
                 if trajectory is not None:
                     payload["trajectory"] = trajectory
+                if settings.ablation_route:
+                    payload["ablation"] = run.trajectory.ablation
                 if run.response is not None:
                     rep = run.response
                     payload["response"] = {

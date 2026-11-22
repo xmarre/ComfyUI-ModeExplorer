@@ -79,6 +79,9 @@ class Trajectory:
         self.step = 0
         self.used = 0
         self.failure = None
+        self.solver_terminal = None
+        self.ablation = {"status": "incomplete"} if run.settings.ablation_route else None
+        self.started = perf_counter()
         self.solver = sampler.sampler_function
         self.packed_conditioning = None
         self.capture_seconds = 0.0
@@ -98,6 +101,7 @@ class Trajectory:
         from .runtime import FRAME, as_list, spatial_image, summary
 
         x, timestep, context, mask, refs, options = args
+        begin = perf_counter()
         branches = list(options.get("cond_or_uncond", ()))
         if len(self.routes) >= 4 * MAX_STATES:
             self.failure = self.failure or "route_limit"
@@ -135,7 +139,6 @@ class Trajectory:
             from .response_runtime import _packed_condition_value_hashes
 
             self.packed_conditioning = _packed_condition_value_hashes(context, mask, refs)
-        begin = perf_counter()
         row = slice(offset, offset + 1)
         with torch.no_grad():
             clean = self.convert(flow_clean(x[row], velocity[row], sigma))
@@ -165,6 +168,11 @@ class Trajectory:
                                   **token_roi_stats(frame.trajectory_roi if frame is not None else None)}
         if frame is not None:
             state["reference_slots"] = list(frame.reference_slots)
+            if run.settings.ablation_route:
+                state["reference_history"] = frame.reference_history
+                if frame.proposal_relative_rms is not None:
+                    state["proposed_relative_rms"] = as_list(frame.proposal_relative_rms)
+                    state["compact_proposal_sha256"] = _tensor_hash(tensors["compact_feature_proposal"])
             if frame.pooled is not None:
                 state["attention_cell_groups"] = summary(frame.pooled)
                 state["attention_grid"] = list(frame.pooled.shape[-2:])
@@ -177,6 +185,70 @@ class Trajectory:
         self.used += sum(value.numel() * value.element_size() for value in tensors.values())
         self.states.append((state, tensors))
         self.capture_seconds += perf_counter() - begin
+
+    def observe_solver(self, step, denoised, noisy):
+        if self.failure or not self.states:
+            return
+        state, tensors = self.states[-1]
+        # A forecast has no matching actual DiT state and is never exported.
+        if state["solver_step"] != step or self.routes[-1]["route"] != "actual":
+            return
+        if (state["branches"] != [0] or noisy.shape != tensors["frozen_native_input"].shape
+                or denoised.shape != noisy.shape or "solver_clean" in tensors):
+            self.failure = "solver_callback_mismatch"
+            return
+        size = 8 * noisy.numel()
+        if self.used + size > MAX_BYTES:
+            self.failure = "trajectory_budget"
+            return
+        begin = perf_counter()
+        with torch.no_grad():
+            tensors["solver_input"] = noisy.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+            tensors["solver_clean"] = self.convert(denoised.float()).detach().to(device="cpu", copy=True).contiguous()
+        state["solver_input_sha256"] = _tensor_hash(tensors["solver_input"])
+        state["solver_clean_sha256"] = _tensor_hash(tensors["solver_clean"])
+        self.used += size
+        self.capture_seconds += perf_counter() - begin
+
+    def verify_terminal(self, returned):
+        if self.failure or not self.states or self.step != self.info["schedule_length"] - 1:
+            return
+        state, tensors = self.states[-1]
+        if state["solver_step"] != self.step - 1 or "solver_clean" not in tensors:
+            self.solver_terminal = {"status": "terminal_evaluation_not_captured"}
+            return
+        begin = perf_counter()
+        qualified = torch.equal(self.convert(returned.float()).cpu(), tensors["solver_clean"])
+        self.solver_terminal = {"status": "bit_exact" if qualified else "solver_output_mismatch",
+                                "solver_step": state["solver_step"], "solver_clean_sha256": state["solver_clean_sha256"]}
+        self.capture_seconds += perf_counter() - begin
+
+    def verify_ablation(self, run):
+        settings = run.settings
+        actual = "".join("A" if r["route"] == "actual" else "F" for r in self.routes)
+        refs = [r["reference_calls"] for r in self.routes]
+        expected_edits = [] if settings.sham else {"all": [0, 1], "first_only": [0], "second_only": [1]}[settings.feature_application]
+        edits = [s["ordinal"] for s, _ in self.states if s["feature_applied"]]
+        proposals = [s["ordinal"] for s, tensors in self.states if "compact_feature_proposal" in tensors]
+        self.ablation = {"expected_route": settings.ablation_route, "route": actual, "reference_calls": refs,
+                         "expected_edits": expected_edits, "applied_evaluations": edits, "proposal_evaluations": proposals}
+        if self.failure:
+            reason = self.failure
+        elif actual != settings.ablation_route or not all(r["branches"] == [0] for r in self.routes):
+            reason = "ablation_route_mismatch"
+        elif refs != [1, 1] + [0] * (len(refs) - 2) or run.reference_calls != 2 or proposals != [0, 1]:
+            reason = "ablation_reference_or_proposal_mismatch"
+        elif edits != expected_edits or any(not s.get("realized_shift_rms", [0])[0] > 0 for s, _ in self.states if s["feature_applied"]):
+            reason = "ablation_edit_mismatch"
+        elif not self.solver_terminal or self.solver_terminal["status"] != "bit_exact" or any(
+                "solver_clean" not in tensors for _, tensors in self.states):
+            reason = "ablation_solver_capture_unqualified"
+        else:
+            reason = None
+        self.ablation.update(status="qualified" if reason is None else "unqualified", reason=reason)
+        if reason:
+            self.failure = reason
+            raise RuntimeError(f"ModeExplorer temporal ablation unqualified: {reason}.")
 
     def save(self, completed, run):
         from safetensors.torch import save_file
@@ -206,6 +278,8 @@ class Trajectory:
                 "capture_seconds": self.capture_seconds, "serialization_seconds": perf_counter() - begin,
                 "initialization_dit_calls": run.initialization_dit_calls,
                 "feature_reasons": sorted(run.reasons),
+                "solver_terminal": self.solver_terminal, "ablation": self.ablation,
+                "sampler_seconds": begin - self.started,
             }
             (folder / "manifest.json").write_text(json.dumps(finite_json(manifest), allow_nan=False, indent=2))
         except Exception:

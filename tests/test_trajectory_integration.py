@@ -257,3 +257,53 @@ def test_downstream_discovery_budget_admits_wide_projection_at_planner_resolutio
     assert 12288 * mib < required <= factorial_controls("factorial_downstream")["capture_vram_mib"] * mib
     assert required <= factorial_controls("factorial_downstream_first")["capture_vram_mib"] * mib
     assert factorial_controls("factorial_injection")["capture_vram_mib"] == 12288
+
+
+def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model, caplog, tmp_path, monkeypatch):
+    pytest.importorskip("comfyui_spectrum_krea2")
+    from test_spectrum_integration import SIGMAS, spectrum
+    import folder_paths
+
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    options = dict(sampler="er_sde", stage="planner", sigmas=SIGMAS)
+    common = dict(strength=.03, fidelity=.7, adaptive=False, trajectory_label="ablation")
+
+    def run(**widgets):
+        patched, = ModeExplorer().apply(model, **common, **widgets)
+        final = draw(spectrum(patched), **options)
+        trace = traces(caplog)[-1]
+        folder = tmp_path / "modeexplorer_trajectory" / trace["trajectory"]["id"]
+        manifest = json.loads((folder / "manifest.json").read_text())
+        records = [load_file(folder / f"{state['ordinal']:03}.safetensors") for state in manifest["states"]]
+        assert torch.equal(final, records[-1]["solver_clean"])
+        return final, manifest, records
+
+    original_sham, old_sham, _ = run(sham=True)
+    original_active, _, _ = run()
+    route = "".join("A" if r["route"] == "actual" else "F" for r in old_sham["routes"])
+    assert "F" in route
+    rng = torch.random.get_rng_state().clone()
+    arms = (("all", True, []), ("first_only", False, [0]), ("second_only", False, [1]), ("all", False, [0, 1]))
+    results = [run(sham=sham, feature_application=app, ablation_route=route) for app, sham, _ in arms]
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert torch.equal(results[0][0], original_sham)
+    assert torch.equal(results[-1][0], original_active)
+    for (final, m, _), (_, _, applied) in zip(results, arms):
+        assert m["ablation"]["status"] == "qualified"
+        assert m["ablation"]["applied_evaluations"] == applied
+        assert m["ablation"]["reference_calls"] == [1, 1] + [0] * (len(route) - 2)
+        assert m["solver_terminal"]["status"] == "bit_exact"
+        assert [s["reference_history"] for s in m["states"][:2]] == [
+            s["reference_history"] for s in results[0][1]["states"][:2]]
+    assert torch.equal(results[0][2][0]["compact_feature_proposal"], results[-1][2][0]["compact_feature_proposal"])
+    assert torch.equal(results[0][2][1]["solver_input"], results[2][2][1]["solver_input"])
+    assert not torch.equal(results[0][2][1]["solver_input"], results[1][2][1]["solver_input"])
+    assert not torch.equal(results[0][0], results[1][0])
+    assert not torch.equal(results[0][0], results[2][0])
+
+    wrong, = ModeExplorer().apply(model, **common, feature_application="first_only", ablation_route="A" * len(route))
+    with pytest.raises(RuntimeError, match="ablation_route_mismatch"):
+        draw(spectrum(wrong), **options)
+    rejected = traces(caplog)[-1]
+    assert rejected["ablation"]["status"] == "unqualified" and rejected["trajectory"]["status"] == "partial"

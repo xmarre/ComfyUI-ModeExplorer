@@ -1,7 +1,7 @@
 """ComfyUI registration and clone ownership."""
 
 from .runtime import (
-    BLOCK, FEATURES, FEATURE_DIRECTIONS, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
+    BLOCK, FEATURES, FEATURE_APPLICATIONS, FEATURE_DIRECTIONS, FEATURE_GRIDS, FEATURE_UPDATES, KEY, OPERATIONS, REFERENCE_CONTINUATIONS,
     REFERENCE_SELECTIONS, REFERENCE_SOURCES, SamplerWrapper, Settings, attention_feature,
     diffusion_wrapper, has_spectrum, verify_patch_graph,
 )
@@ -64,6 +64,8 @@ class ModeExplorer:
             "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
             "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
             "trajectory_roi": ("STRING", {"default": "", "tooltip": "Optional pre-gate token ROI at the feature block, y0,y1,x0,x1 in patch-grid coordinates. At most 64 tokens."}),
+            "feature_application": (list(FEATURE_APPLICATIONS), {"default": "all", "tooltip": "Gate feature application independently of proposal and reference computation."}),
+            "ablation_route": ("STRING", {"default": "", "tooltip": "Expected actual/forecast route (A/F) for temporal ablation. Empty uses normal production behavior."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
@@ -80,7 +82,9 @@ class ModeExplorer:
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
-        active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi") or (strength != 0 and (feature != "native" or initialization)))
+        if (advanced.get("ablation_route") or advanced.get("feature_application", "all") != "all") and not enabled:
+            raise ValueError("Enable the ModeExplorer node to run a temporal ablation.")
+        active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi") or advanced.get("ablation_route") or advanced.get("feature_application", "all") != "all" or (strength != 0 and (feature != "native" or initialization)))
         if guidance is not None:
             if active:
                 raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")
