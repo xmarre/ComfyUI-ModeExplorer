@@ -24,10 +24,67 @@ def factorial_controls(arm):
         "auxiliary_budget": 5 + evaluation, "capture_vram_mib": 16384 if layers else 12288,
     }
 
+def widget_fields(cls):
+    return [name for inputs in cls.INPUT_TYPES().values() for name, spec in inputs.items()
+            if len(spec) > 1 and "default" in spec[1]]
+
+
+# Linked widgets still occupy serialized positions. Seed control and the
+# wildcard chooser are frontend-only widgets, not server input names.
+SERIALIZED_FIELDS = {
+    PLANNER: (
+        "seed control_after_generate planner_megapixels coarse_lock_strength mid_lock_strength "
+        "steps composition_lock_sigma max_stage_upscale stage_megapixels cfg sampler_name scheduler "
+        "er_sde_solver_type er_sde_max_stage er_sde_eta er_sde_s_noise sa_eta sa_sde_start_percent "
+        "sa_sde_end_percent sa_s_noise sa_predictor_order sa_corrector_order sa_simple_order_2 "
+        "sa_spectrum_forecasts sa_planner_spectrum_forecasts regeneration_mode img2img_start_sigma "
+        "handoff_diagnostics planner_fidelity_strength planner_detail_strength latent_upscale_method "
+        "progressive_transition_sigmas spectral_tolerance stage_planning highres_min_step_fraction "
+        "patch_lattice_correction"
+    ).split(),
+    "ImpactWildcardProcessor": ["wildcard_text", "populated_text", "mode", "seed",
+                               "control_after_generate", "Select to add Wildcard"],
+    "SpectrumApplyKrea2": (
+        "enabled preset degree ridge warmup tail window growth max_history storage budget_mb debug "
+        "bootstrap extrapolation_guard_enabled max_extrapolation_span_ratio sa_pece_forecast_policy "
+        "extrapolation_guard_scope"
+    ).split(),
+    "PrimitiveInt": ["value", "control_after_generate"],
+    "PrimitiveBoolean": ["value"],
+    "ComfySwitchNode": ["switch"],
+    "SaveImage": ["filename_prefix"],
+}
+
+
+def validate_widget_serialization(graph):
+    """Reject conflicting widget encodings and redundant embedded workflow snapshots."""
+    require("workflow" not in graph.get("extensions", {}), "stale embedded workflow snapshot")
+    nodes = {str(node["id"]) for node in graph["nodes"]}
+    for scope in (graph, graph.get("extensions", {})):
+        for key in ("seed_widgets", "widget_idx_map"):
+            require(set(scope.get(key, {})) <= nodes, f"stale {key} node identifiers")
+    for node in graph["nodes"]:
+        if "widgets_values_named" not in node:
+            continue
+        named = node["widgets_values_named"]
+        values = node.get("widgets_values")
+        kind = node["type"]
+        require(isinstance(named, dict) and isinstance(values, list),
+                f"{kind}: invalid named widget representation")
+        if kind == "ModeExplorerKrea2":
+            names = widget_fields(ModeExplorer)
+        elif kind == "ModeExplorerMechanisticKrea2":
+            names = widget_fields(ModeExplorerMechanistic)
+        else:
+            # Archived third-party nodes without a pinned schema use the
+            # original exporter insertion order as a strict pack contract.
+            names = SERIALIZED_FIELDS.get(kind, list(named))
+        require(len(names) == len(values) and dict(zip(names, values)) == named,
+                f"{kind}: conflicting or incomplete named widgets")
+
+
 def widgets(node, cls):
-    fields = [name for inputs in cls.INPUT_TYPES().values() for name, spec in inputs.items()
-              if len(spec) > 1 and "default" in spec[1]]
-    return dict(zip(fields, node["widgets_values"], strict=True))
+    return dict(zip(widget_fields(cls), node["widgets_values"], strict=True))
 
 
 def require(condition, detail):
@@ -37,6 +94,7 @@ def require(condition, detail):
 
 def validate(graph, case, arm, *, private=False):
     """Check an imported LiteGraph workflow without reading private input values into logs."""
+    validate_widget_serialization(graph)
     seed, strength = CASES[case]
     nodes = {n["id"]: n for n in graph["nodes"]}
     links = {item[0]: item for item in graph["links"]}
