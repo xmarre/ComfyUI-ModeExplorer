@@ -196,6 +196,7 @@ class Frame:
     anchor_blocks: tuple[int, ...] = ()
     mechanistic_capture: object = None
     realized_rms: torch.Tensor | None = None
+    trajectory_proposal: torch.Tensor | None = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -511,7 +512,9 @@ def attention_feature(output, options):
         frame.pooled = current
         return output
 
-    if frame.run.trajectory is not None or (settings.diagnostics and len(frame.run.points) < MAX_POINTS):
+    trajectory = frame.run.trajectory
+    observing = trajectory is not None and trajectory.failure is None
+    if observing or (settings.diagnostics and len(frame.run.points) < MAX_POINTS):
         frame.pooled = current
     pairs = frame.pairs
     if frame.reference is not None:
@@ -539,7 +542,9 @@ def attention_feature(output, options):
     repulsion = shift
     if settings.feature_direction != "repel":
         shift = direction_control(shift, settings.feature_direction, frame.run.seed, settings.direction_trial)
-    trace_edit = frame.run.trajectory is not None or (settings.diagnostics and len(frame.run.points) < MAX_POINTS)
+    if observing:
+        frame.trajectory_proposal = shift[:frame.batch]
+    trace_edit = observing or (settings.diagnostics and len(frame.run.points) < MAX_POINTS)
     if trace_edit:
         frame.metrics = (
             redundancy[:frame.batch], loss,
@@ -571,7 +576,7 @@ def attention_feature(output, options):
         delta = shift[:frame.batch, :, iy].to(output.dtype).repeat_interleave(sx, dim=-1)
         target = view[:, iy * sy:(iy + 1) * sy]
         target.add_(delta[:, :, :width].transpose(1, 2)[:, None])
-    if frame.run.trajectory is not None:
+    if observing:
         # Bounded strips avoid a full activation-sized FP32 difference.
         energy = view.new_zeros((frame.batch,), dtype=torch.float32)
         after = result[numbers[0]:numbers[1], start:end]
@@ -740,12 +745,12 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             try:
                 run.trajectory.observe(run, args, result, forecast, run.reference_calls - prior_refs,
                                        kwargs.get("ref_latents_method", executor.class_obj.default_ref_method))
-            except (OSError, RuntimeError, ValueError) as exc:
+            except (MemoryError, OSError, RuntimeError, ValueError) as exc:
                 run.trajectory.failure = "capture_failed"
                 LOGGER.warning("ModeExplorer trajectory capture stopped: %s", exc)
         if run.settings.diagnostics and len(run.decisions) < 256:
             run.decisions.append({
-                "route": "forecast" if before_forecast is not None and after is not None and after > before_forecast else "actual",
+                "route": "forecast" if forecast else "actual",
                 "branches": list(options.get("cond_or_uncond", ())),
                 "reference_calls": run.reference_calls - prior_refs,
             })
@@ -1113,7 +1118,7 @@ class SamplerWrapper:
             if run.trajectory is not None:
                 try:
                     trajectory = run.trajectory.save(completed, run)
-                except (OSError, RuntimeError, ValueError) as exc:
+                except (MemoryError, OSError, RuntimeError, ValueError) as exc:
                     trajectory = {"status": "failed", "reason": str(exc)}
             if settings.diagnostics or run.response is not None or trajectory is not None:
                 payload = {

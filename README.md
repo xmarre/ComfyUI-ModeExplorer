@@ -49,7 +49,7 @@ See [Research](docs/research.md) for equations and limitations and [Validation](
 
 ## Response experiments
 
-Use [ModeExplorer Mechanistic](docs/mechanistic.md) for full-resolution native-site spectra, signed decomposition, matched conditioning experiments, and opt-in clean component steering. The guide includes planner-only research profiles.
+Use [ModeExplorer Mechanistic](docs/mechanistic.md) for full-resolution native-site spectra, signed decomposition, matched conditioning experiments, and opt-in clean component steering. The guide includes planner-only research profiles. See [planner structural discovery](docs/structural-discovery.md) for actual-evaluation trajectory capture and the frozen INT8 activation factorial.
 
 [Projection Guidance](docs/projection_guidance.md) is an opt-in in-forward experiment for native Krea 2. Gaussian, token-adaptive, and channel-aware edits use the existing attention output projection with zero auxiliary DiT or projection calls. The guide includes planner PNG comparisons and a predeclared screening and confirmation protocol.
 

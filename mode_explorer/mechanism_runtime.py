@@ -37,7 +37,7 @@ class ResearchTiming:
     def __init__(self):
         self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation",
                                       "projection_native_replay", "projection_reference", "projection_spectral",
-                                      "projection_activation_emulation", "projection_activation_reference"), 0.)
+                                      "projection_activation_emulation", "projection_activation_reference", "factorial_clean_spectral"), 0.)
         self.events = []
 
     @contextmanager
@@ -107,6 +107,7 @@ class Capture:
         self.references, self.proposal, self.scale, self.fixed = references, proposal, scale, fixed
         self.fields, self.operators = {}, {}
         self.bounds = None
+        self.projection_block = cfg.projection_block if cfg.projection_block >= 0 else block
         self.edit = None
         self.want_projection = projection
         self.projection = None
@@ -210,8 +211,8 @@ class Capture:
                 ):
                     attach(module, (i, name), pre)
             if self.want_projection or self.projection_override is not None:
-                block = dit.blocks[self.block]
-                if self.block not in self.cfg.block_ids:
+                block = dit.blocks[self.projection_block]
+                if self.projection_block not in self.cfg.block_ids:
                     handles.append(block.register_forward_pre_hook(geometry, with_kwargs=True))
 
                 def capture_input(module, args):
@@ -587,10 +588,13 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         stage["kernel_contract"]["device_name"] = torch.cuda.get_device_name(latent.device)
     block_sites = [(b, s) for b in spec.block_ids for s in spec.site_names if s not in _GLOBAL]
     keys = block_sites + [(None, s) for s in spec.site_names if s in _GLOBAL]
-    captured_blocks = set(spec.block_ids) | {cfg.feature_block}
+    projection_block = spec.projection_block if spec.projection_block >= 0 else cfg.feature_block
+    captured_blocks = set(spec.block_ids) | {cfg.feature_block, projection_block}
     if any(block >= len(dit.blocks) for block in captured_blocks):
         raise ValueError("mechanistic_block_out_of_range")
     channels = dit.blocks[cfg.feature_block].attn.wo.in_features
+    if projection_enabled and channels != dit.blocks[projection_block].attn.wo.in_features:
+        raise ValueError("projection_and_feature_width_mismatch")
     points = math.prod(frame.grid)
     core_arms = spec.core_arms
     rebuild = reference_sigma != frame.sigma
@@ -755,7 +759,10 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
             stage["proposal"]["C1_sha256"] = _tensor_hash(alt.proposal)
             stage["proposal"]["C1_compact_rms"] = rms(alt.proposal)
 
-    positive_norm = symmetry["left_l2"] if spec.signed else match["left_l2"]
+    if factorial:
+        positive_norm = compare_edits(plus_edit, plus_edit, 1)["left_l2"]
+    else:
+        positive_norm = symmetry["left_l2"] if spec.signed else match["left_l2"]
     stage["realized_positive_l2"] = positive_norm
     stage["realized_positive_rms"] = positive_norm / math.sqrt(plus_edit[0].numel())
     del plus_edit
@@ -840,7 +847,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     downstream_clean = None
     factorial_clean = {}
     if projection_enabled:
-        projection_report = stage["projection"] = {"schema": 1, "mode": spec.projection_study,
+        projection_report = stage["projection"] = {"schema": 1, "mode": spec.projection_study, "block": projection_block,
                                                    "effect": spec.projection_effect, "packed_tokens_upper_bound": packed_tokens}
         snapshots = {name: cap.projection for name, cap in captures.items()}
         try:
@@ -852,7 +859,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                 tensor.numel() * tensor.element_size()
                 for snapshot in snapshots.values() for tensor in (snapshot.inputs, snapshot.output) if tensor is not None
             )
-            delta = study_projection(dit.blocks[cfg.feature_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
+            delta = study_projection(dit.blocks[projection_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
                                      chunk, projection_report, timing,
                                      seed_key(probe_seed, f"projection-control-{cfg.trial}"))
             if factorial:

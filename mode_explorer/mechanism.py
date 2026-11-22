@@ -46,6 +46,7 @@ class MechanisticSettings:
     projection_cast_check: bool = False
     projection_symmetric_check: bool = False
     projection_activation_check: bool = False
+    projection_block: int = -1
 
     @cached_property
     def block_ids(self):
@@ -78,6 +79,10 @@ class MechanisticSettings:
             raise ValueError("Unknown projection study.")
         if self.projection_effect not in ("positive", "odd", "even", "conditioning_interaction"):
             raise ValueError("Unknown projection effect.")
+        if type(self.projection_block) is not int or not -1 <= self.projection_block <= 63:
+            raise ValueError("Projection block is outside the supported range.")
+        if self.projection_block >= 0 and self.projection_study != "activation_factorial":
+            raise ValueError("An independent projection block requires the activation factorial.")
         if self.projection_study == "activation_factorial":
             if (self.mode != "signed" or self.component != "observe" or not self.projection_activation_check
                     or self.amplitude_check or self.projection_symmetric_check or self.match_cross_dtype):

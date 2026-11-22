@@ -61,8 +61,8 @@ class ModeExplorer:
             "sham": ("BOOLEAN", {"default": False, "tooltip": "Measure feature proposals and reference cost without editing attention. Initialization is skipped."}),
             "initialization_trials": ("INT", {"default": Settings.initialization_trials, "min": 1, "max": 3, "tooltip": "Maximum noise proposals after three baseline/reference guider predictions."}),
             "feature_direction": (list(FEATURE_DIRECTIONS), {"default": Settings.feature_direction, "tooltip": "Causal experiment: repel is normal; reverse negates the bounded edit; channel_sign randomizes channel signs at identical pre-rounding cell norms. Controls require bounded update."}),
-            "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
             "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
+            "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
@@ -298,6 +298,7 @@ class ModeExplorerMechanistic:
             "projection_cast_check": ("BOOLEAN", {"default": False, "tooltip": "Separately measure one output cast of the reconstructed affine map."}),
             "projection_symmetric_check": ("BOOLEAN", {"default": False, "tooltip": "Run two packed projection calls with exactly opposing representable image-token deltas."}),
             "projection_activation_check": ("BOOLEAN", {"default": False, "tooltip": "Isolate INT8 activation quantization, rotation rounding and epilogue after packed bitwise qualification."}),
+            "projection_block": number("INT", "projection_block", -1, 63, tooltip="Activation factorial target. -1 uses the feature intervention block."),
         }}
 
     def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,
@@ -308,7 +309,7 @@ class ModeExplorerMechanistic:
             return ModeExplorerResponse().apply(model, enabled=False)
         spec_fields = MechanisticSettings.__dataclass_fields__.keys() - {"mode"}
         spec = MechanisticSettings(mode=experiment, **{key: options.pop(key) for key in spec_fields & options.keys()})
-        for block in spec.block_ids:
+        for block in (*spec.block_ids, *((spec.projection_block,) if spec.projection_block >= 0 else ())):
             ModeExplorer.verify_model(model, block)
         if (spec.component == "observe" or spec.projection_study in ("observe", "activation_factorial")) and treatment != "export_only":
             raise ValueError("Select a component for active mechanistic steering.")

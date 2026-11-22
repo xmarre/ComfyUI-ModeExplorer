@@ -397,8 +397,11 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     })
                 if any(saved.get(key) != point.get(key) for key in matched):
                     raise ValueError("frozen_sigma_or_conditioning_mismatch")
-                if saved.get("origin") == "trajectory" and saved.get("feature_applied"):
-                    raise ValueError("frozen_replay_requires_native_trajectory")
+                if saved.get("origin") == "trajectory":
+                    if saved.get("feature_applied"):
+                        raise ValueError("frozen_replay_requires_native_trajectory")
+                    if saved.get("backend") != point["backend"]:
+                        raise ValueError("frozen_attention_override_mismatch")
                 with safe_open(data, framework="pt", device="cpu") as package:
                     saved_latent = package.get_tensor("frozen_native_input")
                     if saved.get("origin") == "trajectory":
