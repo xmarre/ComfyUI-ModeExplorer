@@ -25,6 +25,33 @@ def _root():
     return (Path(folder_paths.get_output_directory()) / "modeexplorer_trajectory").resolve()
 
 
+
+def parse_roi(text):
+    if len(text) > 32 or not re.fullmatch(r"\d+(?:,\d+){3}", text):
+        raise ValueError("Enter a trajectory ROI as y0,y1,x0,x1.")
+    y0, y1, x0, x1 = (int(item) for item in text.split(","))
+    if not (y0 < y1 and x0 < x1 and (y1 - y0) * (x1 - x0) <= 64):
+        raise ValueError("A trajectory ROI must contain between 1 and 64 tokens.")
+    return y0, y1, x0, x1
+
+
+def token_roi_stats(value):
+    if value is None:
+        return {"status": "outside_patch_grid_or_hook_unavailable"}
+    rows = value.float().flatten(0, 1)
+    centered = rows - rows.mean(dim=0)
+    gram = centered @ centered.T / rows.shape[1]
+    eig = torch.linalg.eigvalsh(gram.cpu().double()).clamp_min_(0).flip(0)
+    mass = eig.sum()
+    p = eig / mass if mass > 0 else eig
+    effective_rank = float((-torch.special.xlogy(p, p).sum()).exp()) if mass > 0 else 0.0
+    unit = torch.nn.functional.normalize(rows, dim=-1).unflatten(0, value.shape[:2])
+    return {
+        "status": "measured", "covariance_eigenvalues": eig.tolist(), "effective_rank": effective_rank,
+        "horizontal_neighbor_cosines": (unit[:, 1:] * unit[:, :-1]).sum(-1).cpu().tolist(),
+        "vertical_neighbor_cosines": (unit[1:] * unit[:-1]).sum(-1).cpu().tolist(),
+    }
+
 def _option(value):
     cls = type(value)
     if (cls.__name__ == "Krea2PatchCoupledERSDENoise" and cls.__module__.endswith(".slrd_runtime")):
@@ -46,6 +73,7 @@ class Trajectory:
         from .runtime import as_list
 
         self.convert = base.process_latent_out
+        self.roi = parse_roi(run.settings.trajectory_roi) if run.settings.trajectory_roi else None
         self.states = []
         self.routes = []
         self.step = 0
@@ -132,6 +160,9 @@ class Trajectory:
                 and type(self.noise_sampler).__module__.endswith(".slrd_runtime") else None),
             "feature_applied": bool(frame and frame.attempted and proposal is not None),
         }
+        if self.roi is not None:
+            state["token_roi"] = {"bounds_y0_y1_x0_x1": list(self.roi), "block": run.settings.feature_block,
+                                  **token_roi_stats(frame.trajectory_roi if frame is not None else None)}
         if frame is not None:
             state["reference_slots"] = list(frame.reference_slots)
             if frame.pooled is not None:

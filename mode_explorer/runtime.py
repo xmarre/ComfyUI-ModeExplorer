@@ -86,6 +86,7 @@ class Settings:
     feature_direction: str = "repel"
     direction_trial: int = 0
     trajectory_label: str = ""
+    trajectory_roi: str = ""
 
     def __post_init__(self):
         if self.trajectory_label:
@@ -93,6 +94,12 @@ class Settings:
 
             if not LABEL.fullmatch(self.trajectory_label):
                 raise ValueError("Use 1–64 letters, digits, hyphens or underscores for the trajectory label.")
+        if self.trajectory_roi:
+            from .trajectory import parse_roi
+
+            if not self.trajectory_label:
+                raise ValueError("A trajectory ROI requires an export label.")
+            parse_roi(self.trajectory_roi)
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
             raise ValueError("ModeExplorer received an unknown feature or batch mode")
         for key, low, high in (
@@ -197,6 +204,7 @@ class Frame:
     mechanistic_capture: object = None
     realized_rms: torch.Tensor | None = None
     trajectory_proposal: torch.Tensor | None = None
+    trajectory_roi: torch.Tensor | None = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -514,6 +522,10 @@ def attention_feature(output, options):
 
     trajectory = frame.run.trajectory
     observing = trajectory is not None and trajectory.failure is None
+    if observing and trajectory.roi is not None and frame.batch == 1:
+        y0, y1, x0, x1 = trajectory.roi
+        if y1 <= height and x1 <= width:
+            frame.trajectory_roi = image[0].unflatten(0, (height, width))[y0:y1, x0:x1].clone()
     if observing or (settings.diagnostics and len(frame.run.points) < MAX_POINTS):
         frame.pooled = current
     pairs = frame.pairs

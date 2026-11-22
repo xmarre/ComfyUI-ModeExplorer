@@ -63,6 +63,7 @@ class ModeExplorer:
             "feature_direction": (list(FEATURE_DIRECTIONS), {"default": Settings.feature_direction, "tooltip": "Causal experiment: repel is normal; reverse negates the bounded edit; channel_sign randomizes channel signs at identical pre-rounding cell norms. Controls require bounded update."}),
             "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
             "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
+            "trajectory_roi": ("STRING", {"default": "", "tooltip": "Optional pre-gate token ROI at the feature block, y0,y1,x0,x1 in patch-grid coordinates. At most 64 tokens."}),
         }}
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
@@ -79,7 +80,7 @@ class ModeExplorer:
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
-        active = enabled and (diagnostics or advanced.get("trajectory_label") or (strength != 0 and (feature != "native" or initialization)))
+        active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi") or (strength != 0 and (feature != "native" or initialization)))
         if guidance is not None:
             if active:
                 raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")

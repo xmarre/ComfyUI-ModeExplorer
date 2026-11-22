@@ -37,7 +37,8 @@ class ResearchTiming:
     def __init__(self):
         self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation",
                                       "projection_native_replay", "projection_reference", "projection_spectral",
-                                      "projection_activation_emulation", "projection_activation_reference", "factorial_clean_spectral", "factorial_operand_verification"), 0.)
+                                      "projection_activation_emulation", "projection_activation_reference", "factorial_clean_spectral", "factorial_operand_verification",
+                                      "factorial_dit_with_replacements"), 0.)
         self.events = []
 
     @contextmanager
@@ -754,8 +755,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         scope = capture.hooks(dit) if capture is not None else nullcontext()
         layer_scope = continuous.hooks(name) if continuous is not None else nullcontext()
         spend(1)
+        timer = "factorial_dit_with_replacements" if continuous is not None else "auxiliary_dit"
         with torch.no_grad(), scope, layer_scope, isolated_reference(run, sol_evaluations=ordinal):
-            with timing.measure("auxiliary_dit", latent.device):
+            with timing.measure(timer, latent.device):
                 value = executor(latent, timesteps, ctx, msk, refs, opts, **kwargs)
         if not bool(torch.isfinite(value).all()):
             raise ValueError("mechanistic_nonfinite_velocity")

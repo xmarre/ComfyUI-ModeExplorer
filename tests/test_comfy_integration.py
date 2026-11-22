@@ -299,7 +299,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     for path in sorted((root / "examples").glob("*.json")):
         if path.name in ("spectrum_ab.json", "response_spectrum.json") and not spectrum_available:
             continue
-        if (path.name.startswith("projection_") or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json",
+        if (path.name.startswith(("projection_", "structural_discovery_")) or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json",
                                                                   "conditioning_contrast.json")) and not (
             scale_locked and spectrum_available
         ):
@@ -336,7 +336,12 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
             assert port["link"] == ident and ident in output["links"]
             assert value == output["type"] == port["type"]
             api[str(dst)]["inputs"][port["name"]] = [str(src), source_slot]
-        if path.name.startswith("projection_guidance_"):
+        if path.name.startswith("structural_discovery_"):
+            from tools.structural_workflows import validate
+
+            arm = "factorial_downstream" if path.stem.endswith("_factorial") else "native"
+            validate(graph, "detail", arm)
+        elif path.name.startswith("projection_guidance_"):
             planner, = [item["inputs"] for item in api.values()
                         if item["class_type"] == "Krea2TurboFlowAlignedRegenerate"]
             configured, = [item["inputs"] for item in api.values()

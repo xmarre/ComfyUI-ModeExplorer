@@ -36,3 +36,10 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 Use a shared upstream weight LoRA for identity comparisons. For Raw, load Raw weights, encode a true negative prompt, and use the Raw Spectrum preset when Spectrum is installed. Begin inside the model's supported resolution range.
 
 Response examples use a broad initial sigma window so they can run on the local checkpoint’s actual schedule. Narrow the window after reading the trace. Pin Reference start sigma from the live arm for paired feature replay. Use Fixed precision for a common displacement across compared runs. See the [response guide](../docs/response.md) for state matching and predicted-clean decoding.
+
+
+[Structural discovery native capture](structural_discovery_native.json) and [frozen factorial](structural_discovery_factorial.json) exercise the published workflow contract using sample conditioning and model names. The production pack uses the archival conditioning and model stack. The shared validator checks its seeds, feature recipes, guarded routing, connectivity and archive conditioning fingerprints.
+
+```text
+python -m tools.structural_workflows ModeExplorer_Structural_Discovery_Reviewed.zip
+```

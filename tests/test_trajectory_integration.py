@@ -11,13 +11,13 @@ from mode_explorer.nodes import ModeExplorer, ModeExplorerLoadResponse, ModeExpl
 from test_comfy_integration import draw, model, traces
 
 
-def capture(model, caplog, tmp_path, monkeypatch, **settings):
+def capture(model, caplog, tmp_path, monkeypatch, *, draw_options=None, **settings):
     import folder_paths
 
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
     patch, = ModeExplorer().apply(model, trajectory_label="discovery", **settings)
-    result = draw(patch)
+    result = draw(patch, **(draw_options or {}))
     entry = traces(caplog)[-1]["trajectory"]
     manifest = json.loads((tmp_path / "modeexplorer_trajectory" / entry["id"] / "manifest.json").read_text())
     return result, manifest
@@ -145,11 +145,24 @@ def test_factorial_rejects_later_unedited_state_from_guided_trajectory(model, ca
 @pytest.mark.parametrize("selection", ["downstream", "b1.attn.wo,b2.mlp.down"])
 def test_frozen_factorial_qualifies_each_current_packed_layer(model, caplog, tmp_path, monkeypatch, selection):
     import comfy_kitchen
+    from mode_explorer.continuous_layers import ContinuousLayers
+    from mode_explorer.projection import ProjectionUnavailable
     from comfy import ops
     from comfy.quant_ops import QuantizedTensor
 
     dit = model.model.diffusion_model
     targets = (("b1.attn.wo", dit.blocks[1].attn, "wo"), ("b2.mlp.down", dit.blocks[2].mlp, "down"))
+    original_replace = ContinuousLayers.replace
+
+    def assert_native_nongenerated(self, name, module, source, output, bounds):
+        replaced, report = original_replace(self, name, module, source, output, bounds)
+        lo, hi = bounds
+        assert 0 < lo < hi < output.shape[1]  # Text and reference rows are both present.
+        assert torch.equal(replaced[:, :lo], output[:, :lo])
+        assert torch.equal(replaced[:, hi:], output[:, hi:])
+        return replaced, report
+
+    monkeypatch.setattr(ContinuousLayers, "replace", assert_native_nongenerated)
     with torch.inference_mode(), comfy_kitchen.use_backend("eager"):
         for _, parent, key in targets:
             old = getattr(parent, key)
@@ -162,14 +175,14 @@ def test_frozen_factorial_qualifies_each_current_packed_layer(model, caplog, tmp
             layer.layout_type = "TensorWiseINT8Layout"
             setattr(parent, key, layer)
 
-        native, native_run = capture(model, caplog, tmp_path, monkeypatch, feature="native")
-        _, active_run = capture(model, caplog, tmp_path, monkeypatch, strength=.03, fidelity=.81, adaptive=False)
+        native, native_run = capture(model, caplog, tmp_path, monkeypatch, feature="native", draw_options={"reference": True})
+        _, active_run = capture(model, caplog, tmp_path, monkeypatch, strength=.03, fidelity=.81, adaptive=False, draw_options={"reference": True})
         opts = dict(feature_block=1, projection_layers=selection, blocks="1,2", sites="clean", evaluation=0,
                     frozen_state=native_run["states"][0]["export_id"], export=True, projection_study="activation_factorial",
                     projection_activation_check=True, analysis_device="cpu", feature_strength=.03, auxiliary_budget=5,
                     factorial_feature_source=active_run["states"][0]["export_id"])
         patched, = ModeExplorerMechanistic().apply(model, **opts)
-        assert torch.equal(draw(patched), native)
+        assert torch.equal(draw(patched, reference=True), native)
         point, = traces(caplog)[-1]["response"]["points"]
         report = point["mechanistic"]["projection"]
         assert report["status"] == "qualified", report
@@ -183,8 +196,38 @@ def test_frozen_factorial_qualifies_each_current_packed_layer(model, caplog, tmp
             assert all(layer["packed_native_replay_bit_exact"] and layer["activation_emulation"]["packed_bit_exact"]
                        for layer in report["layers"][arm].values())
         rejection, = ModeExplorerMechanistic().apply(model, **{**opts, "feature_strength": .04})
-        assert torch.equal(draw(rejection), native)
+        assert torch.equal(draw(rejection, reference=True), native)
         rejected, = traces(caplog)[-1]["response"]["points"]
         assert rejected["reason"] == "factorial_active_feature_settings_mismatch"
         assert rejected["auxiliary_dit_calls"] == 0
+
+        def reject_final_layer(self, name, *args):
+            if name == targets[-1][0]:
+                raise ProjectionUnavailable("simulated_layer_qualification_failure")
+            return assert_native_nongenerated(self, name, *args)
+
+        monkeypatch.setattr(ContinuousLayers, "replace", reject_final_layer)
+        assert torch.equal(draw(patched, reference=True), native)
+        rejected, = traces(caplog)[-1]["response"]["points"]
+        assert rejected["mechanistic"]["projection"]["reason"] == "simulated_layer_qualification_failure"
+        from mode_explorer.response_runtime import read_export
+        from safetensors.torch import load_file
+
+        _, path = read_export(rejected["export_id"])
+        assert "continuous_native_clean" not in load_file(path)
+        assert "continuous_feature_clean" not in load_file(path)
     assert all(not getattr(parent, key)._forward_hooks for _, parent, key in targets)
+
+
+def test_trajectory_measures_unpooled_token_roi_without_edit(model, caplog, tmp_path, monkeypatch):
+    native = draw(model)
+    observed, captured = capture(model, caplog, tmp_path, monkeypatch, feature="native", trajectory_roi="1,3,1,5")
+    assert torch.equal(observed, native)
+    for state in captured["states"]:
+        stats = state["token_roi"]
+        assert stats["status"] == "measured" and stats["bounds_y0_y1_x0_x1"] == [1, 3, 1, 5]
+        assert len(stats["covariance_eigenvalues"]) == 8
+        assert 1 <= stats["effective_rank"] <= 8
+        assert len(stats["vertical_neighbor_cosines"][0]) == 4
+    with pytest.raises(ValueError, match="between 1 and 64"):
+        ModeExplorer().apply(model, feature="native", trajectory_label="test", trajectory_roi="0,9,0,9")
