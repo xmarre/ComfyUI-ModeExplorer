@@ -299,6 +299,8 @@ class ModeExplorerMechanistic:
             "projection_symmetric_check": ("BOOLEAN", {"default": False, "tooltip": "Run two packed projection calls with exactly opposing representable image-token deltas."}),
             "projection_activation_check": ("BOOLEAN", {"default": False, "tooltip": "Isolate INT8 activation quantization, rotation rounding and epilogue after packed bitwise qualification."}),
             "projection_block": number("INT", "projection_block", -1, 63, tooltip="Activation factorial target. -1 uses the feature intervention block."),
+            "projection_layers": ("STRING", {"default": "", "tooltip": "Frozen factorial only. Enter downstream or explicit names, e.g. b1.attn.wo,b1.mlp.down. Empty uses one projection."}),
+            "factorial_feature_source": ("STRING", {"default": "", "tooltip": "Optional active trajectory state ID. Validate and reuse its exact evaluated feature settings."}),
         }}
 
     def apply(self, model, enabled=True, experiment="signed", treatment="export_only", repeat_baseline=False,

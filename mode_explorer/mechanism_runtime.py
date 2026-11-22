@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import asdict, replace
 import math
 from time import perf_counter
 
@@ -37,7 +37,7 @@ class ResearchTiming:
     def __init__(self):
         self.elapsed = dict.fromkeys(("auxiliary_dit", "capture_copy", "capture_transfer", "output_transfer", "spectral", "edit_validation",
                                       "projection_native_replay", "projection_reference", "projection_spectral",
-                                      "projection_activation_emulation", "projection_activation_reference", "factorial_clean_spectral"), 0.)
+                                      "projection_activation_emulation", "projection_activation_reference", "factorial_clean_spectral", "factorial_operand_verification"), 0.)
         self.events = []
 
     @contextmanager
@@ -145,7 +145,7 @@ class Capture:
                 joined = torch.cat((current, self.references))
                 pairs = ~torch.eye(len(joined), device=output.device, dtype=torch.bool)
                 shift, _, _ = feature_shift(
-                    joined, pairs, settings.feature, settings.strength, settings.fidelity, False,
+                    joined, pairs, settings.feature, settings.strength, settings.fidelity, settings.adaptive,
                     settings.similarity, temperature=settings.cosine_temperature,
                     bandwidth=settings.volume_bandwidth, median_bandwidth=settings.volume_median, live=1,
                 )
@@ -354,7 +354,7 @@ def _amplitude(full_plus, full_minus, half_plus, half_minus, base):
 
 
 def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, attention_channels, patch_size,
-                               baseline_reused, chunk=None, packed_tokens=None):
+                               baseline_reused, chunk=None, packed_tokens=None, retain_packed_projection=True):
     """Return conservative bytes for staged captures and spectral/output workspace."""
     points = math.prod(grid)
     projection_channels = latent_shape[1] * patch_size**2
@@ -380,7 +380,7 @@ def estimate_capture_workspace(spec, *, feature_block, grid, latent_shape, atten
     output_bytes = math.prod(latent_shape) * 4 * (10 + 4 * spec.core_arms + 4 * int(spec.amplitude_check))
     if _UNPATCHED_PROJECTION in spec.site_names:
         output_bytes += 4 * points * projection_channels * captured_arms
-    if spec.projection_study != "off":
+    if spec.projection_study != "off" and retain_packed_projection:
         packed_tokens = points if packed_tokens is None else packed_tokens
         replay_arms = spec.core_arms + 2 * int(spec.amplitude_check)
         # Packed native operands and outputs survive until qualification,
@@ -510,6 +510,36 @@ def _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, 
     return native_velocity, tensors
 
 
+
+def _factorial_feature_source(spec, cfg, point, seed, reference_sigma):
+    if not spec.factorial_feature_source:
+        return None
+    from safetensors import safe_open
+    from .runtime import Settings
+    from .trajectory import read_trajectory
+
+    try:
+        state, path = read_trajectory(spec.factorial_feature_source)
+        settings = Settings(**state["trajectory_settings"])
+        with safe_open(path, framework="pt", device="cpu") as package:
+            proposal = package.get_tensor("compact_feature_proposal")
+    except (OSError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("factorial_active_trajectory_unavailable") from exc
+    matched = ("sigma", "timestep", "input_dtype", "conditioning_sha256", "attention_mask_sha256",
+               "reference_latent_sha256", "reference_method", "backend", "branches", "noise_scale", "cfg_scale")
+    if (state.get("trajectory_status") != "completed" or not state.get("feature_applied")
+            or state.get("seed") != seed or any(state.get(key) != point.get(key) for key in matched)
+            or state.get("feature_reference_initial_sigma") != reference_sigma):
+        raise ValueError("factorial_active_trajectory_provenance_mismatch")
+    if (settings.initialization or settings.sham or settings.feature not in ("feature_cosine", "feature_volume")
+            or settings.operation == "batch" or settings.reference_continuation != "first_estimate"
+            or settings.feature_update != "bounded" or settings.feature_direction != "repel"
+            or settings.feature_block != cfg.feature_block or settings.feature_grid != cfg.feature_grid
+            or settings.strength != cfg.feature_strength or settings.reference_trajectories != cfg.feature_references
+            or cfg.feature_references != 1):
+        raise ValueError("factorial_active_feature_settings_mismatch")
+    return settings, state, proposal
+
 def research_response(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                       kwargs, native_velocity, point, spend, reference_sigma, initial_ordinal, ordinal, probe_seed, timing):
     from .response_runtime import _tensor_hash, _tensor_value_hash
@@ -540,6 +570,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                                       kwargs, native_velocity, point, spend, ordinal, timing)
     projection_enabled = spec.projection_study != "off"
     factorial = spec.projection_study == "activation_factorial"
+    layered = factorial and bool(spec.projection_layers)
     projection_downstream = spec.projection_study not in ("off", "observe", "activation_factorial")
     if factorial and (not cfg.frozen_state or not cfg.export or cfg.steers
                       or run.response.cfg_scale != 1.0 or point["branches"] != [0]
@@ -553,6 +584,9 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         raise ValueError("feature_reference_start_not_observed")
     if frame.sigma > reference_sigma:
         raise ValueError("feature_reference_start_after_probe")
+    archived = _factorial_feature_source(spec, cfg, point, probe_seed, reference_sigma)
+    if archived is not None:
+        archived_settings, archived_state, archived_proposal = archived
     row = slice(frame.offset, frame.offset + 1)
 
     def pick(value):
@@ -596,6 +630,11 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     if projection_enabled and channels != dit.blocks[projection_block].attn.wo.in_features:
         raise ValueError("projection_and_feature_width_mismatch")
     points = math.prod(frame.grid)
+    layer_targets = inventory = None
+    if layered:
+        from .continuous_layers import layer_plan
+
+        layer_targets, inventory = layer_plan(dit, cfg.feature_block, spec.projection_layers)
     core_arms = spec.core_arms
     rebuild = reference_sigma != frame.sigma
     recomputed = spec.mode.endswith("recomputed")
@@ -631,8 +670,12 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     capture_bytes, reserve_bytes = estimate_capture_workspace(
         spec, feature_block=cfg.feature_block, grid=frame.grid, latent_shape=latent.shape,
         attention_channels=channels, patch_size=dit.patch, baseline_reused=can_reuse, chunk=chunk,
-        packed_tokens=packed_tokens,
+        packed_tokens=packed_tokens, retain_packed_projection=not layered,
     )
+    if layered:
+        from .continuous_layers import workspace_bytes
+
+        reserve_bytes += workspace_bytes(layer_targets, packed_tokens, spec.projection_token_chunk)
     stage.update(capture_preflight_bytes=capture_bytes + reserve_bytes, capture_reserve_bytes=reserve_bytes)
     if stage["capture_preflight_bytes"] > stage["capture_budget_bytes"]:
         raise CaptureLimit("mechanistic_capture_preflight")
@@ -660,6 +703,14 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                               feature_grid=cfg.feature_grid, strength=cfg.feature_strength, fidelity=.70, adaptive=False,
                               diagnostics=False, reference_continuation="first_estimate", reference_selection="all",
                               feature_update="bounded", sham=False, feature_direction="repel")
+    if archived is not None:
+        replay_settings = archived_settings
+    if factorial:
+        stage["factorial_feature_settings"] = {
+            **asdict(replay_settings),
+            "source": spec.factorial_feature_source or "explicit_replay_defaults",
+            "reference_count": cfg.feature_references, "reference_initial_sigma": reference_sigma,
+        }
     replay_run = Run(replay_settings, probe_seed, run.start, run.noise_scale, 1, tuple(latent.shape),
                      True, spectrum=run.spectrum, sol=run.sol, stage=run.stage)
 
@@ -696,13 +747,14 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
 
     captures, velocities, clean = {}, {}, {}
 
-    def predict(name, branch="C0", capture=None):
+    def predict(name, branch="C0", capture=None, continuous=None):
         ctx, msk = branches[branch]
         arm_frame = Frame(frame.grid, 1, 0, "response_capture", replay_run, frame.sigma, mechanistic_capture=capture)
         opts = {**options, FRAME: arm_frame} if capture is not None else {**options}
         scope = capture.hooks(dit) if capture is not None else nullcontext()
+        layer_scope = continuous.hooks(name) if continuous is not None else nullcontext()
         spend(1)
-        with torch.no_grad(), scope, isolated_reference(run, sol_evaluations=ordinal):
+        with torch.no_grad(), scope, layer_scope, isolated_reference(run, sol_evaluations=ordinal):
             with timing.measure("auxiliary_dit", latent.device):
                 value = executor(latent, timesteps, ctx, msk, refs, opts, **kwargs)
         if not bool(torch.isfinite(value).all()):
@@ -714,7 +766,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         stage["arms"].append(name)
 
     def capture(**edit):
-        return Capture(spec, frame.grid, workspace, cfg.feature_block, projection=projection_enabled, **edit)
+        return Capture(spec, frame.grid, workspace, cfg.feature_block, projection=projection_enabled and not layered, **edit)
 
     if can_reuse:
         captures["D00"] = capture()
@@ -734,6 +786,14 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     predict("D01", capture=plus)
     plus_edit = _edit_pair(plus)
     stage["proposal"] = {"C0_sha256": _tensor_hash(plus.proposal), "C0_compact_rms": rms(plus.proposal)}
+    if archived is not None:
+        same_input = archived_state["native_input_sha256"] == point["native_input_sha256"]
+        same_proposal = stage["proposal"]["C0_sha256"] == _tensor_hash(archived_proposal)
+        stage["proposal"].update(active_archive_same_noisy_input=same_input, active_archive_same_proposal=same_proposal)
+        if stage["reference_slots"]["C0"] != archived_state.get("reference_slots"):
+            raise ValueError("factorial_active_reference_slots_mismatch")
+        if same_input and not same_proposal:
+            raise ValueError("factorial_active_proposal_mismatch_at_same_input")
     def compare_edits(left, right, sign):
         with timing.measure("edit_validation", analysis_device):
             return _edit_compare(left, right, sign, chunk)
@@ -851,17 +911,25 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                                                    "effect": spec.projection_effect, "packed_tokens_upper_bound": packed_tokens}
         snapshots = {name: cap.projection for name, cap in captures.items()}
         try:
-            if any(snapshot is None for snapshot in snapshots.values()):
+            if layered:
+                from .continuous_layers import ContinuousLayers
+
+                projection_report.update(status="unqualified", local_projection_calls=0, layers={},
+                                         selection=spec.projection_layers, inventory=inventory,
+                                         selected_layers=list(layer_targets), block=None)
+                continuous = ContinuousLayers(layer_targets, points, packed_tokens, spec, timing, projection_report)
+            elif any(snapshot is None for snapshot in snapshots.values()):
                 raise ProjectionUnavailable("packed_projection_capture_incomplete")
-            if any(snapshot.inputs.shape[1] > packed_tokens for snapshot in snapshots.values()):
-                raise ProjectionUnavailable("packed_projection_exceeds_token_estimate")
-            projection_report["retained_packed_bytes"] = sum(
-                tensor.numel() * tensor.element_size()
-                for snapshot in snapshots.values() for tensor in (snapshot.inputs, snapshot.output) if tensor is not None
-            )
-            delta = study_projection(dit.blocks[projection_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
-                                     chunk, projection_report, timing,
-                                     seed_key(probe_seed, f"projection-control-{cfg.trial}"))
+            if not layered:
+                if any(snapshot.inputs.shape[1] > packed_tokens for snapshot in snapshots.values()):
+                    raise ProjectionUnavailable("packed_projection_exceeds_token_estimate")
+                projection_report["retained_packed_bytes"] = sum(
+                    tensor.numel() * tensor.element_size()
+                    for snapshot in snapshots.values() for tensor in (snapshot.inputs, snapshot.output) if tensor is not None
+                )
+                delta = study_projection(dit.blocks[projection_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
+                                         chunk, projection_report, timing,
+                                         seed_key(probe_seed, f"projection-control-{cfg.trial}"))
             if factorial:
                 # Both reruns must reproduce the complete native packed inputs
                 # and outputs before replacement on generated tokens only.
@@ -869,11 +937,11 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                 for name, source in (("continuous_native", "D00"), ("continuous_feature", "D01")):
                     patched = Capture(light, frame.grid, workspace, cfg.feature_block,
                                       proposal=plus.proposal if source == "D01" else None,
-                                      scale=1, projection_override=(snapshots[source], delta[source]),
+                                      scale=1, projection_override=None if layered else (snapshots[source], delta[source]),
                                       replace_projection=True)
                     try:
-                        predict(name, capture=patched)
-                        if patched.projection_realized_energy is None:
+                        predict(name, capture=patched, continuous=continuous if layered else None)
+                        if not layered and patched.projection_realized_energy is None:
                             raise ProjectionUnavailable("factorial_projection_hook_not_observed")
                     finally:
                         for value in patched.fields.values():
@@ -893,9 +961,15 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
                     stats = measure_comparisons(fields, comparisons, chunk, spec.low_cut, spec.high_cut, patch_size=dit.patch)
                 projection_report["factorial"] = {
                     "scope": "frozen_same_checkpoint_generated_tokens_only", "proposal_sha256": stage["proposal"]["C0_sha256"],
+                    "precision": "fp64_continuous_matmul_qualified_native_output_dtype_and_epilogue",
+                    "coverage": "configured_layer_set" if layered else "single_projection",
                     "comparisons": {key: value for key, value in stats.items()},
                     "production_cuda": latent.is_cuda,
                 }
+                if layered:
+                    projection_report.update(status="qualified", activation_counterfactual={
+                        "status": "qualified", "qualification": "bit_exact", "scope": "each_selected_layer_each_arm",
+                    })
                 factorial_clean = {name: clean[name] for name in ("continuous_native", "continuous_feature")}
             if projection_downstream:
                 if delta is None:

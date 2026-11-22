@@ -47,6 +47,8 @@ class MechanisticSettings:
     projection_symmetric_check: bool = False
     projection_activation_check: bool = False
     projection_block: int = -1
+    projection_layers: str = ""
+    factorial_feature_source: str = ""
 
     @cached_property
     def block_ids(self):
@@ -83,6 +85,10 @@ class MechanisticSettings:
             raise ValueError("Projection block is outside the supported range.")
         if self.projection_block >= 0 and self.projection_study != "activation_factorial":
             raise ValueError("An independent projection block requires the activation factorial.")
+        if (self.projection_layers or self.factorial_feature_source) and self.projection_study != "activation_factorial":
+            raise ValueError("Projection layers and feature-source archives require the activation factorial.")
+        if self.projection_layers and (self.projection_block != -1 or len(self.projection_layers) > 4096):
+            raise ValueError("Set projection_block to -1 when selecting downstream layers.")
         if self.projection_study == "activation_factorial":
             if (self.mode != "signed" or self.component != "observe" or not self.projection_activation_check
                     or self.amplitude_check or self.projection_symmetric_check or self.match_cross_dtype):

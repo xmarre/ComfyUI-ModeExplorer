@@ -221,4 +221,5 @@ def read_trajectory(export_id):
     settings = info.get("settings", {})
     return {**info["states"][index], "seed": info["seed"], "cfg_scale": info["cfg"],
             "noise_scale": info["noise_scale"], "origin": "trajectory",
-            "native_trajectory": settings.get("feature") == "native" and settings.get("initialization") is False}, data
+            "native_trajectory": settings.get("feature") == "native" and settings.get("initialization") is False,
+            "trajectory_settings": settings, "trajectory_status": info.get("status")}, data

@@ -140,3 +140,51 @@ def test_factorial_rejects_later_unedited_state_from_guided_trajectory(model, ca
     point, = traces(caplog)[-1]["response"]["points"]
     assert point["reason"] == "frozen_replay_requires_native_trajectory"
     assert point["auxiliary_dit_calls"] == 0
+
+
+@pytest.mark.parametrize("selection", ["downstream", "b1.attn.wo,b2.mlp.down"])
+def test_frozen_factorial_qualifies_each_current_packed_layer(model, caplog, tmp_path, monkeypatch, selection):
+    import comfy_kitchen
+    from comfy import ops
+    from comfy.quant_ops import QuantizedTensor
+
+    dit = model.model.diffusion_model
+    targets = (("b1.attn.wo", dit.blocks[1].attn, "wo"), ("b2.mlp.down", dit.blocks[2].mlp, "down"))
+    with torch.inference_mode(), comfy_kitchen.use_backend("eager"):
+        for _, parent, key in targets:
+            old = getattr(parent, key)
+            layer = ops.mixed_precision_ops(compute_dtype=torch.float32).Linear(
+                old.in_features, old.out_features, bias=False, device="cpu").eval()
+            layer.weight = torch.nn.Parameter(QuantizedTensor.from_float(
+                old.weight.detach(), "TensorWiseINT8Layout", convrot=True, convrot_groupsize=4, per_channel=True,
+            ), requires_grad=False)
+            layer.quant_format = "int8_tensorwise"
+            layer.layout_type = "TensorWiseINT8Layout"
+            setattr(parent, key, layer)
+
+        native, native_run = capture(model, caplog, tmp_path, monkeypatch, feature="native")
+        _, active_run = capture(model, caplog, tmp_path, monkeypatch, strength=.03, fidelity=.81, adaptive=False)
+        opts = dict(feature_block=1, projection_layers=selection, blocks="1,2", sites="clean", evaluation=0,
+                    frozen_state=native_run["states"][0]["export_id"], export=True, projection_study="activation_factorial",
+                    projection_activation_check=True, analysis_device="cpu", feature_strength=.03, auxiliary_budget=5,
+                    factorial_feature_source=active_run["states"][0]["export_id"])
+        patched, = ModeExplorerMechanistic().apply(model, **opts)
+        assert torch.equal(draw(patched), native)
+        point, = traces(caplog)[-1]["response"]["points"]
+        report = point["mechanistic"]["projection"]
+        assert report["status"] == "qualified", report
+        assert report["selected_layers"] == [name for name, _, _ in targets]
+        assert report["local_projection_calls"] == 4 and point["auxiliary_dit_calls"] == 5
+        assert point["mechanistic"]["factorial_feature_settings"]["fidelity"] == .81
+        assert point["mechanistic"]["proposal"]["active_archive_same_noisy_input"]
+        assert point["mechanistic"]["proposal"]["active_archive_same_proposal"]
+        assert report["factorial"]["comparisons"]["precision_feature"]["displacement_l2"] > 0
+        for arm in ("continuous_native", "continuous_feature"):
+            assert all(layer["packed_native_replay_bit_exact"] and layer["activation_emulation"]["packed_bit_exact"]
+                       for layer in report["layers"][arm].values())
+        rejection, = ModeExplorerMechanistic().apply(model, **{**opts, "feature_strength": .04})
+        assert torch.equal(draw(rejection), native)
+        rejected, = traces(caplog)[-1]["response"]["points"]
+        assert rejected["reason"] == "factorial_active_feature_settings_mismatch"
+        assert rejected["auxiliary_dit_calls"] == 0
+    assert all(not getattr(parent, key)._forward_hooks for _, parent, key in targets)
