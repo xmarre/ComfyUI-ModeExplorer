@@ -315,10 +315,17 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
                 assert port["name"] in inputs and inputs[port["name"]][0] == port["type"]
             ports = {port["name"] for port in item["inputs"]}
             values = iter(item.get("widgets_values", []))
+            missing = object()
             widget_inputs = {}
             for name, spec in inputs.items():
                 if name not in ports:
-                    widget_inputs[name] = next(values)
+                    value = next(values, missing)
+                    if value is missing:
+                        assert name in schema.get("optional", {}) and len(spec) > 1 and "default" in spec[1], (
+                            path.name, item["type"], name,
+                        )
+                        continue
+                    widget_inputs[name] = value
                     if name in ("seed", "noise_seed") or (len(spec) > 1 and spec[1].get("control_after_generate")):
                         next(values)
             assert next(values, None) is None, (path.name, item["type"])
