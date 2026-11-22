@@ -8,9 +8,21 @@ from zipfile import ZipFile
 from mode_explorer.nodes import ModeExplorer, ModeExplorerMechanistic
 
 CASES = {"detail": (896275366471460, .03), "anatomy": (354937070410882, .05)}
-ARMS = ("native", "native_repeat", "sham", "active", "factorial_injection", "factorial_block5", "factorial_downstream")
+FACTORIAL_TARGETS = {"factorial_injection": (-1, ""), "factorial_block5": (5, ""),
+                     "factorial_downstream": (-1, "downstream")}
+ARMS = ("native", "native_repeat", "sham", "active", *FACTORIAL_TARGETS,
+        *(f"{arm}_first" for arm in FACTORIAL_TARGETS))
 PLANNER = "Krea2TurboFlowAlignedRegenerate"
 
+
+
+def factorial_controls(arm):
+    evaluation = 0 if arm.endswith("_first") else 1
+    block, layers = FACTORIAL_TARGETS[arm.removesuffix("_first")]
+    return {
+        "projection_block": block, "projection_layers": layers, "evaluation": evaluation,
+        "auxiliary_budget": 5 + evaluation, "capture_vram_mib": 16384 if layers else 12288,
+    }
 
 def widgets(node, cls):
     fields = [name for inputs in cls.INPUT_TYPES().values() for name, spec in inputs.items()
@@ -84,13 +96,12 @@ def validate(graph, case, arm, *, private=False):
     if factorial:
         study = find("ModeExplorerMechanisticKrea2")
         spec = widgets(study, ModeExplorerMechanistic)
-        expected = {"factorial_injection": (-1, ""), "factorial_block5": (5, ""),
-                    "factorial_downstream": (-1, "downstream")}[arm]
-        require((spec["projection_block"], spec["projection_layers"]) == expected
+        require(all(spec[key] == value for key, value in factorial_controls(arm).items())
                 and spec["projection_study"] == "activation_factorial" and spec["projection_activation_check"]
                 and spec["treatment"] == "export_only" and spec["feature_block"] == 1
-                and spec["feature_strength"] == strength and spec["auxiliary_budget"] == 6
-                and spec["evaluation"] == 1 and spec["export"] and not spec["all_actual"], "wrong factorial controls")
+                and spec["feature_strength"] == strength and spec["export"] and not spec["all_actual"]
+                and spec["reference_start_sigma"] == .9999683499336243
+                and spec["analysis_device"] == "cuda", "wrong factorial controls")
         require(linked(spectrum, "model")[0] == study, "factorial must precede Spectrum")
 
     if not factorial or private:
@@ -152,4 +163,4 @@ if __name__ == "__main__":
     parser.add_argument("pack")
     args = parser.parse_args()
     validate_pack(args.pack)
-    print("Validated all 14 private discovery workflows.")
+    print(f"Validated all {len(CASES) * len(ARMS)} private discovery workflows.")

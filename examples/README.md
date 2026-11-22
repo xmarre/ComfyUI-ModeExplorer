@@ -41,5 +41,5 @@ Response examples use a broad initial sigma window so they can run on the local 
 [Structural discovery native capture](structural_discovery_native.json) and [frozen factorial](structural_discovery_factorial.json) exercise the published workflow contract using sample conditioning and model names. The production pack uses the archival conditioning and model stack. The shared validator checks its seeds, feature recipes, guarded routing, connectivity and archive conditioning fingerprints.
 
 ```text
-python -m tools.structural_workflows ModeExplorer_Structural_Discovery_Reviewed.zip
+python -m tools.structural_workflows ModeExplorer_Structural_Discovery_Final.zip
 ```

@@ -231,3 +231,29 @@ def test_trajectory_measures_unpooled_token_roi_without_edit(model, caplog, tmp_
         assert len(stats["vertical_neighbor_cosines"][0]) == 4
     with pytest.raises(ValueError, match="between 1 and 64"):
         ModeExplorer().apply(model, feature="native", trajectory_label="test", trajectory_roi="0,9,0,9")
+
+
+def test_downstream_discovery_budget_admits_wide_projection_at_planner_resolution():
+    from types import SimpleNamespace
+
+    from mode_explorer.continuous_layers import workspace_bytes
+    from mode_explorer.mechanism import MechanisticSettings
+    from mode_explorer.mechanism_runtime import estimate_capture_workspace
+    from tools.structural_workflows import factorial_controls
+
+    spec = MechanisticSettings(
+        blocks="1,5", sites="clean", projection_study="activation_factorial",
+        projection_activation_check=True, projection_layers="downstream",
+    )
+    packed_rows = 102 * 154 + 512
+    staged, reserve = estimate_capture_workspace(
+        spec, feature_block=1, grid=(102, 154), latent_shape=(1, 16, 204, 308),
+        attention_channels=6144, patch_size=2, baseline_reused=False, chunk=spec.cuda_chunk,
+        packed_tokens=packed_rows, retain_packed_projection=False,
+    )
+    targets = {"b1.mlp.up": (None, SimpleNamespace(in_features=6144, out_features=16384))}
+    required = staged + reserve + workspace_bytes(targets, packed_rows, spec.projection_token_chunk)
+    mib = 1024**2
+    assert 12288 * mib < required <= factorial_controls("factorial_downstream")["capture_vram_mib"] * mib
+    assert required <= factorial_controls("factorial_downstream_first")["capture_vram_mib"] * mib
+    assert factorial_controls("factorial_injection")["capture_vram_mib"] == 12288

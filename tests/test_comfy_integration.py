@@ -339,7 +339,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
         if path.name.startswith("structural_discovery_"):
             from tools.structural_workflows import validate
 
-            arm = "factorial_downstream" if path.stem.endswith("_factorial") else "native"
+            arm = "factorial_downstream_first" if path.stem.endswith("_factorial") else "native"
             validate(graph, "detail", arm)
         elif path.name.startswith("projection_guidance_"):
             planner, = [item["inputs"] for item in api.values()
