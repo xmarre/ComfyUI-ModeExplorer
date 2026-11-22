@@ -218,5 +218,7 @@ def read_trajectory(export_id):
     if (not isinstance(info, dict) or info.get("schema") != 1
             or index >= len(info.get("states", ())) or info["states"][index].get("export_id") != export_id):
         raise ValueError("unknown_trajectory_state")
+    settings = info.get("settings", {})
     return {**info["states"][index], "seed": info["seed"], "cfg_scale": info["cfg"],
-            "noise_scale": info["noise_scale"], "origin": "trajectory"}, data
+            "noise_scale": info["noise_scale"], "origin": "trajectory",
+            "native_trajectory": settings.get("feature") == "native" and settings.get("initialization") is False}, data

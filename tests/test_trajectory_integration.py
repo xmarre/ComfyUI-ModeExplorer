@@ -124,3 +124,19 @@ def test_trajectory_keeps_er_sde_spectrum_forecasts_out_of_exports(model, caplog
     assert len(manifest["states"]) == run["native_dit_calls"]
     assert {state["route"] for state in manifest["states"]} == {"actual"}
     assert len(manifest["routes"]) == len(SIGMAS) - 1
+
+
+def test_factorial_rejects_later_unedited_state_from_guided_trajectory(model, caplog, tmp_path, monkeypatch):
+    native = draw(model)
+    _, run = capture(model, caplog, tmp_path, monkeypatch, strength=.03, fidelity=.7, adaptive=False)
+    state = run["states"][2]
+    assert not state["feature_applied"]
+    patched, = ModeExplorerMechanistic().apply(
+        model, feature_block=1, blocks="1", evaluation=2, frozen_state=state["export_id"],
+        export=True, projection_study="activation_factorial", projection_activation_check=True,
+        analysis_device="cpu", feature_strength=.03, auxiliary_budget=6,
+    )
+    assert torch.equal(draw(patched), native)
+    point, = traces(caplog)[-1]["response"]["points"]
+    assert point["reason"] == "frozen_replay_requires_native_trajectory"
+    assert point["auxiliary_dit_calls"] == 0
