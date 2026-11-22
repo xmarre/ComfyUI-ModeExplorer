@@ -102,7 +102,7 @@ class Workspace:
 
 class Capture:
     def __init__(self, cfg, grid, workspace, block, references=None, proposal=None, scale=0, fixed=None,
-                 projection=False, projection_override=None):
+                 projection=False, projection_override=None, replace_projection=False):
         self.cfg, self.grid, self.workspace, self.block = cfg, grid, workspace, block
         self.references, self.proposal, self.scale, self.fixed = references, proposal, scale, fixed
         self.fields, self.operators = {}, {}
@@ -111,6 +111,7 @@ class Capture:
         self.want_projection = projection
         self.projection = None
         self.projection_override = projection_override
+        self.replace_projection = replace_projection
         self.projection_realized_energy = None
         self.wants_edit = references is not None or proposal is not None or fixed is not None
 
@@ -241,7 +242,8 @@ class Capture:
                         for first in range(lo, hi, self.cfg.projection_token_chunk):
                             stop = min(first + self.cfg.projection_token_chunk, hi)
                             before = output[0, first:stop].float()
-                            result[0, first:stop] = before + delta[first-lo:stop-lo]
+                            replacement = delta[first-lo:stop-lo]
+                            result[0, first:stop] = replacement if self.replace_projection else before + replacement
                             energy.add_((result[0, first:stop].float() - before).square().sum())
                         self.projection_realized_energy = energy
                         return result
@@ -536,7 +538,12 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         return _conditioning_contrast(executor, run, frame, latent, x, timesteps, context, mask, refs, options,
                                       kwargs, native_velocity, point, spend, ordinal, timing)
     projection_enabled = spec.projection_study != "off"
-    projection_downstream = spec.projection_study not in ("off", "observe")
+    factorial = spec.projection_study == "activation_factorial"
+    projection_downstream = spec.projection_study not in ("off", "observe", "activation_factorial")
+    if factorial and (not cfg.frozen_state or not cfg.export or cfg.steers
+                      or run.response.cfg_scale != 1.0 or point["branches"] != [0]
+                      or run.response.frozen_velocity is None):
+        raise ValueError("factorial_requires_native_cfg_one_trajectory_and_export_only")
     if projection_enabled and analysis_device != latent.device:
         raise CaptureLimit("packed_projection_replay_requires_inference_device")
     if spec.analysis_device == "cuda" and not latent.is_cuda:
@@ -605,7 +612,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
     repeat = cfg.calibration != "off"
     native_capture = any(site not in {"velocity", "clean"} | UNAVAILABLE for site in spec.site_names)
     can_reuse = not (projection_enabled or native_capture or cfg.frozen_state or frame.attempted or x.shape[0] != 1)
-    required = core_arms - int(can_reuse) + reference_calls + 2 * int(spec.amplitude_check) + int(repeat) + int(projection_downstream)
+    required = (core_arms - int(can_reuse) + reference_calls + 2 * int(spec.amplitude_check)
+                + int(repeat) + int(projection_downstream) + 2 * int(factorial))
     stage["baseline_reused"] = can_reuse
     stage.update(auxiliary_calls_planned=required, feature_reference_calls_planned=reference_calls,
                  feature_reference_calls=0,
@@ -711,6 +719,8 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         stage["arms"].append("D00")
     else:
         predict("D00", capture=capture())
+    if factorial and not bitwise_equal(velocities["D00"].float().cpu(), run.response.frozen_velocity):
+        raise ValueError("factorial_frozen_native_velocity_mismatch")
     if repeat:
         predict("D00_repeat")
         stage["repeat_clean_rms"] = rms(clean.pop("D00_repeat") - clean["D00"])
@@ -828,6 +838,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
             clean.pop(name)
 
     downstream_clean = None
+    factorial_clean = {}
     if projection_enabled:
         projection_report = stage["projection"] = {"schema": 1, "mode": spec.projection_study,
                                                    "effect": spec.projection_effect, "packed_tokens_upper_bound": packed_tokens}
@@ -844,6 +855,41 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
             delta = study_projection(dit.blocks[cfg.feature_block].attn.wo, snapshots, frame.grid, spec, dit.patch,
                                      chunk, projection_report, timing,
                                      seed_key(probe_seed, f"projection-control-{cfg.trial}"))
+            if factorial:
+                # Both reruns must reproduce the complete native packed inputs
+                # and outputs before replacement on generated tokens only.
+                light = replace(spec, sites="")
+                for name, source in (("continuous_native", "D00"), ("continuous_feature", "D01")):
+                    patched = Capture(light, frame.grid, workspace, cfg.feature_block,
+                                      proposal=plus.proposal if source == "D01" else None,
+                                      scale=1, projection_override=(snapshots[source], delta[source]),
+                                      replace_projection=True)
+                    try:
+                        predict(name, capture=patched)
+                        if patched.projection_realized_energy is None:
+                            raise ProjectionUnavailable("factorial_projection_hook_not_observed")
+                    finally:
+                        for value in patched.fields.values():
+                            workspace.release(value)
+                        patched.fields.clear()
+                        patched.projection_override = None
+                a, b, c, d = (clean[name] for name in ("D00", "D01", "continuous_native", "continuous_feature"))
+                fields = {key: ((1., spatial_image(value)[0]),) for key, value in zip("ABCD", (a, b, c, d))}
+                comparisons = {
+                    "feature_native": (((1., "A"),), ((1., "B"), (-1., "A"))),
+                    "feature_continuous": (((1., "C"),), ((1., "D"), (-1., "C"))),
+                    "precision_native": (((1., "A"),), ((1., "C"), (-1., "A"))),
+                    "precision_feature": (((1., "B"),), ((1., "D"), (-1., "B"))),
+                    "interaction": (((1., "A"),), ((1., "D"), (-1., "C"), (-1., "B"), (1., "A"))),
+                }
+                with timing.measure("factorial_clean_spectral", latent.device):
+                    stats = measure_comparisons(fields, comparisons, chunk, spec.low_cut, spec.high_cut, patch_size=dit.patch)
+                projection_report["factorial"] = {
+                    "scope": "frozen_same_checkpoint_generated_tokens_only", "proposal_sha256": stage["proposal"]["C0_sha256"],
+                    "comparisons": {key: value for key, value in stats.items()},
+                    "production_cuda": latent.is_cuda,
+                }
+                factorial_clean = {name: clean[name] for name in ("continuous_native", "continuous_feature")}
             if projection_downstream:
                 if delta is None:
                     raise ProjectionUnavailable("projection_component_below_numerical_floor")
@@ -953,6 +999,7 @@ def research_response(executor, run, frame, latent, x, timesteps, context, mask,
         tensors = {"frozen_native_input": latent, "baseline_clean": base}
         tensors.update({f"{arm}_clean": clean[arm] for arm in main_arms if arm != "D00"})
         tensors.update({f"{name}_native_delta": value for name, value in components.items()})
+        tensors.update({f"{name}_clean": value for name, value in factorial_clean.items()})
         if downstream_clean is not None:
             tensors["projection_component_clean"] = downstream_clean
         if candidate is not None and (not projection_downstream or downstream_clean is not None):

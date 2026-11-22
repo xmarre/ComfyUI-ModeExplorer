@@ -61,6 +61,7 @@ class ModeExplorer:
             "sham": ("BOOLEAN", {"default": False, "tooltip": "Measure feature proposals and reference cost without editing attention. Initialization is skipped."}),
             "initialization_trials": ("INT", {"default": Settings.initialization_trials, "min": 1, "max": 3, "tooltip": "Maximum noise proposals after three baseline/reference guider predictions."}),
             "feature_direction": (list(FEATURE_DIRECTIONS), {"default": Settings.feature_direction, "tooltip": "Causal experiment: repel is normal; reverse negates the bounded edit; channel_sign randomizes channel signs at identical pre-rounding cell norms. Controls require bounded update."}),
+            "trajectory_label": ("STRING", {"default": "", "tooltip": "Optional local planner trajectory export. A new label also gives repeats distinct sampling inputs."}),
             "direction_trial": ("INT", {"default": Settings.direction_trial, "min": 0, "max": 31, "tooltip": "Independent deterministic channel-sign mask for the same seed; used only by channel_sign."}),
         }}
 
@@ -78,7 +79,7 @@ class ModeExplorer:
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
-        active = enabled and (diagnostics or (strength != 0 and (feature != "native" or initialization)))
+        active = enabled and (diagnostics or advanced.get("trajectory_label") or (strength != 0 and (feature != "native" or initialization)))
         if guidance is not None:
             if active:
                 raise ValueError("Use separate MODEL branches for feature guidance and projection guidance.")
@@ -289,7 +290,7 @@ class ModeExplorerMechanistic:
             "analysis_device": (["cuda", "cpu"], {"default": defaults.analysis_device, "tooltip": "CUDA uses the inference GPU. CPU is an explicit diagnostic fallback."}),
             "capture_vram_mib": number("INT", "capture_vram_mib", 16, 32768, tooltip="CUDA capture and spectral workspace budget, separate from ordinary DiT memory."),
             "cuda_chunk": number("INT", "cuda_chunk", 1, 128, tooltip="Channels processed together per CUDA spectral batch."),
-            "projection_study": (["off", "observe", "linear", "residual", "executed", "control"],
+            "projection_study": (["off", "observe", "linear", "residual", "executed", "control", "activation_factorial"],
                                  {"default": defaults.projection_study, "tooltip": "Diagnose or apply an isolated displacement at the feature block's native projection."}),
             "projection_effect": (["even", "positive", "odd", "conditioning_interaction"], {"default": defaults.projection_effect}),
             "projection_replay_fraction": number("FLOAT", "projection_replay_fraction", 0., .1, step=.005),
@@ -309,7 +310,7 @@ class ModeExplorerMechanistic:
         spec = MechanisticSettings(mode=experiment, **{key: options.pop(key) for key in spec_fields & options.keys()})
         for block in spec.block_ids:
             ModeExplorer.verify_model(model, block)
-        if (spec.component == "observe" or spec.projection_study == "observe") and treatment != "export_only":
+        if (spec.component == "observe" or spec.projection_study in ("observe", "activation_factorial")) and treatment != "export_only":
             raise ValueError("Select a component for active mechanistic steering.")
         return ModeExplorerResponse().apply(
             model, mode="feature_replay" if treatment == "export_only" else "feature_steer",

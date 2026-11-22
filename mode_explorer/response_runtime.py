@@ -38,6 +38,7 @@ class ResponseRun:
     base_model: object = None
     positive_metadata_mask: torch.Tensor | None = None
     mechanistic_anchors: dict = field(default_factory=dict)
+    frozen_velocity: torch.Tensor | None = None
 
 
 MECHANISTIC_MANIFEST_LIMIT = 16 * 1024**2
@@ -158,6 +159,10 @@ def read_export(export_id):
     from json import loads
     import folder_paths
 
+    if export_id.startswith("trajectory-"):
+        from .trajectory import read_trajectory
+
+        return read_trajectory(export_id)
     if not re.fullmatch(r"response-[a-z0-9_]{8}", export_id):
         raise ValueError("invalid_response_export_id")
     root = (Path(folder_paths.get_output_directory()) / "modeexplorer_response").resolve()
@@ -376,6 +381,7 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
     initial_sol_evaluations = response.reference_initial_sol_evaluations
     try:
         if cfg.frozen_state:
+            response.frozen_velocity = None
             from safetensors import safe_open
 
             try:
@@ -391,8 +397,12 @@ def run_response(executor, run, frame, arguments, kwargs, velocity):
                     })
                 if any(saved.get(key) != point.get(key) for key in matched):
                     raise ValueError("frozen_sigma_or_conditioning_mismatch")
+                if saved.get("origin") == "trajectory" and saved.get("feature_applied"):
+                    raise ValueError("frozen_replay_requires_native_trajectory")
                 with safe_open(data, framework="pt", device="cpu") as package:
                     saved_latent = package.get_tensor("frozen_native_input")
+                    if saved.get("origin") == "trajectory":
+                        response.frozen_velocity = package.get_tensor("conditional_velocity")
                 if saved_latent.shape != latent.shape:
                     raise ValueError("frozen_shape_mismatch")
                 latent = saved_latent.to(device=latent.device, dtype=latent.dtype)

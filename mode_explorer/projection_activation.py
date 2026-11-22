@@ -156,14 +156,14 @@ class ActivationStudy:
         arm = ActivationArm(rotated[lo:hi].clone() if rotated is not None else None, codes[lo:hi].clone(), scales[lo:hi].clone())
         return {"quantizer": route, "gemm_route_candidate": gemm}, telemetry, arm
 
-    def without_quantization(self, source, arm, bounds, dtype, epilogue):
+    def without_quantization(self, source, arm, bounds, dtype, epilogue, *, include_unrounded=True):
         """Keep row scales and the qualified epilogue while removing input coding."""
         lo, hi = bounds
         source = source[0, lo:hi]
         rows, count = source.shape[0], self.reference.weight.shape[0]
         rounded = torch.empty((rows, count), dtype=dtype, device=source.device)
         rotation = self.reference.rotation
-        unrounded = torch.empty_like(rounded) if rotation is not None else rounded
+        unrounded = torch.empty_like(rounded) if rotation is not None and include_unrounded else rounded
         for start in range(0, rows, self.token_chunk):
             self.interrupt()
             span = slice(start, start + self.token_chunk)
@@ -174,7 +174,7 @@ class ActivationStudy:
             # rounding, integer rounding and clipping while retaining the
             # same row scale and output epilogue.
             rounded[span] = self._epilogue((continuous / scales.double()) @ self.reference.weight.T, scales, dtype, epilogue)
-            if rotation is not None:
+            if rotation is not None and include_unrounded:
                 group = rotation.shape[0]
                 high_precision = (source[span].double().unflatten(-1, (-1, group)) @ rotation).flatten(-2)
                 unrounded[span] = self._epilogue((high_precision / scales.double()) @ self.reference.weight.T, scales, dtype, epilogue)

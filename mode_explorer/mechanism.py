@@ -67,18 +67,22 @@ class MechanisticSettings:
 
     @property
     def signed(self):
-        return self.mode == "signed" or self.mode.startswith("joint")
+        return (self.mode == "signed" or self.mode.startswith("joint")) and self.projection_study != "activation_factorial"
 
     @property
     def core_arms(self):
-        return 2 if self.mode == "conditioning_contrast" else 2 + int(self.signed) + 2 * int(self.conditioning)
+        return 2 if self.mode == "conditioning_contrast" or self.projection_study == "activation_factorial" else 2 + int(self.signed) + 2 * int(self.conditioning)
 
     def __post_init__(self):
-        if self.projection_study not in ("off", "observe", "linear", "residual", "executed", "control"):
+        if self.projection_study not in ("off", "observe", "linear", "residual", "executed", "control", "activation_factorial"):
             raise ValueError("Unknown projection study.")
         if self.projection_effect not in ("positive", "odd", "even", "conditioning_interaction"):
             raise ValueError("Unknown projection effect.")
-        if self.projection_study not in ("off", "observe"):
+        if self.projection_study == "activation_factorial":
+            if (self.mode != "signed" or self.component != "observe" or not self.projection_activation_check
+                    or self.amplitude_check or self.projection_symmetric_check or self.match_cross_dtype):
+                raise ValueError("Activation factorial requires a signed observational projection with activation checking.")
+        elif self.projection_study not in ("off", "observe"):
             if self.component != "complete":
                 raise ValueError("Select complete as the clean response component for a projection displacement.")
             if (self.projection_effect in ("odd", "even") and not self.signed

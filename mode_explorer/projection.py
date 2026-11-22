@@ -298,6 +298,12 @@ def _activation_stages(reference, captures, components, floors, spec, report, ti
             "replayed_kitchen_cuda_quantizer_codes_and_row_scales" if backend == "cuda" else
             "eager_emulated_codes_and_row_scales_after_packed_bitwise_match"
         )
+        if spec.projection_study == "activation_factorial" and selected["qualification"] != "bit_exact":
+            info["reason"] = "factorial_requires_bit_exact_packed_emulation"
+            return None
+        if spec.projection_study == "activation_factorial" and backend != "cuda" and device.type == "cuda":
+            info["reason"] = "factorial_requires_kitchen_cuda_quantizer"
+            return None
         qualify_pairs = {}
         if "D0minus" in arms:
             qualify_pairs["full"] = ("D01", "D0minus")
@@ -313,8 +319,10 @@ def _activation_stages(reference, captures, components, floors, spec, report, ti
         with timing.measure("projection_activation_reference", device):
             for name, cap in captures.items():
                 arm = arms[name] if name == "D00" and spec.projection_symmetric_check else arms.pop(name)
-                staged[name] = study.without_quantization(cap.inputs, arm, cap.bounds, cap.output.dtype, epilogue)
-                info["reference_matmul_passes"] += 1 + int(reference.rotation is not None)
+                include_unrounded = spec.projection_study != "activation_factorial"
+                staged[name] = study.without_quantization(cap.inputs, arm, cap.bounds, cap.output.dtype, epilogue,
+                                                           include_unrounded=include_unrounded)
+                info["reference_matmul_passes"] += 1 + int(include_unrounded and reference.rotation is not None)
     except ActivationUnavailable as exc:
         info["reason"] = str(exc)
         return None
@@ -550,6 +558,13 @@ def study_projection(module, captures, grid, spec, patch, chunk, report, timing,
     report["components"] = {}
     activation = (_activation_stages(reference, captures, components, floors, spec, report, timing, interrupt)
                   if spec.projection_activation_check else None)
+    if spec.projection_study == "activation_factorial":
+        if activation is None:
+            raise ProjectionUnavailable(report["activation_counterfactual"]["reason"])
+        if not all(check["packed_bit_exact"] for check in replay.values()):
+            raise ProjectionUnavailable("factorial_requires_bit_exact_packed_native_replay")
+        report["status"] = "qualified"
+        return {name: values[0] for name, values in activation[1].items()}
     chosen = None
     for name, terms in components.items():
         with timing.measure("projection_reference", device):

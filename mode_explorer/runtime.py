@@ -85,8 +85,14 @@ class Settings:
     sham: bool = False
     feature_direction: str = "repel"
     direction_trial: int = 0
+    trajectory_label: str = ""
 
     def __post_init__(self):
+        if self.trajectory_label:
+            from .trajectory import LABEL
+
+            if not LABEL.fullmatch(self.trajectory_label):
+                raise ValueError("Use 1–64 letters, digits, hyphens or underscores for the trajectory label.")
         if self.feature not in FEATURES or self.operation not in OPERATIONS:
             raise ValueError("ModeExplorer received an unknown feature or batch mode")
         for key, low, high in (
@@ -151,6 +157,7 @@ class Run:
     reasons: set[str] = field(default_factory=set)
     response: object = None
     guidance: object = None
+    trajectory: object = None
 
 
 @dataclass
@@ -188,6 +195,7 @@ class Frame:
     sol_evaluations: int | None = None
     anchor_blocks: tuple[int, ...] = ()
     mechanistic_capture: object = None
+    realized_rms: torch.Tensor | None = None
 
 
 def sigma_eligible(sigma: float, minimum: float) -> bool:
@@ -503,7 +511,7 @@ def attention_feature(output, options):
         frame.pooled = current
         return output
 
-    if settings.diagnostics and len(frame.run.points) < MAX_POINTS:
+    if frame.run.trajectory is not None or (settings.diagnostics and len(frame.run.points) < MAX_POINTS):
         frame.pooled = current
     pairs = frame.pairs
     if frame.reference is not None:
@@ -531,7 +539,7 @@ def attention_feature(output, options):
     repulsion = shift
     if settings.feature_direction != "repel":
         shift = direction_control(shift, settings.feature_direction, frame.run.seed, settings.direction_trial)
-    trace_edit = settings.diagnostics and len(frame.run.points) < MAX_POINTS
+    trace_edit = frame.run.trajectory is not None or (settings.diagnostics and len(frame.run.points) < MAX_POINTS)
     if trace_edit:
         frame.metrics = (
             redundancy[:frame.batch], loss,
@@ -561,7 +569,15 @@ def attention_feature(output, options):
     # Expand a single coarse cell row over width, with no full-size delta tensor.
     for iy in range(shift.shape[-2]):
         delta = shift[:frame.batch, :, iy].to(output.dtype).repeat_interleave(sx, dim=-1)
-        view[:, iy * sy:(iy + 1) * sy].add_(delta[:, :, :width].transpose(1, 2)[:, None])
+        target = view[:, iy * sy:(iy + 1) * sy]
+        target.add_(delta[:, :, :width].transpose(1, 2)[:, None])
+    if frame.run.trajectory is not None:
+        # Bounded strips avoid a full activation-sized FP32 difference.
+        energy = view.new_zeros((frame.batch,), dtype=torch.float32)
+        after = result[numbers[0]:numbers[1], start:end]
+        for edited_row, native_row in zip(after.split(width, dim=1), image.split(width, dim=1)):
+            energy.add_(edited_row.to(dtype=torch.float32, copy=True).sub_(native_row).square_().sum(dim=(1, 2)))
+        frame.realized_rms = (energy / image[0].numel()).sqrt()
     if trace_edit:
         edited = token_pool(result[numbers[0]:numbers[1], start:end], height, width, settings.feature_grid)
         after = torch.cat((edited, current[frame.batch:]), dim=0) if frame.reference is not None else edited
@@ -716,9 +732,17 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
     def forward(args):
         result = executor(*args, **kwargs)
         after = spectrum_forecast_count(run)
-        if before_forecast is not None and after is not None and after > before_forecast:
+        forecast = before_forecast is not None and after is not None and after > before_forecast
+        if forecast:
             run.spectrum_forecasts += after - before_forecast
             run.native_dit_calls -= 1
+        if run.trajectory is not None:
+            try:
+                run.trajectory.observe(run, args, result, forecast, run.reference_calls - prior_refs,
+                                       kwargs.get("ref_latents_method", executor.class_obj.default_ref_method))
+            except (OSError, RuntimeError, ValueError) as exc:
+                run.trajectory.failure = "capture_failed"
+                LOGGER.warning("ModeExplorer trajectory capture stopped: %s", exc)
         if run.settings.diagnostics and len(run.decisions) < 256:
             run.decisions.append({
                 "route": "forecast" if before_forecast is not None and after is not None and after > before_forecast else "actual",
@@ -733,7 +757,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         return dispatch(forward, arguments, executor.class_obj, run)
 
     response_active = run.response is not None and run.response.eligibility is None
-    if not (run.feature_active or run.settings.diagnostics or response_active) or spatial_image(x) is None:
+    if not (run.feature_active or run.settings.diagnostics or run.trajectory is not None or response_active) or spatial_image(x) is None:
         return forward(arguments)
     branches = options.get("cond_or_uncond", ())
     if 0 not in branches:
@@ -744,8 +768,9 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         run.reasons.add("unverified_condition_dispatch")
         return forward(arguments)
     trace = run.settings.diagnostics and len(run.points) < MAX_POINTS
+    observe = run.trajectory is not None and run.trajectory.failure is None
     may_steer = run.feature_active and (run.batch > 1 or run.reference_calls < run.settings.reference_budget)
-    if not trace and not may_steer and not response_active:
+    if not (trace or observe or may_steer or response_active):
         return forward(arguments)
     sigmas = options.get("sigmas")
     if sigmas is None or sigmas.shape != (run.batch,):
@@ -758,7 +783,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
         run.reasons.add("nonuniform_sigma")
         return forward(arguments)
     active = may_steer and sigma_eligible(low, run.settings.min_sigma)
-    if not active and not trace and not response_active:
+    if not (active or trace or observe or response_active):
         return forward(arguments)
     offset = branches.index(0) * run.batch
     patch = executor.class_obj.patch
@@ -789,7 +814,7 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
             prepare_native_options({FRAME: frame})
     elif active and run.batch > 1:
         frame.pairs = equal_condition_pairs(run.batch, offset, context, attention_mask, ref_latents)
-    if frame.pairs is None and frame.reference is None and frame.prepare is None and not trace:
+    if frame.pairs is None and frame.reference is None and frame.prepare is None and not (trace or observe):
         if not response_active:
             return forward(arguments)
         frame.phase = "response_pass"
@@ -936,8 +961,8 @@ class SamplerWrapper:
         from comfy.model_sampling import CONST, ModelSamplingFlux
         from comfy.samplers import CFGGuider, KSAMPLER
 
-        def sample(args=extra_args, initial=noise):
-            return executor(model_wrap, sigmas, args, callback, initial, latent_image, denoise_mask, disable_pbar)
+        def sample(args=extra_args, initial=noise, sample_callback=callback):
+            return executor(model_wrap, sigmas, args, sample_callback, initial, latent_image, denoise_mask, disable_pbar)
 
         settings = self.settings
         model_options = extra_args["model_options"]
@@ -1003,7 +1028,7 @@ class SamplerWrapper:
             LOGGER.info("ModeExplorer sequential feature guidance has zero reference budget (seed=%s)", seed)
             feature_active = False
             reasons.add("zero_reference_budget")
-        if not (feature_active or initialize or settings.diagnostics or self.response is not None):
+        if not (feature_active or initialize or settings.diagnostics or settings.trajectory_label or self.response is not None):
             return sample()
 
         scale = getattr(sampling, "noise_scale", 1.0)
@@ -1011,6 +1036,17 @@ class SamplerWrapper:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
                   spectrum=spectrum, sol=sol, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
+        sample_callback = callback
+        if settings.trajectory_label:
+            from .trajectory import Trajectory
+
+            run.trajectory = Trajectory(run, executor.class_obj, sigmas, noise, model_wrap.inner_model,
+                                        getattr(model_wrap, "cfg", None))
+
+            def sample_callback(step, *args):
+                run.trajectory.step = int(step) + 1
+                if callback is not None:
+                    return callback(step, *args)
         force_native = nullcontext()
         response = self.response
         if response is not None:
@@ -1068,12 +1104,18 @@ class SamplerWrapper:
                 else:
                     initial = optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evaluation_sigma)
             with force_native:
-                result = sample({**extra_args, "model_options": options}, initial)
+                result = sample({**extra_args, "model_options": options}, initial, sample_callback)
             completed = True
             return result
         finally:
             run.shadows.clear()
-            if settings.diagnostics or run.response is not None:
+            trajectory = None
+            if run.trajectory is not None:
+                try:
+                    trajectory = run.trajectory.save(completed, run)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    trajectory = {"status": "failed", "reason": str(exc)}
+            if settings.diagnostics or run.response is not None or trajectory is not None:
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
                     "sham": settings.sham, "feature_direction": settings.feature_direction,
@@ -1087,6 +1129,8 @@ class SamplerWrapper:
                         if spectrum is not None else "none",
                     "points": run.points, "decisions": run.decisions,
                 }
+                if trajectory is not None:
+                    payload["trajectory"] = trajectory
                 if run.response is not None:
                     rep = run.response
                     payload["response"] = {
