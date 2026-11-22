@@ -121,12 +121,13 @@ def qualify_runs(runs, temporal):
     return common, states
 
 
-def checked_tensors(state):
+def checked_tensors(state, tensors=None):
     from comfy.latent_formats import Wan21
     from safetensors.torch import load_file
 
-    _, path = read_trajectory(state["export_id"])
-    tensors = load_file(path)
+    if tensors is None:
+        _, path = read_trajectory(state["export_id"])
+        tensors = load_file(path)
     computed = Wan21().process_out(flow_clean(tensors["frozen_native_input"], tensors["conditional_velocity"], state["sigma"]))
     if not torch.equal(computed, tensors["baseline_clean"]):
         raise ValueError(f"{state['export_id']}: archived clean tensor mismatches the Krea 2 latent conversion.")
@@ -172,6 +173,18 @@ def _sheet(images, caption):
     return sheet
 
 
+
+def decode_rgb(vae, tensor):
+    """Decode already-converted Wan21 latents through ComfyUI VAE Decode."""
+    import numpy as np
+    from PIL import Image
+    from nodes import VAEDecode
+
+    pixels, = VAEDecode().decode(vae, {"samples": tensor})
+    if pixels.ndim != 4 or pixels.shape[0] != 1 or pixels.shape[-1] != 3:
+        raise ValueError("Expected a single RGB planner image from VAE Decode.")
+    return Image.fromarray(np.clip(255. * pixels[0].cpu().numpy(), 0, 255).astype(np.uint8))
+
 class ModeExplorerTrajectoryReview:
     CATEGORY = "model_patches/ModeExplorer"
     RETURN_TYPES = ()
@@ -192,11 +205,8 @@ class ModeExplorerTrajectoryReview:
         import tempfile
 
         import folder_paths
-        import numpy as np
-        from PIL import Image
         from comfy.model_management import throw_exception_if_processing_interrupted
         from comfy.utils import ProgressBar
-        from nodes import VAEDecode
 
         started = perf_counter()
         plan = json.loads(review_plan)
@@ -243,11 +253,7 @@ class ModeExplorerTrajectoryReview:
                     if "compact_feature_proposal" in tensors:
                         proposals[arm] = _tensor_hash(tensors["compact_feature_proposal"])
                     fingerprints[arm] = _tensor_hash(tensors[tensor])
-                    pixels, = VAEDecode().decode(vae, {"samples": tensors[tensor]})
-                    if pixels.ndim != 4 or pixels.shape[0] != 1 or pixels.shape[-1] != 3:
-                        raise ValueError("Expected a single RGB planner image from VAE Decode.")
-                    array = np.clip(255. * pixels[0].cpu().numpy(), 0, 255).astype(np.uint8)
-                    image = Image.fromarray(array)
+                    image = decode_rgb(vae, tensors[tensor])
                     if list(image.size) != plan["resolution"]:
                         raise ValueError("VAE output does not match the archived planner resolution.")
                     image.save(frame_dir / f"{arm}.png")

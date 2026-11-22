@@ -47,7 +47,7 @@ class ModeExplorer:
             "full_spectrum": ("BOOLEAN", {"default": Settings.full_spectrum,
                 "tooltip": "Experimental: leave Spectrum's forecast policy/history untouched. Forecasted steps cannot receive guidance; cross-regime extrapolation is unvalidated."}),
         }, "optional": {
-            "feature_block": ("INT", {"default": Settings.feature_block, "min": 0, "max": 63, "tooltip": "Zero-based native single-stream block. Validated against the loaded model."}),
+            "feature_block": ("INT", {"default": Settings.feature_block, "min": -1, "max": 63, "tooltip": "Zero-based native single-stream block. -1 resolves to floor(block count / 2) on the loaded Krea 2 model."}),
             "feature_grid": ([str(grid) for grid in FEATURE_GRIDS], {"default": str(Settings.feature_grid), "tooltip": "Maximum spatial cells on each axis."}),
             "cosine_temperature": ("FLOAT", {"default": Settings.cosine_temperature, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Cosine objective only. Changes the weighting for cohorts of at least three valid members."}),
             "volume_bandwidth": ("FLOAT", {"default": Settings.volume_bandwidth, "min": 0.25, "max": 1.25, "step": 0.05, "tooltip": "RBF objective only, for cohorts of at least three. Ignored when median bandwidth is enabled."}),
@@ -95,10 +95,11 @@ class ModeExplorer:
         if active:
             if "feature_grid" in advanced and isinstance(advanced["feature_grid"], str):
                 advanced["feature_grid"] = int(advanced["feature_grid"])
+            block = self.verify_model(model, advanced.get("feature_block", Settings.feature_block))
+            advanced["feature_block"] = block
             settings = Settings(feature, initialization, strength, fidelity, min_sigma,
                                 adaptive, similarity, operation, reference_budget, diagnostics,
                                 full_spectrum, **advanced)
-            self.verify_model(model, settings.feature_block)
         if active or response is not None:
             if has_spectrum(base_options, model.wrappers):
                 raise RuntimeError("Apply ModeExplorer before Spectrum: noise optimization must precede Spectrum's sampling session.")
@@ -127,8 +128,11 @@ class ModeExplorer:
             type(dit) is not SingleStreamDiT or dit.patch != 2 or dit.channels != 16
         ):
             raise RuntimeError("ModeExplorer could not verify the native Krea 2 transformer contract.")
+        if block == -1:
+            block = len(dit.blocks) // 2
         if not 0 <= block < len(dit.blocks) or type(dit.blocks[block]) is not SingleStreamBlock:
             raise ValueError(f"ModeExplorer block {block} is outside the native single-stream range [0, {len(dit.blocks) - 1}].")
+        return block
 
 
 class ModeExplorerResponse:

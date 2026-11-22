@@ -93,6 +93,7 @@ class Trajectory:
             "solver_options": {key: _option(value) for key, value in sampler.extra_options.items()},
             "schedule": as_list(sigmas[:MAX_STATES + 1]), "schedule_length": len(sigmas),
             "initial_noise_sha256": _tensor_hash(noise), "noise_scale": run.noise_scale,
+            "single_stream_blocks": len(base.diffusion_model.blocks),
             "device": str(noise.device), "torch": str(torch.__version__),
             "resume_supported": False, "auxiliary_dit_calls": 0,
         }
@@ -170,6 +171,12 @@ class Trajectory:
             state["reference_slots"] = list(frame.reference_slots)
             if run.settings.ablation_route:
                 state["reference_history"] = frame.reference_history
+                if proposal is not None:
+                    state["feature_geometry"] = {"block": run.settings.feature_block, "patch_grid": list(frame.grid),
+                                                 "channels": proposal.shape[1], "proposal_shape": list(proposal.shape)}
+                    state["realization_error_rms"] = (as_list(frame.realization_error_rms)
+                                                      if frame.realization_error_rms is not None else None)
+                    state["objective_after"] = as_list(frame.objective_after) if frame.objective_after is not None else None
                 if frame.proposal_relative_rms is not None:
                     state["proposed_relative_rms"] = as_list(frame.proposal_relative_rms)
                     state["compact_proposal_sha256"] = _tensor_hash(tensors["compact_feature_proposal"])

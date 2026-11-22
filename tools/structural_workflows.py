@@ -55,6 +55,7 @@ SERIALIZED_FIELDS = {
     "SaveImage": ["filename_prefix"],
     "VAELoader": ["vae_name"],
     "ModeExplorerTrajectoryReviewKrea2": ["review_plan"],
+    "ModeExplorerResearchReportKrea2": ["campaign"],
 }
 
 
@@ -104,7 +105,7 @@ def require(condition, detail):
         raise ValueError(detail)
 
 
-def validate(graph, case, arm, *, private=False):
+def validate(graph, case, arm, *, private=False, feature_block=1, trajectory_label=None):
     """Check an imported LiteGraph workflow without reading private input values into logs."""
     validate_widget_serialization(graph)
     seed, strength = CASES[case]
@@ -183,14 +184,14 @@ def validate(graph, case, arm, *, private=False):
             require(cfg.get("feature_application") == arm and cfg.get("ablation_route", "").startswith("AA"),
                     "temporal arm has no guarded application schedule")
         require(cfg["enabled"] and cfg["feature"] == expected_mode and cfg["sham"] == (arm == "sham")
-                and cfg["strength"] == strength and cfg["fidelity"] == .70 and cfg["feature_block"] == 1
+                and cfg["strength"] == strength and cfg["fidelity"] == .70 and cfg["feature_block"] == feature_block
                 and cfg["feature_grid"] == "4" and not cfg["adaptive"] and not cfg["full_spectrum"]
                 and cfg["reference_budget"] == 2 and cfg["min_sigma"] == .82 and not cfg["initialization"]
                 and cfg["reference_source"] == "bank" and cfg["reference_bank_size"] == 8
                 and cfg["reference_trajectories"] == 1 and cfg["reference_selection"] == "all"
                 and cfg["reference_continuation"] == "first_estimate" and cfg["feature_update"] == "bounded"
                 and cfg["feature_direction"] == "repel"
-                and cfg["trajectory_label"] == ("" if factorial else f"{case}_iv_{arm}" if scheduled else f"{case}_{arm}"), "wrong feature or sham recipe")
+                and cfg["trajectory_label"] == (trajectory_label if trajectory_label is not None else "" if factorial else f"{case}_iv_{arm}" if scheduled else f"{case}_{arm}"), "wrong feature or sham recipe")
 
         if factorial:
             require(linked(study, "model")[0] == feature, "factorial feature base is miswired")

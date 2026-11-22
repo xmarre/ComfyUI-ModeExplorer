@@ -20,6 +20,7 @@ from .objectives import (
     feature_shift,
     initial_direction,
     noise_candidate,
+    objective,
     pool,
     reference_noise,
     seed_key,
@@ -219,6 +220,8 @@ class Frame:
     trajectory_proposal: torch.Tensor | None = None
     trajectory_roi: torch.Tensor | None = None
     proposal_relative_rms: torch.Tensor | None = None
+    realization_error_rms: torch.Tensor | None = None
+    objective_after: torch.Tensor | None = None
     reference_history: list = field(default_factory=list)
 
 
@@ -600,6 +603,8 @@ def attention_feature(output, options):
     if not apply_edit:
         if trace_edit:
             frame.edit_metrics = pooled_edit_metrics(current, current, pairs, shift, repulsion, frame.batch, areas)
+            if settings.ablation_route:
+                frame.objective_after = loss[:frame.batch]
         return output
     result = output.clone()
     view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
@@ -613,13 +618,27 @@ def attention_feature(output, options):
         # Bounded strips avoid a full activation-sized FP32 difference.
         energy = view.new_zeros((frame.batch,), dtype=torch.float32)
         after = result[numbers[0]:numbers[1], start:end]
-        for edited_row, native_row in zip(after.split(width, dim=1), image.split(width, dim=1)):
-            energy.add_(edited_row.to(dtype=torch.float32, copy=True).sub_(native_row).square_().sum(dim=(1, 2)))
+        error_energy = torch.zeros_like(energy) if settings.ablation_route else None
+        for row_index, (edited_row, native_row) in enumerate(zip(after.split(width, dim=1), image.split(width, dim=1))):
+            delta = edited_row.to(dtype=torch.float32, copy=True).sub_(native_row)
+            energy.add_((delta.square() if error_energy is not None else delta.square_()).sum(dim=(1, 2)))
+            if error_energy is not None:
+                if row_index % sy == 0:
+                    intended = shift[:frame.batch, :, row_index // sy].repeat_interleave(sx, dim=-1)
+                error_energy.add_(delta.sub_(intended[:, :, :width].transpose(1, 2)).square_().sum(dim=(1, 2)))
         frame.realized_rms = (energy / image[0].numel()).sqrt()
+        if error_energy is not None:
+            frame.realization_error_rms = (error_energy / image[0].numel()).sqrt()
     if trace_edit:
         edited = token_pool(result[numbers[0]:numbers[1], start:end], height, width, settings.feature_grid)
         after = torch.cat((edited, current[frame.batch:]), dim=0) if frame.reference is not None else edited
         frame.edit_metrics = pooled_edit_metrics(current, after, pairs, shift, repulsion, frame.batch, areas)
+        if settings.ablation_route:
+            mean = after.mean(dim=(-1, -2), keepdim=True) if areas is None else (after * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum()
+            # Temporal ablations have one live row and one reference. The
+            # pair uses the same fallback objective parameters as feature_shift.
+            _, _, after_loss = objective((after - mean).flatten(1), pairs, settings.feature, .55, .5, gradient=False)
+            frame.objective_after = after_loss[:frame.batch]
     return result
 
 
