@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from mode_explorer.nodes import ModeExplorer
-from tools.structural_workflows import PLANNER, SERIALIZED_FIELDS, validate_widget_serialization, widget_fields, widgets
+from tools.structural_workflows import (
+    PLANNER, SERIALIZED_FIELDS, validate, validate_widget_serialization, widget_fields, widgets,
+)
 
 
 def feature_graph():
@@ -104,3 +106,13 @@ def test_production_example_widget_configuration(filename, mode):
     assert settings["strength"] == .03 and settings["fidelity"] == .70
     assert not (settings["diagnostics"] or settings["trajectory_label"] or settings["ablation_route"])
     assert any(link[1] == feature["id"] and link[-1] == "MODEL" for link in graph["links"])
+
+
+def test_structural_campaign_requires_historical_mode_resolution():
+    path = Path(__file__).resolve().parents[1] / "examples" / "structural_discovery_native.json"
+    graph = json.loads(path.read_text())
+    validate(graph, "detail", "native")
+    feature = next(node for node in graph["nodes"] if node["type"] == "ModeExplorerKrea2")
+    feature["widgets_values"].extend(["all", "", "Early Structural (B1)"])
+    with pytest.raises(ValueError, match="structural campaign requires Original mode"):
+        validate(graph, "detail", "native")

@@ -178,6 +178,7 @@ def validate(graph, case, arm, *, private=False, feature_block=1, trajectory_lab
     if not factorial or private:
         feature = find("ModeExplorerKrea2")
         cfg = widgets(feature, ModeExplorer)
+        require(cfg.get("mode", "Original") == "Original", "structural campaign requires Original mode")
         scheduled = arm in ("first_only", "second_only")
         expected_mode = "feature_cosine" if arm in ("sham", "active") or scheduled else "native"
         if scheduled:
