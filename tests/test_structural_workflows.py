@@ -1,9 +1,11 @@
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
 from mode_explorer.nodes import ModeExplorer
-from tools.structural_workflows import PLANNER, SERIALIZED_FIELDS, validate_widget_serialization, widget_fields
+from tools.structural_workflows import PLANNER, SERIALIZED_FIELDS, validate_widget_serialization, widget_fields, widgets
 
 
 def feature_graph():
@@ -65,3 +67,40 @@ def test_obsolete_workflow_and_seed_metadata_rejected():
     graph["seed_widgets"] = {"2": 0}
     with pytest.raises(ValueError, match="stale seed_widgets"):
         validate_widget_serialization(graph)
+
+
+def test_mode_is_appended_and_legacy_widget_encodings_round_trip():
+    assert widget_fields(ModeExplorer)[-5:] == [
+        "trajectory_label", "trajectory_roi", "feature_application", "ablation_route", "mode",
+    ]
+    for count in (27, 29, 31, 32):
+        graph = feature_graph()
+        node = graph["nodes"][0]
+        del node["widgets_values"][count:]
+        node["widgets_values_named"] = dict(zip(widget_fields(ModeExplorer), node["widgets_values"]))
+        round_trip = json.loads(json.dumps(graph))
+        validate_widget_serialization(round_trip)
+        settings = widgets(round_trip["nodes"][0], ModeExplorer)
+        assert settings["strength"] == .05
+        assert ("mode" in settings) == (count == 32)
+        if count == 32:
+            assert settings["mode"] == "Original"
+            round_trip["nodes"][0]["widgets_values_named"]["mode"] = "Custom"
+            with pytest.raises(ValueError, match="conflicting or incomplete named widgets"):
+                validate_widget_serialization(round_trip)
+
+
+@pytest.mark.parametrize("filename,mode", [
+    ("turbo.json", "Early Structural (B1)"),
+    ("scale_locked_spectrum.json", "Early Structural (B2)"),
+])
+def test_production_example_widget_configuration(filename, mode):
+    path = Path(__file__).resolve().parents[1] / "examples" / filename
+    graph = json.loads(path.read_text())
+    validate_widget_serialization(graph)
+    feature = next(node for node in graph["nodes"] if node["type"] == "ModeExplorerKrea2")
+    settings = widgets(feature, ModeExplorer)
+    assert settings["mode"] == mode
+    assert settings["strength"] == .03 and settings["fidelity"] == .70
+    assert not (settings["diagnostics"] or settings["trajectory_label"] or settings["ablation_route"])
+    assert any(link[1] == feature["id"] and link[-1] == "MODEL" for link in graph["links"])

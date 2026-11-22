@@ -4,7 +4,7 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 
 | Workflow | Purpose |
 | --- | --- |
-| [Turbo](turbo.json) | Default conservative feature guidance on one sample. |
+| [Turbo](turbo.json) | Early Structural (B1) at strength 0.03, fidelity 0.70 and fixed seed. |
 | [A/B](ab.json) | Native and guided paths at the same seed. |
 | [Advanced](advanced.json) | Collective RBF volume, two deterministic references, rolling continuation and verified update. |
 | [Initialization](initialization.json) | Initial-noise trust-region search with feature guidance disabled. |
@@ -13,7 +13,7 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 | [Sequential](sequential.json) | KSampler seed increments on each submission. |
 | [Native refinement](multistage.json) | Guided 1024px composition, latent resize, and a native 1536px second pass. |
 | [Spectrum A/B](spectrum_ab.json) | Guarded versus Full Spectrum at the same seed. Requires the companion Spectrum overlay. |
-| [Spectrum and Scale-Locked](scale_locked_spectrum.json) | Actual Scale-Locked Krea 2 Regenerate with ER-SDE and separate planner and refined outputs. Requires the companion Spectrum overlay and Scale-Locked with stage tags. |
+| [Spectrum and Scale-Locked](scale_locked_spectrum.json) | Early Structural (B2) with ER-SDE and separate planner and refined outputs. Requires the companion Spectrum overlay and Scale-Locked with stage tags. |
 | [Causal directions](causal_directions.json) | Native, sham, repel, reverse and channel-sign renders at a fixed seed. The low-strength controls use strength 0.025, fidelity 0.70 and block 5. |
 | [Latent probe](response_probe.json) | Projected response and local clean/state export at the first matching actual evaluation. |
 | [Frozen feature replay](response_feature_replay.json) | Compare latent responses and a cosine edit at the same native state. Includes later-block measurements. |

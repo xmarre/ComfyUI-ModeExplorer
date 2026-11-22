@@ -1,6 +1,7 @@
 """Native ComfyUI smoke tests using the real Krea 2 implementation at tiny width."""
 
 import asyncio
+import copy
 import json
 import logging
 from pathlib import Path
@@ -116,6 +117,69 @@ def test_milli_strength_widget_and_runtime(model, caplog):
         assert points[0]["edit_applied"]
         shifts.append(points[0]["shift_rms"][0])
     assert 0 < shifts[0] < shifts[1]
+
+
+@pytest.mark.parametrize("mode,block,schedule", [
+    ("Original", 6, "all"), ("Early Structural (B0)", 0, "first_only"),
+    ("Early Structural (B1)", 1, "first_only"), ("Early Structural (B2)", 2, "first_only"),
+    ("Amplified Structural (B5)", 5, "first_only"), ("Middle Refinement", 3, "first_only"),
+    ("Custom", 6, "second_only"),
+])
+def test_production_modes_keep_strength_and_resolve_against_loaded_depth(model, mode, block, schedule):
+    from comfy.patcher_extension import WrappersMP
+
+    blocks = model.get_model_object("diffusion_model").blocks
+    blocks.extend(copy.deepcopy(blocks[0]) for _ in range(4))
+    kwargs = dict(feature_block=6, strength=.037, fidelity=.71, reference_budget=3)
+    if mode != "Original":
+        kwargs["feature_application"] = "second_only"
+    patched, = ModeExplorer().apply(model, mode=mode, **kwargs)
+    sampler, = patched.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+    assert (sampler.settings.feature_block, sampler.settings.feature_application) == (block, schedule)
+    assert (sampler.settings.strength, sampler.settings.fidelity, sampler.settings.reference_budget) == (.037, .71, 3)
+    assert not (sampler.settings.diagnostics or sampler.settings.trajectory_label or sampler.settings.ablation_route)
+
+
+def test_production_modes_validate_depth_and_bypass_disabled_strength(model):
+    node = ModeExplorer()
+    for kwargs in (
+        {"mode": "Custom", "feature_block": 3},
+        {"mode": "Custom", "feature_block": -2},
+        {"mode": "Amplified Structural (B5)"},
+    ):
+        with pytest.raises(ValueError, match="outside the native single-stream range"):
+            node.apply(model, **kwargs)
+    with pytest.raises(ValueError, match="requires enabled Original"):
+        node.apply(model, mode="Early Structural (B1)", ablation_route="AAFA")
+    assert node.apply(model, mode="Amplified Structural (B5)", enabled=False)[0] is model
+    assert node.apply(model, mode="Amplified Structural (B5)", strength=0)[0] is model
+
+
+@pytest.mark.parametrize("mode,application,applied", [
+    ("Original", "all", [True, True]),
+    ("Early Structural (B1)", "all", [True, False]),
+    ("Custom", "second_only", [False, True]),
+])
+@pytest.mark.parametrize("continuation", ["first_estimate", "rolling_euler"])
+def test_production_edit_only_gates_application(model, caplog, mode, application, applied, continuation):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    node = ModeExplorer()
+    options = dict(mode=mode, feature_application=application, reference_continuation=continuation,
+                   adaptive=False, strength=.03)
+    plain, = node.apply(model, **options)
+    traced, = node.apply(plain, diagnostics=True, **options)
+    # Different context lengths force separate positive and negative forwards.
+    sample = dict(cfg=3.5, split_cfg=True, sampler="er_sde")
+    first = draw(plain, **sample)
+    assert not traces(caplog)
+    assert torch.equal(first, draw(traced, **sample))
+    stats = traces(caplog)[-1]
+    assert stats["feature_attempts"] == stats["feature_reference_dit_calls"] == 2
+    assert stats["initialization_dit_calls"] == 0 and "trajectory" not in stats
+    assert [p["edit_applied"] for p in stats["points"] if "shift_rms" in p] == applied
+    assert torch.equal(first, draw(plain, **sample))
+    assert torch.equal(draw(model, **sample), draw(plain, stage="highres", **sample))
+    assert run_key_absent(plain) and run_key_absent(traced)
 
 
 def run_key_absent(model):

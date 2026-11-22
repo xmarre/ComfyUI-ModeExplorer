@@ -40,7 +40,7 @@ class ModeExplorer:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
+        inputs = {"required": {
             "model": ("MODEL",),
             "enabled": ("BOOLEAN", {"default": True}),
             "feature": (list(FEATURES), {"default": Settings.feature}),
@@ -78,6 +78,10 @@ class ModeExplorer:
             # Preserve the positional widget indices of archived workflows.
             "mode": (list(MODES), {"default": "Original", "tooltip": "Original keeps the historical controls. Structural presets set depth and apply only the first eligible proposal. Custom uses the block and application widgets."}),
         }}
+        for name, (_, options) in inputs["optional"].items():
+            if name != "mode":
+                options["advanced"] = True
+        return inputs
 
     def apply(self, model, enabled=True, feature=Settings.feature, initialization=Settings.initialization,
               strength=Settings.strength, fidelity=Settings.fidelity, min_sigma=Settings.min_sigma,

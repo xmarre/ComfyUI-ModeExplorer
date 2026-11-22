@@ -11,6 +11,15 @@ Native ComfyUI Krea 2 Raw and Turbo use a single-stream DiT and the constant flo
 | [DivIn](https://arxiv.org/abs/2606.02453), [code](https://github.com/South7X/divin) | Uses Langevin sampling from a tilted Gaussian defined by conditional/unconditional clean-prediction agreement. This needs a meaningful unconditional prediction and model derivatives, both outside the supported distilled Turbo path. |
 | [Collapse recovery](https://arxiv.org/abs/2601.00090), [code](https://github.com/anneharrington/divgen) | Optimizes through full denoising with decoded-image diversity and quality rewards, including sequential history with stopping and reversion. Pink noise changes the spectral prior in a separate ablation. ModeExplorer keeps sampling state invocation-local and measures previous outputs in the offline evaluation tool. |
 | [DiverseFlow](https://arxiv.org/abs/2504.07894) | Couples ODE particles using a determinantal point process on predicted endpoints. Its objective includes a separate normalization determinant. ModeExplorer uses predicted endpoints and Gram volume. Coupled integration requires a different solver and compute budget. |
+| [Posterior Matching Distillation](https://arxiv.org/abs/2611.26629) | Matches teacher posterior samples during distillation. This requires student training and has no corresponding Krea 2 inference mode. |
+
+## Production controls and research paths
+
+The production depth modes share the existing feature update. Cosine and RBF volume remain selectable feature objectives. The determinant-based initial-noise search remains available independently through Initialization, including with Feature set to Native for initialization alone.
+
+Projection Gaussian and token-adaptive edits, response-informed steering and conditioning contrast act at different sites or derive their directions from different evidence. Their existing experimental nodes retain the corresponding trust gates, capture options and scope controls. The production depth presets are based on the localized attention-output intervention. Reverse, channel-sign and sham are causal controls available in the advanced settings.
+
+The production first-only schedule applies the first eligible feature proposal. It retains subsequent reference and proposal work so guarded Spectrum keeps the same eligibility predicate and history-transition policy. The archive qualification path still requires its explicit expected route and fixed actual-evaluation ordinals.
 
 ## Feature edits
 
