@@ -16,7 +16,7 @@ The observer performs zero auxiliary transformer forwards. Existing feature guid
 
 The cell Gram matrix and neighbor cosines describe pooled pre-gate attention at the feature block. For targeted local comparisons, set `trajectory_roi` to `y0,y1,x0,x1` in patch-grid coordinates with exclusive upper bounds. Up to 64 unpooled tokens are sampled at that same site. The observer records the centered, channel-normalized token Gram spectrum, its entropy effective rank, and horizontal and vertical neighbor cosines. The measurements describe one registered region and one site. Attention routing and cross-depth attribution require a separate targeted measurement.
 
-Each invocation writes its own folder under `output/modeexplorer_trajectory`. Use the per-state ID with the existing Load Response node. The `tools.trajectory_report` utility builds a decoder-only graph using the original VAE filename and compares saved runs offline.
+Each invocation writes its own folder under `output/modeexplorer_trajectory`. Use the per-state ID with the existing Load Response node. The [local research report](local-research-reports.md) node qualifies and summarizes matched campaigns using these folders in place. The `tools.trajectory_report` utility builds a decoder-only graph using the original VAE filename and compares saved runs offline.
 
 ```text
 python -m tools.trajectory_report decode --vae ORIGINAL_VAE.safetensors --output Decode.json NATIVE/manifest.json ACTIVE/manifest.json

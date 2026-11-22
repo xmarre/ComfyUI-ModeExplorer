@@ -128,6 +128,8 @@ class ModeExplorer:
             type(dit) is not SingleStreamDiT or dit.patch != 2 or dit.channels != 16
         ):
             raise RuntimeError("ModeExplorer could not verify the native Krea 2 transformer contract.")
+        if type(block) is not int:
+            raise ValueError("ModeExplorer feature block must be an integer index.")
         if block == -1:
             block = len(dit.blocks) // 2
         if not 0 <= block < len(dit.blocks) or type(dit.blocks[block]) is not SingleStreamBlock:

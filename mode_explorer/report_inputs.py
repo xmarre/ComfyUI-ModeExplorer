@@ -87,6 +87,7 @@ def qualified_metadata(data, pin, case, control=None):
     if control is not None:
         for name in PROVENANCE:
             require(data.get(name) == control.get(name), f"provenance_mismatch:{name}")
+        require(routes == control["routes"], "actual_or_forecast_route_provenance_mismatch")
         recipe = {k: v for k, v in settings.items() if k not in SETTINGS_EXCEPTIONS}
         require(recipe == {k: v for k, v in control["settings"].items() if k not in SETTINGS_EXCEPTIONS},
                 "feature_reference_recipe_mismatch")
@@ -117,7 +118,7 @@ def equivalent_signature(folder, data, interrupt):
             for part in iter(lambda: f.read(1024 * 1024), b""):
                 digest.update(part)
         ordered.append((tuple((k, v) for k, v in state.items() if k != "export_id"), digest.hexdigest()))
-    return ordered, data["settings"], data.get("single_stream_blocks"), data.get("solver_terminal")
+    return ordered, tuple(sorted(data["settings"].items())), data.get("single_stream_blocks"), data.get("solver_terminal")
 
 
 def resolve_arm(root, pin, case, control, interrupt):

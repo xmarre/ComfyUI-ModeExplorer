@@ -41,9 +41,16 @@ def _validate_plan(plan):
         require(all(len(box) == 4 and all(type(v) is int for v in box)
                     and 0 <= box[0] < box[2] <= w and 0 <= box[1] < box[3] <= h for box in crops.values()),
                 "invalid_fixed_crop_bounds")
+        visual = spec.get("visual_crops", crops)
+        require(visual.keys() == crops.keys() and all(len(box) == 4 and all(type(v) is int for v in box)
+                and crops[region][0] <= box[0] < box[2] <= crops[region][2]
+                and crops[region][1] <= box[1] < box[3] <= crops[region][3] for region, box in visual.items()),
+                "visual_crop_must_be_inside_registered_region")
         require(len(set(spec.get("intermediate_steps", []))) <= 2, "select_at_most_two_intermediate_steps")
         require(len(set(pin["label"] for pin in arms.values())) == len(arms), "duplicate_arm_labels")
         require(not arms["sham"]["applied"] and "id" in arms["sham"], "sham_must_be_a_pinned_unedited_control")
+        require(spec.get("direction_reference") is None or spec["direction_reference"] in arms,
+                "unknown_direction_reference_arm")
 
 
 def _record_failure(report, arm, check, reason):
@@ -101,8 +108,9 @@ def _check_direction(records, spec, report):
             continue
         source, _, source_meta, _ = records[first]
         params = metadata["settings"]
-        require(params["feature_block"] == source_meta["settings"]["feature_block"],
-                "direction_transform_requires_same_feature_block")
+        if params["feature_block"] != source_meta["settings"]["feature_block"]:
+            _record_failure(report, arm, "initial_direction_transform", "direction_transform_requires_same_feature_block")
+            continue
         mode, trial = params["feature_direction"], params["direction_trial"]
         want = direction_control(source["compact_feature_proposal"], mode, metadata["seed"], trial)
         if not torch.equal(proposal.view(torch.int32), want.view(torch.int32)):
@@ -140,10 +148,16 @@ def analyze_case(name, spec, root, interrupt, vae=None):
                           routes=data["routes"], solver_terminal=data.get("solver_terminal"),
                           performance=_performance(data), single_stream_blocks=data.get("single_stream_blocks"),
                           provenance={k: data.get(k) for k in PROVENANCE})
-        arm_report["checks"]["archive_metadata_and_resolution"] = "verified"
-        arm_report["checks"]["terminal_solver"] = ("runtime_certified_and_manifest_bound" if data.get("solver_terminal")
-                                                  else "unavailable_legacy")
-        arm_report["checks"]["initial_noisy_input"] = "pending_tensor_verification"
+        arm_report["checks"].update(
+            archive_metadata_and_resolution="verified", feature_block_and_settings="verified",
+            intervention_schedule="verified", actual_and_forecast_routes="verified",
+            reference_slots_and_forward_schedule="verified",
+            reference_continuation=("recorded_and_checked" if "reference_history" in data["states"][0]
+                                    else "unavailable_legacy"),
+            planner_and_state_provenance="matched_to_sham" if arm != "sham" else "pinned_control",
+            terminal_solver="runtime_certified_and_manifest_bound" if data.get("solver_terminal") else "unavailable_legacy",
+            initial_noisy_input="pending_tensor_verification",
+        )
 
     if not selected:
         return report, {}
@@ -225,14 +239,19 @@ def analyze_case(name, spec, root, interrupt, vae=None):
             decode_time += perf_counter() - begin
     report["vae_decode_seconds"] = decode_time
     for arm, value in report["arms"].items():
-        if value["qualification"] == "qualified" and report["qualification"] == "qualified":
+        if arm in selected and len(value["states"]) == len(selected[arm][1]["states"]):
             value["checks"]["tensor_states"] = "verified"
+        if value["checks"].get("initial_noisy_input") == "pending_tensor_verification":
+            value["checks"]["initial_noisy_input"] = "unavailable_incomplete_case"
     if report["qualification"] != "qualified":
         for field in ("initial_proposal_groups_by_block", "initial_realized_rms_relative_spread"):
             report.pop(field, None)
         report["evaluations"].clear()
         return report, {}
-    report["terminal_summary"] = {arm: data["clean_delta"] for arm, data in report["evaluations"][-1]["arms"].items() if arm != "sham"}
+    report["terminal_summary"] = {
+        arm: {field: data[field] for field in ("clean_delta", "norm_amplification_from_initial", "cosine_to_initial")}
+        for arm, data in report["evaluations"][-1]["arms"].items() if arm != "sham"
+    }
     return report, intermediate
 
 
@@ -355,7 +374,7 @@ class ModeExplorerResearchReport:
         _validate_plan(plan)
         require(vae is not None or not any(s.get("intermediate_steps") for s in plan["cases"].values()),
                 "selected_intermediates_require_connected_production_vae")
-        report = {"schema": SCHEMA, "name": plan["name"], "qualification": "qualified", "cases": {},
+        report = {"schema": SCHEMA, "name": plan["name"], "qualification": "qualified", "cases": {}, "analysis_device": "cpu",
                   "report_dit_calls": 0, "configuration": plan}
         intermediate = {}
         LOGGER.info("ModeExplorer report: qualifying %s on CPU", plan["name"])

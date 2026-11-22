@@ -604,7 +604,7 @@ def attention_feature(output, options):
         if trace_edit:
             frame.edit_metrics = pooled_edit_metrics(current, current, pairs, shift, repulsion, frame.batch, areas)
             if settings.ablation_route:
-                frame.objective_after = loss[:frame.batch]
+                frame.objective_after = loss.reshape(-1)
         return output
     result = output.clone()
     view = result[numbers[0]:numbers[1], start:end].unflatten(1, (height, width))
@@ -634,11 +634,12 @@ def attention_feature(output, options):
         after = torch.cat((edited, current[frame.batch:]), dim=0) if frame.reference is not None else edited
         frame.edit_metrics = pooled_edit_metrics(current, after, pairs, shift, repulsion, frame.batch, areas)
         if settings.ablation_route:
-            mean = after.mean(dim=(-1, -2), keepdim=True) if areas is None else (after * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum()
+            mean = (after.mean(dim=(-1, -2), keepdim=True) if areas is None
+                    else (after * areas).sum(dim=(-1, -2), keepdim=True) / areas.sum())
             # Temporal ablations have one live row and one reference. The
             # pair uses the same fallback objective parameters as feature_shift.
             _, _, after_loss = objective((after - mean).flatten(1), pairs, settings.feature, .55, .5, gradient=False)
-            frame.objective_after = after_loss[:frame.batch]
+            frame.objective_after = after_loss.reshape(-1)
     return result
 
 

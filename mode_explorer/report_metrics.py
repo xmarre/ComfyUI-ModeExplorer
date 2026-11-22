@@ -13,31 +13,44 @@ def ratio(numerator, denominator):
 
 
 def norms(tensor):
-    l2 = float(torch.linalg.vector_norm(tensor.reshape(-1)))
+    l2 = math.sqrt(_dot(tensor.reshape(-1), tensor.reshape(-1)))
     return {"l2": l2, "rms": l2 / math.sqrt(tensor.numel())}
+
+
+def _dot(left, right):
+    # FP32 dot kernels can lose precision on million-element responses.
+    # Use double scalar products in bounded strips, with no large FP64 GEMM.
+    return math.fsum(float(torch.dot(a.double(), b.double()))
+                     for a, b in zip(left.split(65536), right.split(65536), strict=True))
+
+
+def _cosine(dot, denom):
+    return min(1.0, max(-1.0, dot / denom)) if denom else None
 
 
 def response_geometry(vectors):
     names = list(vectors)
-    values = torch.stack([v.reshape(-1) for v in vectors.values()])
-    gram = (values @ values.T).double()
-    lengths = gram.diag().clamp_min(0).sqrt().tolist()
-    eig = torch.linalg.eigvalsh(gram).clamp_min(0).flip(0)
+    values = [v.reshape(-1) for v in vectors.values()]
+    gram = [[0.0] * len(values) for _ in values]
+    for i, left in enumerate(values):
+        for j in range(i + 1):
+            gram[i][j] = gram[j][i] = _dot(left, values[j])
+    lengths = [math.sqrt(row[i]) for i, row in enumerate(gram)]
+    eig = torch.linalg.eigvalsh(torch.tensor(gram, dtype=torch.float64)).clamp_min(0).flip(0)
     total = float(eig.sum())
     masses = eig / total if total else eig
     effective = float(torch.exp(-torch.special.xlogy(masses, masses).sum())) if total else 0.0
-    g = gram.tolist()
-    return {"arms": names, "gram": g, "cosine": [[ratio(g[i][j], a * b) for j, b in enumerate(lengths)]
-                                                  for i, a in enumerate(lengths)],
-            "pairwise_l2": [[math.sqrt(max(0.0, g[i][i] + g[j][j] - 2.0 * g[i][j])) for j in range(len(names))]
+    return {"arms": names, "gram": gram, "cosine": [[_cosine(gram[i][j], a * b) for j, b in enumerate(lengths)]
+                                                     for i, a in enumerate(lengths)],
+            "pairwise_l2": [[math.sqrt(max(0.0, gram[i][i] + gram[j][j] - 2.0 * gram[i][j])) for j in range(len(names))]
                             for i in range(len(names))],
             "singular_values_sampled_responses": eig.sqrt().tolist(),
             "entropy_effective_rank_sampled_responses": effective}
 
 
 def cosine(left, right):
-    return ratio(float(torch.dot(left.flatten(), right.flatten())),
-                 float(torch.linalg.vector_norm(left)) * float(torch.linalg.vector_norm(right)))
+    a, b = left.flatten(), right.flatten()
+    return _cosine(_dot(a, b), math.sqrt(_dot(a, a) * _dot(b, b)))
 
 
 def _scalar(value):

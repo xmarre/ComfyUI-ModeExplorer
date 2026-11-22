@@ -11,6 +11,9 @@ from .trajectory_review import _pixel_hash
 def prompt_signature(prompt):
     copy = json.loads(json.dumps(prompt))
     for node in copy.values():
+        # Frontend titles and registry annotations change on workflow import.
+        # The executable class, input values and connections carry provenance.
+        node.pop("_meta", None)
         inputs = node["inputs"]
         if node["class_type"] == "ModeExplorerKrea2":
             for opt in ("feature_block", "trajectory_label"):
@@ -128,7 +131,7 @@ def make_visuals(cases, plan, output, interrupt):
         # Preserve exact crop pixels. The JPEG previews alone are resized.
         for arm in ordered:
             interrupt()
-            for region, box in spec["crops"].items():
+            for region, box in spec.get("visual_crops", spec["crops"]).items():
                 basename = f"visual/{case_name}/crops/{region}/{names[arm]}.{extension}"
                 files[basename] = encode(images[arm].crop(box), codec, **lossless)
         panels[case_name] = [(names[arm], preview(images[arm], 560)) for arm in ordered]

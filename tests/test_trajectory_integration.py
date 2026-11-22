@@ -297,6 +297,13 @@ def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model
         assert [s["reference_history"] for s in m["states"][:2]] == [
             s["reference_history"] for s in results[0][1]["states"][:2]]
     assert torch.equal(results[0][2][0]["compact_feature_proposal"], results[-1][2][0]["compact_feature_proposal"])
+    first, second = results[1][1]["states"][:2]
+    assert first["feature_geometry"]["block"] == 1
+    assert first["feature_geometry"]["proposal_shape"] == list(results[1][2][0]["compact_feature_proposal"].shape)
+    assert 0 <= first["realization_error_rms"][0] < first["realized_shift_rms"][0]
+    assert first["objective_after"][0] < first["objective"]
+    assert second["realization_error_rms"] is None
+    assert second["objective_after"][0] == second["objective"]
     assert torch.equal(results[0][2][1]["solver_input"], results[2][2][1]["solver_input"])
     assert not torch.equal(results[0][2][1]["solver_input"], results[1][2][1]["solver_input"])
     assert not torch.equal(results[0][0], results[1][0])
