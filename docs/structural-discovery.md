@@ -1,0 +1,75 @@
+# Planner structural discovery
+
+The active research phase uses native inference to [decode intermediate predictions and isolate temporal application](phase-iv-structural-causality.md). The frozen activation-coding factorial below is retained as an archived diagnostic.
+
+Two discovery outcomes have separate acceptance criteria. For anatomy, track the visibility, connection and orientation of the same limb or joint and record defects introduced elsewhere. For detail, track structure at comparable object scale and position. Use full-resolution crops of the same hair region, seam or fold, plant or mushroom structure, and surface texture. Score coherent structure, loss of structure, sharpening, noise, and duplication separately. Use ties and unjudgeable regions. Independently confirm the outcomes on an untouched, unselected split after the discovery controls have reproduced them.
+
+This campaign uses the original production checkpoint and planner settings. Conditioning contrast remains available in the Mechanistic node. The reproduction workflows use native, native repeat, sham and the original feature intervention. Native repeat establishes a numerical floor. Sham computes the proposal and incurs reference forwards with zero applied field. It can still exercise different Spectrum decisions from an unpatched run. Hold the resolved conditioning, seed, model, attention backend, adapters, solver and VAE constant. Compare guarded Spectrum routes before interpreting any differences. The companion Scale-Locked planner-only mode produces the same planner and zero target-resolution evaluations.
+
+When preparing archived discovery workflows, synchronize `widgets_values` and `widgets_values_named` for every edited node. Frontends that restore by widget name can otherwise silently select different settings. Remove obsolete embedded workflow snapshots and seed-widget maps that refer to removed nodes. The structural workflow validator rejects conflicts before the pack is distributed. Import corrected graphs as distinct workflows; verify the ModeExplorer trajectory label and the Scale-Locked `planner_final_upscale_only` setting before queueing.
+
+## Trajectory capture and comparison
+
+Set `trajectory_label` on the ModeExplorer node. An empty label disables capture. For the native arm, leave the node enabled with `feature=native` and initialization off. Use distinct labels for the repeat and treatment arms so that ComfyUI evaluates them separately. Capture takes place in the planner and standalone sampler stages, downstream of the actual positive-row dispatch. The observer preserves the existing solver and Spectrum forecast policy. Forecasts appear in the route ledger and produce no actual-state tensors. For a 13-step ER-SDE run with forecasts, there may be fewer than 13 states.
+
+The observer performs zero auxiliary transformer forwards. Existing feature guidance retains its ordinary reference cost. Each state contains the noisy transformer input and conditional velocity in native flow coordinates, and the clean prediction converted through `process_latent_out` for the same VAE. On an active arm, the velocity includes the feature edit. Captures retain only FP32 CPU latent tensors, capped at 512 MiB per invocation and 32 states. For a 1632×2464 planner, one state uses about 11.5 MiB and 13 states use about 150 MiB. Two small compact proposal fields add roughly 0.75 MiB to typical guided runs. Transfers occur during capture and serialization occurs after denoising. The manifest records capture and serialization time. It also records exact sigma, actual ordinal, solver step, native or forecast route, available patch-coupled ER-SDE noise cursor, model coordinates, hashes of conditioning and inputs, the proposed compact shift and the realized edit after rounding.
+
+The cell Gram matrix and neighbor cosines describe pooled pre-gate attention at the feature block. For targeted local comparisons, set `trajectory_roi` to `y0,y1,x0,x1` in patch-grid coordinates with exclusive upper bounds. Up to 64 unpooled tokens are sampled at that same site. The observer records the centered, channel-normalized token Gram spectrum, its entropy effective rank, and horizontal and vertical neighbor cosines. The measurements describe one registered region and one site. Attention routing and cross-depth attribution require a separate targeted measurement.
+
+Each invocation writes its own folder under `output/modeexplorer_trajectory`. Use the per-state ID with the existing Load Response node. The `tools.trajectory_report` utility builds a decoder-only graph using the original VAE filename and compares saved runs offline.
+
+```text
+python -m tools.trajectory_report decode --vae ORIGINAL_VAE.safetensors --output Decode.json NATIVE/manifest.json ACTIVE/manifest.json
+python -m tools.trajectory_report compare NATIVE/manifest.json ACTIVE/manifest.json Comparison.json
+```
+
+An optional `--roi NAME Y0 Y1 X0 X1` adds band measurements for a visually registered shared region in the latent grid. Run the same comparison for native versus native repeat first. The report pairs exact sigma, solver step and denoiser opportunity and shows missing pairs and route disagreement. A visually aligned crop can still have a different latent coordinate if the object moved. Quantify composition and object scale before making a shared-grid comparison. Use the exported VAE clean tensors for decoding and compare visually at their native resolution. Each band reports baseline energy, displacement energy, cross-term, and net energy change. High-frequency displacement can represent sharper coherent structure, a position change, an artifact or noise. Establish those distinctions in the crops.
+
+Float32 snapshots, seed and solver provenance support reproduction from the start. The observer does not serialize restart state for ER-SDE or Spectrum. Compare divergent trajectories descriptively. Use the frozen test for a matched-state causal estimate.
+
+## Frozen activation factorial
+
+After reproduction, start with actual evaluation 0 (σ = 0.9999683499336243). Use the actual evaluation 1 (σ = 0.9743000268936157) graphs as a second frozen-state comparison. Confirm that each selected sigma is present in both the native and active trajectory exports. Set `frozen_state` to the native state ID and `factorial_feature_source` to the matching active state ID. Set `evaluation` to the native actual ordinal and pin the first eligible feature sigma. Select `projection_study=activation_factorial`, `projection_activation_check=true`, `component=observe`, `treatment=export_only`, and enable export. CFG 1 with only the native positive row is required.
+
+The active source matches seed, conditioning, backend, sigma and reference start, supplies the exact replay settings, and must have applied an edit at the selected state. The trace reports those settings and the archival and reconstructed proposal match. If the frozen and active noisy inputs are identical, the proposal must match bit for bit. A later active state may have a different input. Its settings and reference slots are validated and its proposal is recomputed on the frozen native input. Leaving the active source empty uses the explicit replay defaults recorded in the trace.
+
+At each evaluation, run the injection-site `attn.wo` target first with `projection_block=-1`, alongside the historical block-5 comparison. After those checks, `projection_layers=downstream` inventories native linears in the generated-token stream after the injection. It selects supported tensorwise INT8 operators, including the injection block's output projection and MLP, later attention and MLP linears, and the final projection if INT8. Explicit subsets use names such as `b1.attn.wo,b2.mlp.down`. Set `projection_block=-1` when selecting layers. The inventory shows dense and other formats, including operators outside the selected set.
+
+| Arm | Feature edit | Target projection |
+| --- | --- | --- |
+| A | Off | Native packed INT8 |
+| B | Original proposal at the configured feature block | Native packed INT8 |
+| C | Off | Continuous activations on generated-image tokens |
+| D | Same proposal as B | Continuous activations on generated-image tokens |
+
+All four arms share the exact same frozen noisy input. The baseline must reproduce the archived native velocity bit for bit. Both packed projection replays and the selected Kitchen quantizer and epilogue emulation must reproduce native output bit for bit across all packed tokens for both native arms. The report records Kitchen version, candidate GEMM route and reproduced quantizer route. A GEMM candidate records the audited dispatch contract and possible fallback, without instrumenting the native kernel launch. CUDA requires the audited quantizer contract in Kitchen 0.2.40 or 0.2.41. A CPU eager run can test the implementation.
+
+The replacement keeps the stored weight codes, weight scales, native activation rotation, measured per-row scales, output dtype, and qualified epilogue. It evaluates continuous codes with a chunked FP64 matrix product and writes the qualified native output dtype. It removes activation coding on generated-image tokens in each selected projection. Text and reference rows retain the native result for that layer's actual input. The result propagates through the remainder of the same transformer. In the layer-set arm, inputs at later layers already include earlier replacements. Each layer qualifies the native replay and emulation on both arms' actual packed inputs, and its operator, weights, geometry, route and epilogue must agree across the arms. The layer-set mode holds one layer workspace at a time and does two extra local operator replays per selected layer. Runtime can grow substantially even though the DiT forward count is unchanged. The timings distinguish native forwards and the two inclusive replacement forwards from their local replay, operand verification and continuous-matmul timings. Reconstructed affine references and genuine original unquantized checkpoint weights are separate execution conditions. The factorial uses the stored INT8 checkpoint in every arm and does not require a BF16 checkpoint.
+
+The exported arms are `baseline_clean`, `D01_clean`, `continuous_native_clean`, and `continuous_feature_clean`. One reference, two native arms and two replacement arms require five auxiliary transformer forwards at the first actual evaluation. A later state may need a second reference forward to reconstruct the first estimate, for a total of six. The downstream templates set the CUDA capture budget to 16 GiB. At 15,708 image tokens plus 512 packed tokens and a 6,144 × 16,384 INT8 MLP, the estimator reserves about 12.6 GiB for the widest local replay before other capture costs. The CUDA preflight still checks the observed dimensions and free device headroom. The estimate is independent of measured peak VRAM. The main planner always receives its original prediction. A failed qualification produces no C or D export. Check `mechanistic.projection.status`, `activation_counterfactual`, the per-arm packed replay, the recorded dispatch, the timings and `factorial.production_cuda` before interpreting C or D. This gated experiment qualifies an isolated downstream prediction. Live solver continuation requires additional production evidence.
+
+For the declared sites and frozen state, estimate the feature effect under each precision condition and the interaction `(D − C) − (B − A)`. Compare C versus A and D versus B visually and account for the repeatability floor. A visible C-versus-A correction at this state supports a local precision contribution. A comparable feature effect under both routes weakens a necessity claim only for the covered operators, generated rows, and frozen input. Upstream quantization, other weight formats, text and reference activation coding, and solver effects are separate variables. Run a declared layer-set intervention before reasoning about post-injection INT8 coding as a group. A large spectral interaction with no visible improvement supports numerical sensitivity without establishing a beneficial mechanism.
+
+## Interpretation and deferred controls
+
+| Hypothesis | Discriminating evidence |
+| --- | --- |
+| Early structural redirection | A matched-state edit changes early geometry and a correctly coupled continuation retains the change. |
+| Later loss or corruption | The native clean sequence contains an earlier acceptable structure and loses it while the active sequence retains it. |
+| Quantization effects | The qualified four-arm test changes the relevant visual outcome at equal noisy input, proposal and effective stored weights. |
+| Generic trajectory sensitivity | Multiple magnitude-matched directions give differing visual outcomes without consistent direction-specific improvement. |
+| Solver or Spectrum coupling | The effect tracks changed solver increments, actual versus forecast routes, or qualified solver continuation. |
+| Composition or selection | The apparent gain shrinks in scale-registered crops or fails a blinded independent confirmation split. |
+
+First localize the visual change. Then test direction specificity with the sign-reversed proposal, multiple matched controls, and the measured native versus continuous precision correction, using realized edit magnitude and output displacement as separate measurements. A production-qualified live continuation must preserve solver noise increments, solver memory and Spectrum state. Restarting from a frozen latent plus a new schedule cannot establish that coupling.
+
+### Research context
+
+| Supplied work | Relevance and limit |
+| --- | --- |
+| [DiverseFlow](https://arxiv.org/abs/2504.07894) | Couples flow samples at inference through a determinantal point process. The training-free method targets sample-efficient diversity under a fixed sampling budget. |
+| [It’s Never Too Late](https://arxiv.org/abs/2601.00090) | Optimizes noise in groups of samples during inference, including late recovery. It motivates testing when a trajectory retains the capacity to change without attributing an anatomical defect to mode collapse. |
+| [Initialization is Half the Battle](https://arxiv.org/abs/2606.02453) | Samples noise using a guidance-potential posterior. It motivates a distinct initialization study with equal compute and multiple seeds. |
+| [Beyond Pairwise Repulsion](https://arxiv.org/abs/2610.22267) | Uses determinant maximization to account for collective diversity. It motivates group-level coverage metrics when comparing seeds. |
+| [Don’t Settle at the Mode!](https://arxiv.org/abs/2606.27371) | Uses inter-sample feature repulsion for flow diversity. This motivates the existing coarse feature intervention. Within-image structure and quality require their own controls. |
+| [Posterior Matching Distillation](https://arxiv.org/abs/2611.26629) | Matches a denoising posterior in student training and discusses expressive conditional outputs. The posterior identities do not identify why a particular Krea 2 output has an anatomical defect. |
