@@ -1,0 +1,41 @@
+{
+  "protocol": 1,
+  "source": "projection_guidance_prompts.json screening subset; exploratory direction qualification, not confirmation",
+  "actual_evaluation": 2,
+  "states": 1,
+  "candidate_target_rms": 0.02,
+  "clean_limit": 0.04,
+  "candidate_gain": 1,
+  "repeat_baseline": true,
+  "auxiliary_budget": 2,
+  "arms": [
+    "observe",
+    "contrast",
+    "contrast_reverse",
+    "contrast_spatial"
+  ],
+  "cases": [
+    {
+      "id": "anatomy",
+      "seed": 439821507,
+      "prompt": "A full-body documentary photograph of a bicycle courier kneeling to thread a chain through the rear derailleur at a curb. Show both shoes, one hand on the pedal and the other guiding the chain, rain-dark pavement, candid posture.",
+      "alternate": "A documentary photograph of a bicycle courier kneeling to thread a chain through the rear derailleur at a curb. One hand on the pedal and the other guiding the chain, rain-dark pavement, candid posture.",
+      "primary_endpoint": "Both shoes and the full body visible; retain hand-object contact and mechanically plausible bicycle parts."
+    },
+    {
+      "id": "texture",
+      "seed": 547901121,
+      "prompt": "Macro product photograph of a scratched brass compass half-open on coarse indigo linen next to a fractured white shell. Distinguish the directional weave, shallow metal scratches and the shell's layered edge, subdued afternoon light.",
+      "alternate": "Macro product photograph of a scratched brass compass half-open on coarse indigo linen next to a fractured white shell. Subdued afternoon light.",
+      "primary_endpoint": "Distinct directional linen weave, metal scratches and shell layers; no spurious detail or oversharpening."
+    },
+    {
+      "id": "layout",
+      "seed": 813656705,
+      "prompt": "A documentary photograph of a red kettle on the left end of a black workbench, a clear jar of screws directly behind the kettle, and a folded blue cloth on the far right. In a mirror above the bench the same objects appear in a consistent reflection.",
+      "alternate": "A documentary photograph of a red kettle on the left end of a black workbench, a clear jar of screws directly behind the kettle, and a folded blue cloth on the far right. A mirror hangs above the bench.",
+      "primary_endpoint": "Mirror reflection contains the same objects in geometrically consistent locations; retain the primary object arrangement."
+    }
+  ],
+  "qualification": "Require identical input and conditioning fingerprints, repeat floor below half the realized edit RMS, and matched native-rounded target RMS within 10%. A declined intervention is a decline, not a successful control. Score candidate previews and final outputs separately, without arm metadata, against the predeclared primary endpoint and fidelity/regression criteria."
+}
