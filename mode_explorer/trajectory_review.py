@@ -87,8 +87,14 @@ def qualify_runs(runs, temporal):
         if data.get("status") != "completed" or any(data.get(key) != first.get(key) for key in CONTROL_KEYS):
             raise ValueError(f"{arm}: incomplete trajectory or different planner provenance.")
         terminal = data.get("solver_terminal")
-        if terminal is not None and terminal.get("status") != "bit_exact":
-            raise ValueError(f"{arm}: the archive records an unqualified solver terminal ({terminal.get('status')}).")
+        if terminal is not None:
+            last_state = data["states"][-1] if data["states"] else {}
+            if (terminal.get("status") != "bit_exact"
+                    or terminal.get("solver_step") != len(data["schedule"]) - 2
+                    or terminal.get("solver_step") != last_state.get("solver_step")
+                    or not terminal.get("solver_clean_sha256")
+                    or terminal["solver_clean_sha256"] != last_state.get("solver_clean_sha256")):
+                raise ValueError(f"{arm}: the archive records an unqualified solver terminal ({terminal.get('status')}).")
         expected = {"native": [], "native_repeat": [], "sham": [], "first_only": [0],
                     "second_only": [1], "active": [0, 1]}[arm]
         if [state["ordinal"] for state in data["states"] if state["feature_applied"]] != expected:
