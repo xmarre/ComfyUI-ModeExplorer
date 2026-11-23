@@ -214,3 +214,31 @@ The compact reports certify checks from their original raw tensors; they do not 
 - Remaining uncertainty: generalization, direction selection, strength calibration, CUDA throughput/VRAM and reliable assessment of structural quality under complex production conditioning.
 
 The reviewed production implementation passed exact-head CPU validation (248 passed, 14 skipped) and pinned companion validation (282 passed, 5 skipped) in [run 45085113146](https://github.com/xmarre/ComfyUI-ModeExplorer/actions/runs/45085113146). This is engineering evidence at the cited head, not full-checkpoint CUDA or image-quality validation.
+
+## 8. Post-campaign production observation: high-strength block 0 (2026-11-23)
+
+This observation was collected during ordinary use, not as a new controlled quality study. The operator reported a complex, difficult scene in which the unpatched generation already had coherent anatomy. Several low-strength production modes produced different, visually conflicting body arrangements; block 0 preserved the originally coherent configuration but initially seemed to reduce background detail. Increasing the edit strength at block 0 through 0.15, 0.30, 0.50, 0.75 and 1.00 reportedly produced substantially more varied body/object interactions and facial expressions while retaining coherent anatomy and recovering environmental detail in the reviewed outputs. Higher-strength block 2 reportedly retained more of the original composition; block 5 continued to exhibit a conflicting anatomical configuration. These are **operator visual observations**, not independently inspected or blind-scored images. The earlier impression of slightly enhanced detail from block 2 and Middle Refinement also remains a case-specific subjective observation.
+
+The two available diagnostic traces cover block 0 at strengths 0.75 and 1.00. Each used the same seed, resolved conditioning, initial noise, sigma schedule, reference slot and native single-stream block. The trace does not itself serialize the strength widget; strength identification follows the operator's run order and the near-exact 4:3 ratio of realized edits.
+
+| Metric | Strength 0.75 | Strength 1.00 |
+| --- | ---: | ---: |
+| Initial sigma | 0.999968350 | 0.999968350 |
+| Initial reference cosine | 0.491066158 | 0.491066158 |
+| Initial objective | 0.982132316 | 0.982132316 |
+| Initial proposal RMS | 0.759044647 | 1.012059450 |
+| Applied pooled edit RMS | 0.759042382 | 1.012063980 |
+| Applied pooled relative RMS | 0.229006797 | 0.305344641 |
+| Reference cosine after edit | -0.756117702 | -0.787354290 |
+| Second proposal computed | Yes | Yes |
+| Second proposal applied | No | No |
+| Planner live/reference/forecast forwards | 10 / 2 / 3 | 10 / 2 / 3 |
+| Planner trace time (s) | 19.444983 | 19.578846 |
+
+Both used the same `AAAAAAFAFAFAA` route, first-only feature application, grid 4, positive reference slot 7, and one native-rounded edit at the first positive actual evaluation. The stage-tagged high-resolution pass then used two actual evaluations without an additional ModeExplorer edit. Their original planner attention representation before the first edit matched in the recorded summaries. At the second proposal (not applied), the reference cosine had already diverged (0.506958 vs. 0.467242), consistent with a changed downstream state. Conditional-clean summaries after the first applied edit differed.
+
+The increase from 0.75 to 1.00 scaled realized edit RMS by 1.3333× (up 33.33%) and pooled relative RMS from 22.90% to 30.53%. The cosine after the intervention was strongly negative in both configurations. This is a substantially more aggressive operating regime than the earlier 0.03–0.05 discovery settings. The bounded objective has no image-quality guarantee; a larger negative reference cosine does not imply greater perceptual quality.
+
+Interpretation: the depth-0 intervention can act as a deterministic composition/structure variation control at a fixed seed and prompt. It does not introduce new stochastic noise. Multiple distinct outcomes when **changing strength** do not prove improved **between-seed** diversity at a fixed strength. The observation suggests that feature repulsion can redirect structure both toward and away from coherent arrangements, depending on the native state and selected intervention. No evidence establishes a targeted anatomical-correction objective, universal high-strength safety or guaranteed identity/conditioning retention. The reported recovery of detail and anatomical coherence cannot be independently established without the images.
+
+The original 99-line diagnostic capture is retained privately under the evidence library, identified by SHA-256 `4961fc97a90b2077bd7e2d2a9ac6067649ae6984dd478d88c43b169625359f57`. It contains both ModeExplorer traces, Spectrum route summaries, Scale-Locked high-resolution handoff telemetry and production warnings. Private conditioning, images and local output paths are intentionally not reproduced here.
