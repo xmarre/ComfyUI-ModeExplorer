@@ -1,5 +1,7 @@
 # ComfyUI-ModeExplorer
 
+Completed measurements, negative results, reproducibility evidence and the production decision are recorded in [Completed structural-discovery findings](docs/structural-findings.md).
+
 Selectable early-flow feature guidance for native Krea 2 Raw and Turbo. The node takes and returns a standard ComfyUI MODEL. Use the mode dropdown to compare intervention depths in your normal sampling graph. The image-quality effect depends on the prompt, checkpoint, weight patches, seed and sampler.
 
 ## Setup

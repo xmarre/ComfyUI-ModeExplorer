@@ -1,6 +1,6 @@
 # Planner structural discovery
 
-The active research phase uses native inference to [decode intermediate predictions and isolate temporal application](phase-iv-structural-causality.md). The frozen activation-coding factorial below is retained as an archived diagnostic.
+The completed research campaign used native inference to [decode intermediate predictions and isolate temporal application](phase-iv-structural-causality.md). See [completed findings](structural-findings.md). The frozen activation-coding factorial below is retained as an archived diagnostic.
 
 Two discovery outcomes have separate acceptance criteria. For anatomy, track the visibility, connection and orientation of the same limb or joint and record defects introduced elsewhere. For detail, track structure at comparable object scale and position. Use full-resolution crops of the same hair region, seam or fold, plant or mushroom structure, and surface texture. Score coherent structure, loss of structure, sharpening, noise, and duplication separately. Use ties and unjudgeable regions. Independently confirm the outcomes on an untouched, unselected split after the discovery controls have reproduced them.
 

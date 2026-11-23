@@ -1,5 +1,7 @@
 # Phase IV structural causality
 
+**Status:** This is the historical experimental protocol. The discovery campaign is closed; see [completed findings and evidence inventory](structural-findings.md) for the results and remaining limitations.
+
 The objective is to identify when ModeExplorer changes anatomical coherence and meaningful detail, whether the original direction supplies information beyond a magnitude-matched perturbation, and how the native Krea 2 trajectory propagates the change. Work proceeds from intermediate decoding to temporal ablation, then to gated direction, depth and held-out tests. Existing activation-coding diagnostics and measurements remain archived. Use the same native INT8 ConvRot model, production attention route, VAE, conditioning, seed, ER-SDE schedule, planner geometry and guarded Spectrum settings for matched runs.
 
 ## Coordinate audit and review
