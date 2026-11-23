@@ -1,0 +1,188 @@
+name: Validation
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: c8abeb00ad2736b649ca2fceb8395e25072c7ea3
+          path: .comfyui
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r .comfyui/requirements.txt pytest
+      - name: Test native Krea 2 integration
+        env:
+          PYTHONPATH: "${{ github.workspace }}/.comfyui:${{ github.workspace }}"
+        run: python -m pytest -q tests
+  spectrum-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: 7ad7adb38f6cbb6c2b0713d3bd44c3fb2b9c8ebe
+          path: .comfyui
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-Spectrum-Krea2
+          ref: d2a16c717dae594f9ba79ed78a629308b5357e4f
+          path: .spectrum
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-Sol-H3
+          ref: 32a356f3a0ae62a5cf3eec82c010f48f5e93391a
+          path: .sol
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-ScaleLockedResidualDiffusion
+          ref: 129484bd676be55e3af0f2ea7fa6ae60e4a4ec5b
+          path: .scale-locked
+      - uses: actions/checkout@v6
+        with:
+          repository: xmarre/ComfyUI-KJNodes
+          ref: ef7156d3590dc6cdcc9a13799c9f2a025612f03c
+          path: .kjnodes
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r .comfyui/requirements.txt pytest
+      - name: Validate native sampling, companion state isolation and workflow schemas
+        env:
+          PYTHONPATH: "${{ github.workspace }}/.comfyui:${{ github.workspace }}/.spectrum:${{ github.workspace }}/.sol:${{ github.workspace }}"
+          MODEEXPLORER_SCALE_LOCKED: "${{ github.workspace }}/.scale-locked"
+          MODEEXPLORER_KJNODES: "${{ github.workspace }}/.kjnodes"
+        run: python -m pytest -q tests
+  github-release:
+    needs: [cpu, spectrum-native]
+    if: github.repository == 'xmarre/ComfyUI-ModeExplorer' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: modeexplorer-github-release
+      cancel-in-progress: false
+    outputs:
+      current: ${{ steps.release.outputs.current }}
+      version: ${{ steps.release.outputs.version }}
+      node: ${{ steps.release.outputs.node }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Publish version-pinned custom-node release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          node="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["name"])')"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "node=${node}" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            source_sha="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
+            if [ "$source_sha" != "$GITHUB_SHA" ]; then
+              echo "Version $version was already released from $source_sha; leave its assets unchanged."
+              echo "current=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            if git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null; then
+              echo "::error::Tag $tag already exists without a release; inspect before publishing."
+              exit 1
+            fi
+            notes="docs/releases/${tag}.md"
+            test -s "$notes"
+            mkdir -p dist
+            archive="dist/ComfyUI-ModeExplorer-${tag}.zip"
+            git archive --format=zip --prefix="ComfyUI-ModeExplorer/" "$GITHUB_SHA" > "$archive"
+            unzip -tq "$archive"
+            unzip -l "$archive" | grep -F "ComfyUI-ModeExplorer/__init__.py"
+            (cd dist && sha256sum "ComfyUI-ModeExplorer-${tag}.zip" > "ComfyUI-ModeExplorer-${tag}.zip.sha256")
+            gh release create "$tag" "$archive" "$archive.sha256" --target "$GITHUB_SHA" --title "ComfyUI-ModeExplorer $tag" --notes-file "$notes" --latest
+          fi
+          test "$(gh release view "$tag" --json isDraft --jq '.isDraft')" = false
+          test "$(gh release view "$tag" --json isPrerelease --jq '.isPrerelease')" = false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')" = "$GITHUB_SHA"
+          gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fx "ComfyUI-ModeExplorer-${tag}.zip"
+          gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fx "ComfyUI-ModeExplorer-${tag}.zip.sha256"
+          echo "current=true" >> "$GITHUB_OUTPUT"
+  registry-release:
+    needs: github-release
+    if: needs.github-release.outputs.current == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: modeexplorer-registry-release
+      cancel-in-progress: false
+    steps:
+      - name: Check published registry version
+        id: registry
+        env:
+          NODE: ${{ needs.github-release.outputs.node }}
+          VERSION: ${{ needs.github-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS --retry 3 -o registry.json -w '%{http_code}' "https://api.comfy.org/nodes/$NODE/versions/$VERSION")"
+          case "$code" in
+            200)
+              test "$(jq -r .version registry.json)" = "$VERSION"
+              curl -fsS --retry 3 "https://api.comfy.org/nodes/$NODE" | jq -e --arg repo "https://github.com/$GITHUB_REPOSITORY" '.repository | ascii_downcase == ($repo | ascii_downcase)' >/dev/null
+              echo "Registry version $VERSION already exists; status: $(jq -r .status registry.json)"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Registry version lookup returned HTTP $code"; exit 1 ;;
+          esac
+      - name: Check registry credential
+        if: steps.registry.outputs.exists == 'false'
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$REGISTRY_ACCESS_TOKEN" ]; then
+            echo "::error::REGISTRY_ACCESS_TOKEN is missing."
+            exit 1
+          fi
+      - name: Publish Custom Node
+        if: steps.registry.outputs.exists == 'false'
+        uses: Comfy-Org/publish-node-action@v1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+      - name: Verify registry version
+        env:
+          NODE: ${{ needs.github-release.outputs.node }}
+          VERSION: ${{ needs.github-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsS "https://api.comfy.org/nodes/$NODE/versions/$VERSION" -o registry.json && jq -e --arg v "$VERSION" '.version == $v' registry.json >/dev/null; then
+              echo "Registry version $VERSION exists; status: $(jq -r .status registry.json)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Published version not visible in the Registry API."
+          exit 1
