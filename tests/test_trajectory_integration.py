@@ -383,6 +383,20 @@ def test_temporal_ablation_matches_guarded_spectrum_and_reference_schedule(model
     with pytest.raises(ValueError, match="unqualified solver terminal"):
         ModeExplorerTrajectoryReview().review(FixtureVAE(), json.dumps(plan))
 
+    # A bit_exact flag is insufficient if its certificate points to a stale
+    # terminal tensor or a different solver step.
+    data["solver_terminal"]["status"] = "bit_exact"
+    data["solver_terminal"]["solver_clean_sha256"] = "0" * 64
+    terminal.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="unqualified solver terminal"):
+        ModeExplorerTrajectoryReview().review(FixtureVAE(), json.dumps(plan))
+
+    data["solver_terminal"]["solver_clean_sha256"] = data["states"][-1]["solver_clean_sha256"]
+    data["solver_terminal"]["solver_step"] = -1
+    terminal.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="unqualified solver terminal"):
+        ModeExplorerTrajectoryReview().review(FixtureVAE(), json.dumps(plan))
+
     wrong, = ModeExplorer().apply(model, **common, feature_application="first_only", ablation_route="A" * len(route))
     with pytest.raises(RuntimeError, match="ablation_route_mismatch"):
         draw(spectrum(wrong), **options)
