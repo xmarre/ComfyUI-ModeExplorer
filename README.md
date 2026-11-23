@@ -6,7 +6,9 @@ Selectable early-flow feature guidance for native Krea 2 Raw and Turbo. The node
 
 ## Setup
 
-1. Apply the ModeExplorer PR overlay in ComfyUI Patcher and restart ComfyUI. Apply the [Spectrum ModeExplorer overlay](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/pull/6) if using guarded forecasting.
+Requires Python 3.10+ and a ComfyUI installation with native Krea 2 support. No additional runtime packages are required beyond ComfyUI's dependencies.
+
+1. Install or update `ComfyUI-ModeExplorer` through ComfyUI Manager (registry ID `comfyui-modeexplorer`) or ComfyUI Patcher using [this repository](https://github.com/xmarre/ComfyUI-ModeExplorer). A versioned custom-node ZIP is also available from [GitHub Releases](https://github.com/xmarre/ComfyUI-ModeExplorer/releases). Restart ComfyUI. No ModeExplorer PR overlay is required. For guarded forecasting, install Spectrum Krea 2 separately with its [ModeExplorer compatibility overlay (PR #6)](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/pull/6) until that interoperability change is released.
 2. Load native Krea 2 weights, a Qwen3-VL-4B encoder in Krea 2 mode, and the matching Qwen Image VAE. Apply weight LoRAs upstream.
 3. Connect **MODEL → ModeExplorer → optional Sol-Krea2 → optional Spectrum → sampler**. Place a native/guided switch upstream of Spectrum so each arm shares the same settings. For an opt-in response measurement, place ModeExplorer Response before Sol and Spectrum.
 4. Load an [example workflow](examples/README.md). Match the prompt, model, seed, conditioning and sigma schedule during comparisons.
