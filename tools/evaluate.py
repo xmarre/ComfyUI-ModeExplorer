@@ -202,6 +202,20 @@ def graph(args, method, prompt, seed, *, name):
     return g
 
 
+PLACEHOLDERS = {"$teacher": "teacher_model", "$adapter": "rediverse_adapter"}
+
+
+def resolve_placeholders(args, value):
+    """A profile with $teacher and $adapter replaced by the files of this run, for records and identity hashes."""
+    if isinstance(value, dict):
+        return {key: resolve_placeholders(args, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_placeholders(args, item) for item in value]
+    if isinstance(value, str) and value in PLACEHOLDERS:
+        return getattr(args, PLACEHOLDERS[value], None)
+    return value
+
+
 def sampler_config(workflow):
     """Effective sampling configuration of a graph from ``graph``, for KSampler and SamplerCustom."""
     node = workflow["8"]
@@ -451,7 +465,7 @@ def main():
                     )
                     # The resolved arm configuration, so arms that differ only in temporal profile or
                     # start position never share an identity.
-                    arm = args.variants.get(method, {"method": method})
+                    arm = resolve_placeholders(args, args.variants.get(method, {"method": method}))
                     result.update(profile=arm, profile_sha256=hashlib.sha256(
                         json.dumps(arm, sort_keys=True).encode()).hexdigest()[:16])
                     if args.planner_megapixels is not None:

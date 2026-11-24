@@ -941,8 +941,11 @@ def test_auxiliary_forwards_inherit_their_evaluation_strength(caplog, model, wor
 def test_split_cfg_and_multistage_solvers_share_slots_per_sigma(caplog, model, workspace):
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     draw(rediverse(model, adapted_sigmas=2, diagnostics=True), cfg=2.0, split_cfg=True)
-    slots = summaries(caplog)[-1]["temporal"]["slots"]
+    temporal = summaries(caplog)[-1]["temporal"]
+    slots = temporal["slots"]
     assert [(s["evaluation"], s["calls"], s["live_forwards"]) for s in slots] == [(0, 2, 2), (1, 2, 2)]
+    # Two active slots, four admitted calls behind them.
+    assert temporal["adapter_active_evaluations"] == 2 and temporal["adapter_active_calls"] == 4
     caplog.clear()
     # Heun: the corrector at sigma 1 and the next predictor at the same sigma share slot 1.
     draw(rediverse(model, adapted_sigmas=2, diagnostics=True), sampler="heun")

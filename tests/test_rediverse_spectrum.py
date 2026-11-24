@@ -151,3 +151,23 @@ def test_scale_locked_temporal_window_stays_in_the_planner(caplog, model, worksp
     if start + count > len(temporal["evaluation_sigmas"]):
         assert "temporal_window_truncated" in found[0]["rediverse"]["reasons"]
     assert CURRENT.get() is None
+
+
+def test_delayed_window_with_sa_pece_runs_every_slot_actual(caplog, model, workspace):
+    """SA-PECE corrections re-evaluate the same sigma; they share the slot and never shift the window."""
+    caplog.set_level(logging.INFO)
+    draw(spectrum(rediverse(model, adapted_sigmas=3, start_evaluation=2, diagnostics=True), warmup=1),
+         sigmas=torch.linspace(1.0, 0.0, 13), sampler="sa_solver_pece")
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    temporal = traces(caplog)[-1]["rediverse"]["temporal"]
+    slots = temporal["slots"]
+    assert [s["evaluation"] for s in slots] == [2, 3, 4]
+    # Predictor and its same-sigma PECE correction share one slot; both ran the model.
+    assert all(s["calls"] == s["live_forwards"] == 2 for s in slots)
+    assert temporal["adapter_active_evaluations"] == 3 and temporal["adapter_active_calls"] == 6
+    assert len(set(temporal["evaluation_sigmas"])) == len(temporal["evaluation_sigmas"])
+    routes = [(d["step"], d["route"]) for d in report["denoiser_decisions"] if d["route"] != "forecast_rejected"]
+    assert report["fallback"] is None and report["forecast"] > 0, report
+    assert all(route == "actual" for step, route in routes if 2 <= step <= 5)  # window and forced exit
+    assert any(route != "actual" for step, route in routes if step < 2)  # forecasting before the window
+    assert CURRENT.get() is None

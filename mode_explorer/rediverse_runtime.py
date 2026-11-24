@@ -196,7 +196,12 @@ class ReDiverseRun:
             "native_before_window": max(0, min(len(schedule.seen), cfg.start)) if cfg.schedule == "first_evaluation" else 0,
             "window_slots_requested": cfg.evaluations, "window_slots_reached": schedule.reached,
             "window_entry_sigma": schedule.window_sigmas[0] if schedule.window_sigmas else None,
-            "window_exit_sigma": schedule.exit_sigma, "adapter_active_evaluations": self.adapter_active, "slots": slots,
+            "window_exit_sigma": schedule.exit_sigma,
+            # Distinct window slots whose adapter ran in a live forward, and the admitted calls behind them
+            # (split CFG dispatches several calls per slot).
+            "adapter_active_evaluations": sum(1 for slot in slots if slot["state"] == "adapter_active"
+                                              and slot["live_forwards"] > 0),
+            "adapter_active_calls": self.adapter_active, "slots": slots,
         }
         if cfg.schedule == "first_evaluation" and schedule.reached < cfg.evaluations:
             out["unreached_window_slots"] = list(range(cfg.start + schedule.reached, cfg.start + cfg.evaluations))

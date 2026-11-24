@@ -52,7 +52,7 @@ class ModeExplorerReDiverse:
         return {"required": {
             "model": ("MODEL",),
             "enabled": ("BOOLEAN", {"default": True}),
-            "adapter": (_adapter_choices(), {"default": NONE, "tooltip": "ReDiverse-FT LoRA from the loras folder, e.g. krea-2-rediverse-comfy.safetensors. Active only on the first evaluation."}),
+            "adapter": (_adapter_choices(), {"default": NONE, "tooltip": "ReDiverse-FT LoRA from the loras folder, e.g. krea-2-rediverse-comfy.safetensors. Active on the scheduled window: by default only the first evaluation (the reference recipe); see adapted_sigmas, start_evaluation and strength_profile."}),
             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "Adapter multiplier. 1.0 is the released recipe."}),
             "band": ("FLOAT", {"default": PAPER_BAND, "min": 0.0, "max": 8.0, "step": 0.1, "tooltip": "ReDiverse-TF coefficients alpha ~ U[-band, band]. 2 is the paper setting, 4 the released combined setting. Needs directions."}),
         }, "optional": {

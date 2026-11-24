@@ -129,7 +129,7 @@ With Diagnostics on, the `temporal` record of the trace lists:
 - the reached and unreached slots, and the window's entry and exit σ;
 - for each slot: its index, σ, multiplier, effective strength, state (`adapter_active`, `zero_strength` or `steering_only`), calls, live and auxiliary forwards, and adapter module calls.
 
-The top-level `adapted_evaluations` keeps its established meaning: admitted window evaluations with a live forward, zero-strength slots and the Strength 0 sham included. `temporal.adapter_active_evaluations` counts only those with a nonzero effective strength. A probe measures only the opening evaluation, so a probe through a ReDiverse node requires start evaluation 0 and records the probed effective strength. A selected zero slot is not evidence that adapter arithmetic ran. That evidence is a nonzero `adapter_module_calls`, which equals 216 × (live + auxiliary forwards) for the released adapter.
+The top-level `adapted_evaluations` keeps its established meaning: admitted window evaluations with a live forward, zero-strength slots and the Strength 0 sham included. `temporal.adapter_active_evaluations` counts distinct window slots whose adapter ran at a nonzero effective strength in a live forward; `temporal.adapter_active_calls` counts the admitted calls behind them, which is larger under split CFG. A probe measures only the opening evaluation, so a probe through a ReDiverse node requires start evaluation 0 and records the probed effective strength. A selected zero slot is not evidence that adapter arithmetic ran. That evidence is a nonzero `adapter_module_calls`, which equals 216 × (live + auxiliary forwards) for the released adapter.
 
 The adapter is bypassed (the sampler runs natively and the reason is logged) for partial denoise (first σ not 1), latent masks, unsupported latent layouts and tagged Scale-Locked high-resolution stages. Projection guidance, multi-GPU and context-window dispatch keep ModeExplorer's existing rejections.
 
@@ -262,14 +262,14 @@ python tools/analyze.py bench-output/rediverse-production --baseline C_route_sha
 | `tools/rediverse_temporal_duration_profiles.json` (A) | Native; route sham 4 × 0; reference 1 × 1.0; weak 1 × 0.5; constant windows of 2, 4, 6 and 8 at 0.5; 4, 6 and 8 at 1.0; boundary research 16 × 0.5 (not a recommendation) |
 | `tools/rediverse_temporal_shape_profiles.json` (B) | Native and six custom profiles with nominal cumulative strength 2.0: constant, front-loaded, increasing, bell, delayed within the window, concentrated opening (2, 0, 0, 0) |
 | `tools/rediverse_temporal_delay_profiles.json` (C) | Native; 4 × 0.5 starting at evaluations 0, 1, 2, 4 and 6; isolated single slots at 1.0 starting at 0, 1, 2 and 4 |
-| `tools/rediverse_temporal_combination_profiles.json` (D) | Native, B0, reference FT, extended FT 4 × 0.5, and extended FT with B0 and with B1. B0 and B1 share every other ModeExplorer setting |
+| `tools/rediverse_temporal_combination_profiles.json` (D) | Native, B0, reference FT, extended FT 4 × 0.5, and extended FT with B0 and with B1. B0 and B1 use strength 0.30 with Adaptive off and share every other ModeExplorer setting |
 | `tools/rediverse_temporal_spectrum_profiles.json` | Guarded Spectrum: native, 4 × 0.5, start 2, front-loaded, with a route-matched sham per window |
 
 ```shell
 python tools/evaluate.py --model krea2_int8_convrot.safetensors --rediverse-adapter krea-2-rediverse-comfy.safetensors --profiles tools/rediverse_temporal_duration_profiles.json --sampler er_sde --steps 16 --seed-count 4 --out bench-output/rediverse-temporal-duration --server-log /path/to/comfy.log
 ```
 
-Every run record stores its resolved arm configuration and a hash of it, so arms that differ only in start position or profile are never merged. Judge temporal arms on the same dimensions as above, separately:
+Every run record stores its arm configuration with `$teacher` and `$adapter` resolved to the files of the run, and a hash of it, so arms that differ only in start position or profile are never merged. Judge temporal arms on the same dimensions as above, separately:
 
 - anatomy and structural coherence
 - pose, framing and setting variation

@@ -288,6 +288,14 @@ def test_rediverse_panels_record_effective_sampler_configuration(tmp_path, monke
     assert len(records) == 2 * 2 * 5
     assert all((r["steps"], r["sampler"], r["scheduler"]) == (13, "er_sde", "simple") for r in records)
     assert all(r["planner_image"].endswith("_planner.png") for r in records)
+    # Records carry resolved files: the identity changes with the adapter actually used.
+    assert "$adapter" not in json.dumps(records) and "$teacher" not in json.dumps(records)
+    ft = next(r for r in records if r["method"] == "C_turbo_ft")
+    assert ft["profile"]["rediverse"]["adapter"] == "adapter"
+    other = evaluate.resolve_placeholders(
+        Namespace(rediverse_adapter="other", teacher_model="raw"), json.loads(json.dumps(evaluate.load_profiles(
+            root.with_name("rediverse_production_profiles.json"))["C_turbo_ft"])))
+    assert other["rediverse"]["adapter"] == "other" and other != ft["profile"]
 
 
 def test_temporal_rediverse_panels_build_distinct_graphs():
@@ -321,6 +329,10 @@ def test_temporal_rediverse_panels_build_distinct_graphs():
     guided = {arm: cfg["settings"] for arm, cfg in combination.items() if "settings" in cfg}
     # Only the mode differs between B0 and B1 arms: no confounded ModeExplorer strength changes.
     assert len({json.dumps({k: v for k, v in s.items() if k != "mode"}, sort_keys=True) for s in guided.values()}) == 1
+    assert all(s["strength"] == 0.30 and s["adaptive"] is False for s in guided.values())
+    args.variants = combination
+    for arm in guided:
+        assert evaluate.graph(args, arm, "prompt", 7, name=arm)["7"]["inputs"]["adaptive"] is False
     spectrum = evaluate.load_profiles(root.with_name("rediverse_temporal_spectrum_profiles.json"))
     assert all(cfg["spectrum"] == "guarded" for cfg in spectrum.values())
     # Every treated arm has a sham with the same window, hence the same Spectrum route.
