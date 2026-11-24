@@ -70,10 +70,12 @@ Place it on the MODEL path before ModeExplorer feature guidance, Sol-Krea2 and S
 | **Strength** | Multiplier of the low-rank path. 1.0 is the released recipe. 0 applies nothing (see the route-matched sham below). |
 | **Band** | TF coefficients α ~ U[−band, band]. Used only with connected directions. 2 is the paper setting, 4 the released combined setting. |
 | **Directions** | Output of the Calibrate or Directions node. |
-| Schedule, Adapted sigmas | Advanced. See the scheduling contract. Anything other than `first_evaluation` with one sigma is experimental. |
+| Schedule, Adapted sigmas (1–16) | Advanced. See the scheduling contract. Anything other than `first_evaluation` with one sigma is experimental. |
 | Direction count, Coefficient trial | Advanced. Number of archived directions used; an independent deterministic coefficient draw for the same seed. |
 | Steering | Advanced. `random` is ReDiverse-TF; `cohort_logdet` is experimental and `random_norm_matched` is its control. |
-| Diagnostics | Logs a `MODEEXPLORER_TRACE` record with admitted sigmas, adapted evaluations, adapter module calls, TF applications, coefficients and the realized TF offset magnitude. |
+| Diagnostics | Logs a `MODEEXPLORER_TRACE` record with admitted sigmas, adapted evaluations, adapter module calls, TF applications, coefficients, the realized TF offset magnitude and the executed temporal schedule. |
+| Start evaluation (0–15) | Advanced, experimental. First window slot, as a zero-based distinct evaluation sigma. Earlier evaluations run natively. 0 is the reference. |
+| Strength profile, Custom profile | Advanced, experimental. Per-slot multipliers of **Strength** across the window: `constant` (reference), `linear_decay`, `cosine_decay`, `linear_increase`, `bell_curve` or `custom` (exactly *adapted sigmas* comma-separated values). **Strength** stays the global amplitude; the effective strength of slot *i* is Strength × multiplier *i*. The node logs the effective sequence. |
 
 ### Scheduling contract
 
@@ -89,7 +91,45 @@ Terms: a *solver step* moves the latent from σᵢ to σᵢ₊₁; a *model eval
 | ER-SDE, SA-Solver | The first evaluation, at ComfyUI's slightly offset first σ | Same evaluation; σ is just below 1 |
 | CFG > 1 | Both branches of that evaluation | Upstream Turbo uses no CFG |
 
-`first_interval` (experimental) adapts every evaluation with σ above the schedule's second σ, which includes the intermediate stages of multistage solvers inside step 1. *Adapted sigmas* > 1 (experimental) extends `first_evaluation` to the first N distinct evaluation σ. Neither has upstream evidence.
+`first_interval` (experimental) adapts every evaluation with σ above the schedule's second σ, which includes the intermediate stages of multistage solvers inside step 1. Delayed activation and strength profiles are rejected with it. Neither extension has upstream evidence.
+
+### Temporal schedules (experimental)
+
+Under `first_evaluation`, the evaluations of a sampler invocation are numbered by *distinct evaluation σ*, from 0, in the order they occur:
+
+- An evaluation at the same σ as the previous one belongs to the same slot. This covers another CFG branch, a nested ModeExplorer reference or Response forward, and a same-σ corrector.
+- Every new σ opens the next slot.
+- Slots are not solver steps, not percentages of denoising progress and not transformer-call counts. With Heun, the corrector at σᵢ₊₁ and the next predictor at σᵢ₊₁ share one slot; with DPM++ 2S the midpoint σ is a slot of its own; ER-SDE's offset first σ is slot 0.
+
+*Start evaluation* S and *adapted sigmas* N select slots S … S + N − 1. Earlier slots run natively, and the schedule closes at the first σ after the window. Numbering always starts at the beginning of the eligible invocation, never at the first nonzero multiplier. Evaluations that Spectrum replaces with forecasts still pass through ModeExplorer's wrapper, so they are numbered too and cannot shift the window. Partial denoise, masks and tagged high-resolution stages bypass ReDiverse entirely, whatever S is: delayed activation schedules an intervention later inside a supported full-denoise invocation, it does not make refinement passes eligible.
+
+Profile multipliers over a window of N slots, with position i = 0 … N − 1 and t = i / (N − 1):
+
+| Profile | Multiplier | Notes |
+| --- | --- | --- |
+| `constant` | 1 | The reference. With N = 1 this is the upstream recipe. |
+| `linear_decay` | 1 − t | Last slot is 0. |
+| `cosine_decay` | (1 + cos πt) / 2 | Last slot is 0. |
+| `linear_increase` | t | First slot is 0. The profile does not restart at the next slot; the zero slot keeps its position. |
+| `bell_curve` | sin πt | Both ends are exactly 0 and the values are mirror-symmetric. For even N the discrete peak is below 1; it is not renormalized. N = 2 gives 0, 0. |
+| `custom` | the listed values | Exactly N finite nonnegative values. Malformed lists, NaN, infinity, negatives and wrong lengths are errors. |
+
+Every built-in profile is 1 for N = 1. Nothing is normalized, clamped, padded, truncated or repeated. An effective strength above 2 is an error. Profiles with equal multiplier sums have equal *nominal* cumulative strength, which is not equal activation displacement or intervention energy. Use custom lists to build nominally matched comparisons.
+
+Zero slots, whether from a profile or from Strength 0, run no adapter arithmetic and no adapter hooks. They still belong to the window, so Spectrum routing and the slot's diagnostics are the same as for a nonzero slot.
+
+If the sampler has fewer evaluations than the window needs, only the reachable slots run and the run reports `temporal_window_truncated`. If none is reachable, it reports `temporal_window_not_reached`. A schedule never wraps around, never repeats a finished profile and never carries over into another invocation.
+
+These temporal options apply to ReDiverse-FT only. With active ReDiverse-TF steering (connected directions and a nonzero band), a start above 0 or a non-constant profile is an error: TF keeps its established constant per-evaluation offset, from evaluation 0, for up to 16 slots. Set the band to 0 to use temporal FT options next to a connected archive.
+
+With Diagnostics on, the `temporal` record of the trace lists:
+
+- the requested start, window length, profile, global strength, multipliers and planned strengths;
+- every observed evaluation σ, and the number of native evaluations before the window;
+- the reached and unreached slots, and the window's entry and exit σ;
+- for each slot: its index, σ, multiplier, effective strength, state (`adapter_active`, `zero_strength` or `steering_only`), calls, live and auxiliary forwards, and adapter module calls.
+
+A selected zero slot is not evidence that adapter arithmetic ran. That evidence is a nonzero `adapter_module_calls`, which equals 216 × (live + auxiliary forwards) for the released adapter.
 
 The adapter is bypassed (the sampler runs natively and the reason is logged) for partial denoise (first σ not 1), latent masks, unsupported latent layouts and tagged Scale-Locked high-resolution stages. Projection guidance, multi-GPU and context-window dispatch keep ModeExplorer's existing rejections.
 
@@ -115,11 +155,21 @@ With the [Spectrum ModeExplorer overlay](https://github.com/xmarre/ComfyUI-Spect
 
 Without that contract, the pass runs all-actual through Spectrum's native control (`spectrum_all_actual` in the trace). The released Spectrum v0.2.2 refuses to forecast with any ModeExplorer patch, which is also correct but unaccelerated. Full Spectrum is rejected with ReDiverse.
 
-Because the boundary changes Spectrum's route, compare a ReDiverse arm with the **route-matched sham**: the same node with strength 0 (and band 0) keeps the forced-actual boundary and fresh history but applies nothing. Without Spectrum, strength 0 is bitwise identical to the native model.
+For a temporal window, `guidance_pending` answers whether the *next* evaluation's slot lies inside the window, zero slots included. Spectrum's existing regime rule then gives the conservative routing, with no companion change:
+
+1. Before a delayed window, ordinary guarded forecasting.
+2. Entering the window, forecast history is cleared and the first slot is actual.
+3. Every slot inside the window is actual, so no forecast is made from one effective strength for another, and native history never feeds an adapted slot.
+4. The first evaluation after the window is actual and starts fresh native history, so adapted outputs never anchor native forecasts.
+5. Forecasting resumes once Spectrum's own conditions hold again: enough anchors, the extrapolation guard and the actual tail step.
+
+Combined with ModeExplorer feature guidance, each change of the combined pending state is such a boundary. The cost of a window of N slots is N + 1 forced actual evaluations plus Spectrum's history rebuild after it, i.e. fewer forecasts.
+
+Because the boundary changes Spectrum's route, compare a ReDiverse arm with the **route-matched sham**: the same node and the same temporal configuration with Strength 0 (and band 0). It keeps the same window, forced-actual evaluations and fresh history, but applies nothing. Without Spectrum, a Strength 0 sham is bitwise identical to the native model.
 
 ### Scale-Locked
 
-ReDiverse applies to the composition-forming planner stage only. Tagged high-resolution stages and partial-denoise refinements bypass it, so the existing composition lock and refinement behavior are unchanged. TF directions must be calibrated at the planner's latent size (see below).
+ReDiverse applies to the composition-forming planner stage only. Tagged high-resolution stages and partial-denoise refinements bypass it, so the existing composition lock and refinement behavior are unchanged. A temporal window is scheduled, numbered, truncated and closed within the planner invocation. A window that the planner did not complete is reported as truncated; it is never continued or restarted in a later stage. TF directions must be calibrated at the planner's latent size (see below).
 
 ## ReDiverse-TF calibration
 
@@ -205,6 +255,31 @@ python tools/analyze.py bench-output/rediverse-production --baseline C_route_sha
 
 `--embeddings` takes locally computed DINOv2 or DreamSim vectors keyed by blinded IDs and adds cosine diversity and Vendi per prompt; the analyzer aggregates at the prompt level with paired bootstrap intervals. Review sheets are blinded; the private mapping stays out of the shared archive. Give reviewers the prompt and, for identity panels, authorized reference photographs, and rate composition, framing, pose, anatomy, identity, adherence, detail and artifacts at native size. Count identity drift under an identity LoRA as a regression, not as diversity. Report wall time, calibration time, peak VRAM and the trace counters (actual, forecast and auxiliary evaluations, adapted evaluations, TF applications, realized offset). Decide FT on A–D first; TF needs its own calibration-cost accounting. Confirm any pilot result on a held-out panel before changing defaults.
 
+**Temporal panels** (experimental FT schedules). These are screening panels to run on a small prompt and seed set first; extend them only after production evidence. Spectrum is off in panels A–D, to isolate the adapter's behavior. Add the sampler, steps, planner and LoRA options of the workflow under test on the command line.
+
+| Profiles | Arms |
+| --- | --- |
+| `tools/rediverse_temporal_duration_profiles.json` (A) | Native; route sham 4 × 0; reference 1 × 1.0; weak 1 × 0.5; constant windows of 2, 4, 6 and 8 at 0.5; 4, 6 and 8 at 1.0; boundary research 16 × 0.5 (not a recommendation) |
+| `tools/rediverse_temporal_shape_profiles.json` (B) | Native and six custom profiles with nominal cumulative strength 2.0: constant, front-loaded, increasing, bell, delayed within the window, concentrated opening (2, 0, 0, 0) |
+| `tools/rediverse_temporal_delay_profiles.json` (C) | Native; 4 × 0.5 starting at evaluations 0, 1, 2, 4 and 6; isolated single slots at 1.0 starting at 0, 1, 2 and 4 |
+| `tools/rediverse_temporal_combination_profiles.json` (D) | Native, B0, reference FT, extended FT 4 × 0.5, and extended FT with B0 and with B1. B0 and B1 share every other ModeExplorer setting |
+| `tools/rediverse_temporal_spectrum_profiles.json` | Guarded Spectrum: native, 4 × 0.5, start 2, front-loaded, with a route-matched sham per window |
+
+```shell
+python tools/evaluate.py --model krea2_int8_convrot.safetensors --rediverse-adapter krea-2-rediverse-comfy.safetensors --profiles tools/rediverse_temporal_duration_profiles.json --sampler er_sde --steps 16 --seed-count 4 --out bench-output/rediverse-temporal-duration --server-log /path/to/comfy.log
+```
+
+Every run record stores its resolved arm configuration and a hash of it, so arms that differ only in start position or profile are never merged. Judge temporal arms on the same dimensions as above, separately:
+
+- anatomy and structural coherence
+- pose, framing and setting variation
+- prompt adherence
+- identity retention under an identity LoRA
+- meaningful detail and introduced artifacts
+- runtime and forecast utilization
+
+Paired same-seed differences show trajectory sensitivity; they do not establish population-level diversity. Prompt-level aggregation over several prompts and seeds is required before any temporal configuration is recommended.
+
 The reference panel's Raw arm and the production panel do not reproduce the upstream sampling loop exactly (ComfyUI keeps the latent in float32 between steps, upstream in bf16; text-encoder padding and masking can differ), so their numbers are not reproductions of the upstream table.
 
 ## Recommendations
@@ -218,6 +293,7 @@ These are starting points for evaluation, not established optima.
 | Raw | Not applicable: the adapter targets Turbo's first step. Raw is the teacher and the diversity reference. |
 | Spectrum | Use guarded Spectrum with the ModeExplorer overlay and compare against the strength-0 route-matched sham. |
 | Scale-Locked planner | FT on the planner only ([production workflow](../examples/rediverse_scale_locked.json)). Calibrate TF at the planner latent size if used. |
+| Temporal FT (experimental) | Start from the [temporal workflow](../examples/rediverse_temporal.json) and the temporal panels. Keep the reference recipe (start 0, one slot, constant) as the default until panels over several prompts and seeds support a change. |
 | Research | [TF workflow](../examples/rediverse_tf.json) and the [probe workflow](../examples/rediverse_probe.json) (Raw, Turbo and Turbo with the adapter on blocks 22–27). |
 
 ## First real-checkpoint check
@@ -230,6 +306,7 @@ Established on CPU with ComfyUI's native Krea 2 transformer at tiny width (see `
 
 - zero strength and zero band are bitwise native; disabling restores the native graph;
 - the adapted run equals an independent reference (first Euler step on merged weights, remaining steps native) within 2·10⁻⁵, for CFG 1 and packed CFG 2, at strengths 1 and 0.5; upstream weight patches remain applied;
+- temporal schedules equal an independent per-step reference (each Euler step on weights merged at its effective strength) within 2·10⁻⁵ for constant, delayed, increasing, cosine and custom profiles with zero slots; zero-strength temporal shams are bitwise native; slots follow distinct σ under split CFG, Heun and ER-SDE; references inherit their evaluation's strength without advancing the window; truncated and unreachable windows are reported; with guarded Spectrum a delayed window gets forecasts before it, actual slots and exit, two regime transitions and resumed forecasting, with sham routes equal to treated ones; Scale-Locked windows stay in the planner;
 - multistage solvers, ER-SDE's offset σ, split CFG dispatch, partial denoise, masks and high-resolution stages follow the contract above;
 - no hook survives a run, an exception or an interrupt; repeated runs are deterministic; the shared model is unchanged;
 - a requested intervention whose admitted evaluation runs no live forward fails; truncated probe forwards verify the adapter on their executed prefix;
