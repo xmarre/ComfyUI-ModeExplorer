@@ -1,6 +1,7 @@
 """ComfyUI nodes for ReDiverse on native Krea 2."""
 
 import json
+import logging
 import os
 from collections import OrderedDict
 
@@ -12,6 +13,7 @@ from .rediverse import (
 from .runtime import KEY, SamplerWrapper, Settings, attention_feature, diffusion_wrapper, has_spectrum, verify_patch_graph
 
 DIRECTIONS_TYPE = "MODEEXPLORER_REDIVERSE_DIRECTIONS"
+LOGGER = logging.getLogger("ModeExplorer")
 NONE = "none"
 _ADAPTERS = OrderedDict()
 
@@ -56,16 +58,20 @@ class ModeExplorerReDiverse:
         }, "optional": {
             "directions": (DIRECTIONS_TYPE, {"tooltip": "Teacher directions calibrated for this prompt and latent size."}),
             "schedule": (list(SCHEDULES), {"default": "first_evaluation", "advanced": True, "tooltip": "first_evaluation is the reference contract. first_interval also adapts intermediate solver stages above the second sigma (experimental)."}),
-            "adapted_sigmas": ("INT", {"default": 1, "min": 1, "max": 4, "advanced": True, "tooltip": "Number of opening evaluation sigmas. Values above 1 are experimental."}),
+            "adapted_sigmas": ("INT", {"default": 1, "min": 1, "max": 16, "advanced": True, "tooltip": "Length of the intervention window in distinct evaluation sigmas (not solver steps or transformer calls). Values above 1 are experimental."}),
             "direction_count": ("INT", {"default": DIRECTIONS, "min": 1, "max": 32, "advanced": True}),
             "coefficient_trial": ("INT", {"default": 0, "min": 0, "max": 65535, "advanced": True, "tooltip": "Independent deterministic coefficient draw for the same noise seed."}),
             "steering": (["random", "random_norm_matched", "cohort_logdet"], {"default": "random", "advanced": True, "tooltip": "random is ReDiverse-TF. cohort_logdet is an experimental teacher-informed batch objective; random_norm_matched is its control with identical activation-space offset norms."}),
             "diagnostics": ("BOOLEAN", {"default": False, "advanced": True}),
+            # Appended after the historical widgets so saved workflows keep their positions.
+            "start_evaluation": ("INT", {"default": 0, "min": 0, "max": 15, "advanced": True, "tooltip": "Experimental: zero-based distinct evaluation sigma at which the window starts; earlier evaluations run natively. 0 is the reference recipe."}),
+            "strength_profile": (["constant", "linear_decay", "cosine_decay", "linear_increase", "bell_curve", "custom"], {"default": "constant", "advanced": True, "tooltip": "Experimental: per-slot multipliers of Strength across the window (effective strength = Strength x multiplier). Zero slots are kept."}),
+            "custom_profile": ("STRING", {"default": "", "advanced": True, "tooltip": "Custom profile only: exactly adapted_sigmas comma-separated multipliers of Strength, e.g. 0.5, 0.75, 1.0, 0.25."}),
         }}
 
     def apply(self, model, enabled=True, adapter=NONE, strength=1.0, band=PAPER_BAND, directions=None,
               schedule="first_evaluation", adapted_sigmas=1, direction_count=DIRECTIONS, coefficient_trial=0,
-              steering="random", diagnostics=False):
+              steering="random", diagnostics=False, start_evaluation=0, strength_profile="constant", custom_profile=""):
         from comfy.patcher_extension import WrappersMP
 
         from .rediverse_runtime import ReDiverseConfig
@@ -108,7 +114,12 @@ class ModeExplorerReDiverse:
         config = ReDiverseConfig(adapter=parsed, strength=strength, schedule=schedule, evaluations=adapted_sigmas,
                                  directions=directions, band=band, count=min(direction_count, directions.U.shape[0])
                                  if directions is not None else direction_count,
-                                 trial=coefficient_trial, tf_mode=steering, diagnostics=diagnostics)
+                                 trial=coefficient_trial, tf_mode=steering, diagnostics=diagnostics,
+                                 start=start_evaluation, profile=strength_profile, custom=custom_profile)
+        if parsed is not None and config.temporal:
+            LOGGER.info("ModeExplorer ReDiverse temporal schedule: evaluations %s, effective strengths %s",
+                        list(range(start_evaluation, start_evaluation + adapted_sigmas)),
+                        ", ".join(f"{value:g}" for value in config.strengths()))
         return (self._attach(model, existing, config),)
 
     @staticmethod

@@ -168,55 +168,133 @@ def resolve_module(block, name):
 
 
 # ------------------------------------------------------------------ schedule --
-class FirstEvaluations:
-    """Admit the opening model evaluations of one sampler invocation.
+MAX_ADAPTED_SIGMAS = 16
+MAX_START_EVALUATION = 15
+MAX_EFFECTIVE_STRENGTH = 2.0
+PROFILES = ("constant", "linear_decay", "cosine_decay", "linear_increase", "bell_curve", "custom")
 
-    ``first_evaluation`` (reference) admits every evaluation at the first ``count``
-    distinct evaluation sigmas, in order, and closes at the first evaluation at any
-    later sigma. All CFG branches and nested auxiliary forwards at an admitted sigma
-    share the adapted model. With Euler and one sigma this is exactly the upstream
-    "adapter active in sampling step 1" rule. ``first_interval`` additionally admits
-    every evaluation strictly above the second schedule sigma, which includes the
-    intermediate stages of multistage solvers within step 1.
+
+def profile_multipliers(profile, count, custom=""):
+    """Per-slot multipliers of a temporal adapter-strength profile over ``count`` slots.
+
+    With t = i / (count - 1) for slot i: constant 1; linear_decay 1 - t; cosine_decay
+    (1 + cos(pi t)) / 2; linear_increase t; bell_curve sin(pi t), with exact zeros at both
+    ends and mirror-symmetric values. A one-slot window is 1 for every built-in profile.
+    Nothing is normalized: an even-length bell curve peaks below 1, and zero slots are kept.
+    ``custom`` is a comma-separated list of exactly ``count`` finite nonnegative values.
+    """
+    if profile not in PROFILES or type(count) is not int or not 1 <= count <= MAX_ADAPTED_SIGMAS:
+        raise ValueError("Unknown ReDiverse strength profile or window length.")
+    if profile == "custom":
+        fields = [field.strip() for field in str(custom).split(",")]
+        if not custom or not str(custom).strip() or any(not field for field in fields):
+            raise ValueError("A custom strength profile needs comma-separated multipliers, for example 0.5, 0.75, 1.0, 0.25.")
+        try:
+            values = tuple(float(field) for field in fields)
+        except ValueError as exc:
+            raise ValueError(f"Malformed custom strength profile {custom!r}.") from exc
+        if any(not math.isfinite(v) or v < 0 for v in values):
+            raise ValueError("Custom strength multipliers must be finite and nonnegative.")
+        if len(values) != count:
+            raise ValueError(f"The custom strength profile has {len(values)} multipliers; adapted sigmas is {count}.")
+        return values
+    if count == 1:
+        return (1.0,)
+    out = []
+    for i in range(count):
+        t = i / (count - 1)
+        if profile == "constant":
+            value = 1.0
+        elif profile == "linear_decay":
+            value = 1.0 - t
+        elif profile == "linear_increase":
+            value = t
+        elif profile == "cosine_decay":
+            value = (1.0 + math.cos(math.pi * t)) / 2.0
+        else:  # bell_curve: exact zero endpoints and mirror symmetry
+            near = min(i, count - 1 - i)
+            value = 0.0 if near == 0 else math.sin(math.pi * near / (count - 1))
+        out.append(value)
+    return tuple(out)
+
+
+class FirstEvaluations:
+    """Temporal slots of one sampler invocation, counted in distinct evaluation sigmas.
+
+    ``first_evaluation`` numbers the distinct consecutive evaluation sigmas of the
+    invocation from zero: an evaluation at the same sigma as the previous one (another
+    CFG branch, a nested auxiliary forward, a same-sigma corrector) belongs to the same
+    slot; every new sigma opens the next slot. Evaluations replaced by Spectrum forecasts
+    still pass through ModeExplorer's wrapper, so they are numbered too and cannot shift
+    the window. Slots ``start`` ... ``start + count - 1`` are admitted, earlier ones run
+    natively, and the schedule closes at the first sigma after the window. With start 0
+    and one slot this is exactly the upstream "adapter active in sampling step 1" rule.
+
+    ``first_interval`` (unchanged) admits every evaluation strictly above the second
+    schedule sigma, including intermediate stages of multistage solvers within step 1.
     """
 
-    def __init__(self, schedule="first_evaluation", count=1, boundary=None):
-        if schedule not in SCHEDULES or type(count) is not int or not 1 <= count <= 4:
+    def __init__(self, schedule="first_evaluation", count=1, boundary=None, start=0):
+        if (schedule not in SCHEDULES or type(count) is not int or not 1 <= count <= MAX_ADAPTED_SIGMAS
+                or type(start) is not int or not 0 <= start <= MAX_START_EVALUATION):
             raise ValueError("Unknown ReDiverse schedule.")
+        if schedule == "first_interval" and start != 0:
+            raise ValueError("Delayed activation is defined only for the first_evaluation schedule.")
         self.schedule = schedule
         self.count = count
+        self.start = start
         self.boundary = boundary
         self.seen = []
         self.closed = False
         self.admitted = 0
+        self.exit_sigma = None
+
+    def _index(self, sigma):
+        return len(self.seen) - 1 if self.seen and sigma == self.seen[-1] else len(self.seen)
 
     def pending(self, sigma):
+        """Whether an evaluation at ``sigma`` (the next one) falls inside the window. Pure query."""
         if self.closed:
             return False
         if self.schedule == "first_interval" and self.boundary is not None:
             return sigma > self.boundary
-        return len(self.seen) < self.count or sigma == self.seen[-1]
+        return self.start <= self._index(sigma) < self.start + self.count
 
     def admit(self, sigma):
+        """Record an evaluation; its window position (0-based), or None when it runs natively."""
         if self.closed:
-            return False
+            return None
         if self.schedule == "first_interval" and self.boundary is not None:
             if sigma > self.boundary:
                 if not self.seen or self.seen[-1] != sigma:
                     self.seen.append(sigma)
                 self.admitted += 1
-                return True
+                return 0
             self.closed = True
-            return False
-        if self.seen and sigma == self.seen[-1]:
-            self.admitted += 1
-            return True
-        if len(self.seen) < self.count:
+            self.exit_sigma = sigma
+            return None
+        index = self._index(sigma)
+        if index == len(self.seen):
+            if index >= self.start + self.count:
+                self.closed = True
+                self.exit_sigma = sigma
+                return None
             self.seen.append(sigma)
-            self.admitted += 1
-            return True
-        self.closed = True
-        return False
+        if index < self.start:
+            return None
+        self.admitted += 1
+        return index - self.start
+
+    @property
+    def reached(self):
+        """Window slots that received at least one evaluation."""
+        if self.schedule == "first_interval":
+            return len(self.seen)
+        return max(0, min(len(self.seen), self.start + self.count) - self.start)
+
+    @property
+    def window_sigmas(self):
+        return self.seen if self.schedule == "first_interval" else self.seen[self.start:self.start + self.count]
 
 
 def flow_shift(mu, t):

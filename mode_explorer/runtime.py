@@ -1294,6 +1294,7 @@ class SamplerWrapper:
             run.shadows.clear()
             if rediverse is not None:
                 rediverse.release()
+                rediverse.finish(completed)
                 if rediverse.reasons - {"spectrum_all_actual"}:
                     LOGGER.info("ModeExplorer ReDiverse: %s (seed=%s)", ", ".join(sorted(rediverse.reasons)), seed)
             trajectory = None

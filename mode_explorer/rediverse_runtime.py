@@ -31,7 +31,8 @@ import torch
 
 from . import covariance
 from .rediverse import (
-    ANCHOR_BLOCK, DIRECTIONS, PAPER_BAND, ROLLOUTS, ROLLOUT_SAMPLE_BASE, SCHEDULES, TEACHER_FORWARD,
+    ANCHOR_BLOCK, DIRECTIONS, MAX_ADAPTED_SIGMAS, MAX_EFFECTIVE_STRENGTH, MAX_START_EVALUATION, PAPER_BAND, PROFILES,
+    ROLLOUTS, ROLLOUT_SAMPLE_BASE, SCHEDULES, TEACHER_FORWARD, profile_multipliers,
     TEACHER_STEPS, UPSTREAM_REVISION, FirstEvaluations, coefficients, model_fingerprint, packed_noise,
     patch_fingerprint, reference_sigmas, resolve_module, save_directions, tensor_fingerprint,
 )
@@ -65,20 +66,49 @@ class ReDiverseConfig:
     trial: int = 0
     tf_mode: str = "random"
     diagnostics: bool = False
+    start: int = 0
+    profile: str = "constant"
+    custom: str = ""
+    multipliers: tuple = field(init=False, default=(1.0,))
 
     def __post_init__(self):
         if self.adapter is None and self.directions is None:
             raise ValueError("ReDiverse needs an adapter, a direction archive or both.")
-        if self.schedule not in SCHEDULES or type(self.evaluations) is not int or not 1 <= self.evaluations <= 4:
-            raise ValueError("Unknown ReDiverse schedule.")
-        if not (math.isfinite(self.strength) and 0 <= self.strength <= 2):
+        if (self.schedule not in SCHEDULES or type(self.evaluations) is not int
+                or not 1 <= self.evaluations <= MAX_ADAPTED_SIGMAS):
+            raise ValueError(f"ReDiverse adapted sigmas must be an integer in [1, {MAX_ADAPTED_SIGMAS}].")
+        if type(self.start) is not int or not 0 <= self.start <= MAX_START_EVALUATION:
+            raise ValueError(f"ReDiverse start evaluation must be an integer in [0, {MAX_START_EVALUATION}].")
+        if not (math.isfinite(self.strength) and 0 <= self.strength <= MAX_EFFECTIVE_STRENGTH):
             raise ValueError("ReDiverse adapter strength must be in [0, 2].")
+        if self.profile not in PROFILES:
+            raise ValueError("Unknown ReDiverse strength profile.")
+        if self.schedule == "first_interval" and (self.start != 0 or self.profile != "constant"):
+            raise ValueError("Delayed activation and strength profiles are defined only for the first_evaluation schedule.")
+        multipliers = profile_multipliers(self.profile, self.evaluations, self.custom)
+        effective = [self.strength * m for m in multipliers]
+        if any(value > MAX_EFFECTIVE_STRENGTH for value in effective):
+            raise ValueError(f"Effective ReDiverse strengths {', '.join(f'{v:g}' for v in effective)} exceed the supported "
+                             f"maximum {MAX_EFFECTIVE_STRENGTH:g}; lower the strength or the multipliers.")
+        object.__setattr__(self, "multipliers", multipliers)
         if not (math.isfinite(self.band) and 0 <= self.band <= 8):
             raise ValueError("ReDiverse band must be in [0, 8].")
         if self.tf_mode not in TF_MODES or type(self.count) is not int or not 1 <= self.count <= 32:
             raise ValueError("Unknown ReDiverse steering configuration.")
         if self.directions is not None and self.count > self.directions.U.shape[0]:
             raise ValueError(f"The archive holds {self.directions.U.shape[0]} directions.")
+        if self.steers and (self.start != 0 or self.profile != "constant"):
+            # TF has one constant offset per admitted evaluation; FT temporal profiles do not apply to it.
+            raise ValueError("Delayed activation and FT strength profiles cannot be combined with active ReDiverse-TF "
+                             "steering. Use the constant profile from evaluation 0, or set the band to 0.")
+
+    @property
+    def temporal(self):
+        return self.start != 0 or self.profile != "constant" or self.evaluations != 1
+
+    def strengths(self):
+        """Planned effective adapter strength of every window slot (global strength x multiplier)."""
+        return [self.strength * m for m in self.multipliers]
 
     @property
     def adapts(self):
@@ -90,13 +120,19 @@ class ReDiverseConfig:
 
     @property
     def experimental(self):
-        return self.schedule != "first_evaluation" or self.evaluations != 1 or (
+        return self.schedule != "first_evaluation" or self.temporal or (
             self.steers and self.tf_mode != "random")
 
     def describe(self):
-        out = {"schedule": self.schedule, "evaluations": self.evaluations, "experimental": self.experimental}
+        out = {"schedule": self.schedule, "evaluations": self.evaluations, "start_evaluation": self.start,
+               "strength_profile": self.profile, "experimental": self.experimental}
+        if self.profile == "custom":
+            out["custom_multipliers"] = list(self.multipliers)
         if self.adapter is not None:
-            out.update(adapter=self.adapter.describe(), strength=self.strength)
+            out.update(adapter=self.adapter.describe(), strength=self.strength,
+                       planned_strengths=[round(v, 6) for v in self.strengths()],
+                       planned_evaluations=list(range(self.start, self.start + self.evaluations))
+                       if self.schedule == "first_evaluation" else None)
         if self.directions is not None:
             out.update(directions=self.directions.describe(), band=self.band, count=self.count,
                        trial=self.trial, tf_mode=self.tf_mode)
@@ -128,6 +164,8 @@ class ReDiverseRun:
     steer: bool = True
     forwards: list = field(default_factory=list)
     verify_prefix: object = None
+    slots: dict = field(default_factory=dict)
+    adapter_active: int = 0
 
     def pending(self, sigma):
         # Also with zero strength or band: that configuration is the route-matched
@@ -138,9 +176,36 @@ class ReDiverseRun:
         self.device_weights.clear()
         self.offsets = None
 
+    def finish(self, completed):
+        """Report a requested window that the schedule did not fully reach (completed runs only)."""
+        if not completed or self.config.schedule != "first_evaluation":
+            return
+        reached = self.schedule.reached
+        if reached == 0:
+            self.reasons.add("temporal_window_not_reached")
+        elif reached < self.config.evaluations:
+            self.reasons.add("temporal_window_truncated")
+
+    def temporal_summary(self):
+        cfg, schedule = self.config, self.schedule
+        slots = [self.slots[index] for index in sorted(self.slots)]
+        out = {
+            "start_evaluation": cfg.start, "adapted_sigmas": cfg.evaluations, "strength_profile": cfg.profile,
+            "global_strength": cfg.strength, "multipliers": list(cfg.multipliers),
+            "planned_strengths": cfg.strengths(), "evaluation_sigmas": list(schedule.seen),
+            "native_before_window": max(0, min(len(schedule.seen), cfg.start)) if cfg.schedule == "first_evaluation" else 0,
+            "window_slots_requested": cfg.evaluations, "window_slots_reached": schedule.reached,
+            "window_entry_sigma": schedule.window_sigmas[0] if schedule.window_sigmas else None,
+            "window_exit_sigma": schedule.exit_sigma, "adapter_active_evaluations": self.adapter_active, "slots": slots,
+        }
+        if cfg.schedule == "first_evaluation" and schedule.reached < cfg.evaluations:
+            out["unreached_window_slots"] = list(range(cfg.start + schedule.reached, cfg.start + cfg.evaluations))
+        return out
+
     def summary(self):
         out = {
-            "config": self.config.describe(), "seed": self.seed, "admitted_sigmas": self.schedule.seen,
+            "config": self.config.describe(), "seed": self.seed, "admitted_sigmas": self.schedule.window_sigmas,
+            "temporal": self.temporal_summary(),
             "adapted_evaluations": self.adapted_calls, "adapted_rows": self.adapted_rows,
             "adapter_module_calls": self.module_calls, "tf_applications": self.tf_applications,
             "tf_rows": self.tf_rows, "live_forwards": self.live_forwards, "auxiliary_forwards": self.auxiliary_forwards,
@@ -159,7 +224,7 @@ def start_run(config, seed, batch, conditioning, sigmas):
     """Per-invocation state. A requested TF arm that cannot be applied is an error, never a silent untreated arm."""
     boundary = float(sigmas[1]) if len(sigmas) > 1 else None
     run = ReDiverseRun(config, seed, batch, conditioning,
-                       FirstEvaluations(config.schedule, config.evaluations, boundary))
+                       FirstEvaluations(config.schedule, config.evaluations, boundary, config.start))
     run.steer = config.steers
     if config.steers and not isinstance(seed, int):
         raise RuntimeError("ReDiverse steering needs the sampler's integer noise seed for its coefficients.")
@@ -337,10 +402,24 @@ def evaluation_scope(run, dit, x, options):
     sigma = _sigma(options)
     if sigma is None:
         raise RuntimeError("ReDiverse could not read one uniform sigma for this evaluation.")
-    if not rd.schedule.admit(sigma):
-        rd.release()
+    position = rd.schedule.admit(sigma)
+    if position is None:
+        # A native evaluation before the window, or the first one after it.
+        if rd.schedule.closed:
+            rd.release()
         yield
         return
+    strength = rd.config.strength * rd.config.multipliers[position]
+    adapts = rd.config.adapter is not None and strength != 0
+    index = position + (rd.config.start if rd.config.schedule == "first_evaluation" else 0)
+    slot = rd.slots.get(index)
+    if slot is None:
+        slot = rd.slots[index] = {
+            "evaluation": index, "window_position": position, "sigma": sigma,
+            "multiplier": rd.config.multipliers[position], "effective_strength": strength,
+            "state": "adapter_active" if adapts else ("zero_strength" if rd.config.adapter is not None else "steering_only"),
+            "calls": 0, "live_forwards": 0, "auxiliary_forwards": 0, "adapter_module_calls": 0}
+    slot["calls"] += 1
     branches = tuple(options.get("cond_or_uncond", ()))
     steer = rd.steer
     if steer and (not branches or x.shape[0] != rd.batch * len(branches)):
@@ -359,7 +438,8 @@ def evaluation_scope(run, dit, x, options):
     rd.forwards = []
     closed = []
     try:
-        if rd.config.adapts:
+        if adapts:
+            # Device copies stay resident for the invocation; only the scalar changes per slot.
             for block, modules in rd.config.adapter.modules.items():
                 for name, (down, up, scale) in modules.items():
                     key = (block, name, x.device)
@@ -369,7 +449,7 @@ def evaluation_scope(run, dit, x, options):
                     layers.append((block, name, layer))
                     expected.add(id(layer))
                     handles.append(layer.register_forward_hook(
-                        _lora_hook(rd, *rd.device_weights[key], scale * rd.config.strength)))
+                        _lora_hook(rd, *rd.device_weights[key], scale * strength)))
                     # As ComfyUI's bypass adapters do: fused quantized paths must call the module.
                     forced.append((layer, layer.__dict__.get("comfy_force_forward", _MISSING)))
                     layer.comfy_force_forward = True
@@ -421,14 +501,20 @@ def evaluation_scope(run, dit, x, options):
         handles.append(dit.blocks[0].register_forward_pre_hook(opened))
         handles.append(dit.blocks[-1].register_forward_hook(finished))
         scope_token = SCOPE.set(rd)
+        calls_before = rd.module_calls
         yield
         live = sum(closed)
         rd.live_forwards += live
         rd.auxiliary_forwards += len(closed) - live
+        slot["live_forwards"] += live
+        slot["auxiliary_forwards"] += len(closed) - live
+        slot["adapter_module_calls"] += rd.module_calls - calls_before
+        if live and adapts:
+            rd.adapter_active += 1
         if live == 0:
             # No actual live transformer forward ran. Guarded Spectrum keeps admitted evaluations
             # actual, so with a requested intervention this is a broken invariant, not a forecast.
-            if rd.config.adapts or steer:
+            if adapts or steer:
                 raise RuntimeError("An admitted ReDiverse evaluation ran no live transformer forward, so the requested "
                                    "intervention was not applied. Use guarded Spectrum with the ModeExplorer overlay.")
             rd.forecast_consumed += 1
