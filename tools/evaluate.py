@@ -25,7 +25,7 @@ PROFILE_CONTROLS = {
     "reference_source", "reference_bank_size", "reference_trajectories", "reference_selection",
     "reference_continuation", "feature_update", "sham", "initialization_trials",
     "feature_direction", "direction_trial",
-    "reference_budget", "strength", "fidelity", "min_sigma", "adaptive", "similarity", "diagnostics",
+    "reference_budget", "strength", "fidelity", "min_sigma", "adaptive", "similarity", "diagnostics", "mode",
 }
 RESPONSE_CONTROLS = {
     "mode", "basis", "probe_grid", "directions", "trial", "displacement", "norm", "calibration",
@@ -35,6 +35,14 @@ RESPONSE_CONTROLS = {
     "frozen_state", "downstream", "input_limit", "calibration_max_change", "latent_cell",
     "feature_sites", "feature_projection", "require_conditioning", "require_fidelity",
     "reference_min_sigma", "reference_start_sigma", "probe_precision",
+}
+REDIVERSE_CONTROLS = {
+    "adapter", "strength", "band", "schedule", "adapted_sigmas", "direction_count", "coefficient_trial",
+    "steering", "diagnostics", "calibrate", "start_evaluation", "strength_profile", "custom_profile",
+}
+CALIBRATION_CONTROLS = {
+    "teacher_model", "block", "teacher_forward", "teacher_steps", "rollouts", "directions", "seed", "batch",
+    "workspace", "workspace_mib",
 }
 SPECTRUM_CONTROLS = {
     "preset", "degree", "ridge", "warmup", "tail", "window", "growth", "max_history",
@@ -56,7 +64,15 @@ def load_profiles(path):
     for label, cfg in profiles.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", label) or not isinstance(cfg, dict):
             raise ValueError(f"Invalid profile {label!r}.")
-        if (set(cfg) - {"method", "settings", "spectrum", "spectrum_settings", "response", "model", "steps", "cfg"}
+        rediverse = cfg.get("rediverse", {})
+        if (set(cfg) - {"method", "settings", "spectrum", "spectrum_settings", "response", "model", "steps", "cfg",
+                        "rediverse", "schedule"}
+                or not isinstance(rediverse, dict) or set(rediverse) - REDIVERSE_CONTROLS
+                or not isinstance(rediverse.get("calibrate", {}), dict)
+                or set(rediverse.get("calibrate", {})) - CALIBRATION_CONTROLS
+                or ("calibrate" in rediverse and not rediverse["calibrate"].get("teacher_model"))
+                or (rediverse and not (rediverse.get("adapter") or "calibrate" in rediverse))
+                or cfg.get("schedule", "native") not in {"native", "reference_turbo", "reference_raw"}
                 or cfg.get("method") not in METHODS
                 or cfg.get("spectrum", "off") not in {"off", "guarded", "full", "all_actual"}
                 or not isinstance(cfg.get("settings", {}), dict)
@@ -77,7 +93,16 @@ def graph(args, method, prompt, seed, *, name):
     mode = profile["method"]
     feature, initialization = METHODS[mode]
     spectrum = profile.get("spectrum", "off")
-    checkpoint = profile.get("model", args.model)
+    def resolve(value):
+        """Profiles name the teacher checkpoint and ReDiverse adapter as $teacher and $adapter."""
+        for token, option in (("$teacher", "teacher_model"), ("$adapter", "rediverse_adapter")):
+            if value == token:
+                if not getattr(args, option, None):
+                    raise ValueError(f"This profile needs --{option.replace('_', '-')}.")
+                return getattr(args, option)
+        return value
+
+    checkpoint = resolve(profile.get("model", args.model))
     steps, cfg = profile.get("steps", args.steps), profile.get("cfg", args.cfg)
     def node(kind, **inputs):
         return {"class_type": kind, "inputs": inputs}
@@ -102,6 +127,29 @@ def graph(args, method, prompt, seed, *, name):
         if lora_name:
             g[key] = node("LoraLoaderModelOnly", model=model_input, lora_name=lora_name, strength_model=strength)
             model_input = [key, 0]
+    rediverse = profile.get("rediverse")
+    if rediverse:
+        controls = {"enabled": True, "adapter": "none", "strength": 1.0, "band": 2.0, "diagnostics": bool(args.diagnostics)}
+        controls.update({key: resolve(value) for key, value in rediverse.items() if key != "calibrate"})
+        if "calibrate" in rediverse:
+            calibration = {"block": 26, "teacher_forward": 5, "teacher_steps": 52, "rollouts": 25, "directions": 8,
+                           "seed": 0, "batch": 5, "label": "", "cfg": 1.0, "workspace": "auto", "workspace_mib": 8192}
+            calibration.update(rediverse["calibrate"])
+            g["19"] = node("UNETLoader", unet_name=resolve(calibration.pop("teacher_model")), weight_dtype=args.weight_dtype)
+            teacher = ["19", 0]
+            # The teacher gets the student's weight LoRAs, identity LoRA included, at the same strengths,
+            # so teacher directions do not carry variation the student's adapters constrain.
+            for key, lora_name, strength in (
+                ("23", args.model_lora, args.model_lora_strength), ("24", args.identity_lora, args.lora_strength),
+            ):
+                if lora_name:
+                    g[key] = node("LoraLoaderModelOnly", model=teacher, lora_name=lora_name, strength_model=strength)
+                    teacher = [key, 0]
+            g["20"] = node("ModeExplorerReDiverseCalibrateKrea2", teacher=teacher, positive=["4", 0],
+                           latent=["6", 0], **calibration)
+            controls["directions"] = ["20", 0]
+        g["18"] = node("ModeExplorerReDiverseKrea2", model=model_input, **controls)
+        model_input = ["18", 0]
     if mode != "native" or args.diagnostics:
         g["7"] = node(
             "ModeExplorerKrea2", model=model_input, enabled=True, feature=feature, initialization=initialization,
@@ -133,6 +181,16 @@ def graph(args, method, prompt, seed, *, name):
         model_input = ["13", 0]
     sampler = g["8"]["inputs"]
     sampler["model"] = model_input
+    schedule = profile.get("schedule", "native")
+    if schedule != "native":
+        if getattr(args, "planner_megapixels", None) is not None:
+            raise ValueError("Reference schedules use SamplerCustom and cannot drive the Scale-Locked planner.")
+        g["21"] = node("KSamplerSelect", sampler_name=args.sampler)
+        g["22"] = node("ModeExplorerReferenceSigmasKrea2", latent=["6", 0], model=schedule.removeprefix("reference_"),
+                       steps=steps)
+        g["8"] = node("SamplerCustom", model=model_input, add_noise=True, noise_seed=seed, cfg=cfg,
+                      positive=["4", 0], negative=["5", 0], sampler=["21", 0], sigmas=["22", 0],
+                      latent_image=["6", 0])
     if getattr(args, "planner_megapixels", None) is not None:
         g["8"]["class_type"] = "Krea2TurboFlowAlignedRegenerate"
         del sampler["denoise"]
@@ -142,6 +200,21 @@ def graph(args, method, prompt, seed, *, name):
         g["14"] = node("VAEDecode", samples=["8", 1], vae=["3", 0])
         g["15"] = node("SaveImage", images=["14", 0], filename_prefix=f"modeexplorer_eval/{name}_planner")
     return g
+
+
+def sampler_config(workflow):
+    """Effective sampling configuration of a graph from ``graph``, for KSampler and SamplerCustom."""
+    node = workflow["8"]
+    inputs = node["inputs"]
+    if node["class_type"] == "SamplerCustom":
+        schedule = workflow[inputs["sigmas"][0]]["inputs"]
+        return {"steps": schedule["steps"], "cfg": inputs["cfg"],
+                "sampler": workflow[inputs["sampler"][0]]["inputs"]["sampler_name"],
+                "scheduler": f"reference_{schedule['model']}"}
+    if node["class_type"] in ("KSampler", "Krea2TurboFlowAlignedRegenerate"):
+        return {"steps": inputs["steps"], "cfg": inputs["cfg"], "sampler": inputs["sampler_name"],
+                "scheduler": inputs["scheduler"]}
+    raise ValueError(f"Unknown sampler node {node['class_type']!r}.")
 
 
 def request(base, endpoint, payload=None):
@@ -188,13 +261,14 @@ class VramSampler:
 def read_observations(path, offset, seed):
     trace = None
     spectrum = []
+    calibration = []
     if path is None:
-        return trace, spectrum
+        return trace, spectrum, calibration
     with path.open("rb") as logfile:
         if offset <= path.stat().st_size:
             logfile.seek(offset)
         for line in logfile:
-            for marker in (b"MODEEXPLORER_TRACE ", b"Spectrum Krea 2 summary: "):
+            for marker in (b"MODEEXPLORER_TRACE ", b"Spectrum Krea 2 summary: ", b"ModeExplorer ReDiverse calibration: "):
                 _, found, payload = line.partition(marker)
                 if not found:
                     continue
@@ -204,9 +278,11 @@ def read_observations(path, offset, seed):
                     continue
                 if marker.startswith(b"Spectrum"):
                     spectrum.append(observed)
+                elif marker.startswith(b"ModeExplorer ReDiverse"):
+                    calibration.append(observed)
                 elif observed["seed"] == seed and observed["completed"]:
                     trace = observed
-    return trace, spectrum
+    return trace, spectrum, calibration
 
 
 def render(args, workflow, seed, destination):
@@ -237,7 +313,7 @@ def render(args, workflow, seed, destination):
     download("10", destination)
     if "15" in workflow:
         download("15", destination.with_name(destination.stem + "_planner.png"))
-    trace, spectrum = read_observations(args.server_log, offset, seed)
+    trace, spectrum, calibration = read_observations(args.server_log, offset, seed)
     stamps = {kind: data.get("timestamp") for kind, data in status.get("messages", [])}
     start_ms, end_ms = stamps.get("execution_start"), stamps.get("execution_success")
     return {
@@ -246,6 +322,8 @@ def render(args, workflow, seed, destination):
         "execution_seconds": (end_ms - start_ms) / 1000 if start_ms is not None and end_ms is not None else None,
         "sampled_peak_device_mib": vram.peak_mib,
         "trace": trace, "spectrum": spectrum,
+        # Teacher calibration executed in this job (ComfyUI caches it for later seeds of a prompt).
+        "rediverse_calibration": calibration,
     }
 
 
@@ -278,6 +356,8 @@ def parse_args():
                    help="Repeat each same-seed job. Use a dedicated server with --cache-none and a readable --server-log.")
     p.add_argument("--model-lora", help="Optional model LoRA for a separate external baseline.")
     p.add_argument("--model-lora-strength", type=float, default=1.0)
+    p.add_argument("--teacher-model", help="Krea 2 Raw diffusion model filename for $teacher in ReDiverse profiles.")
+    p.add_argument("--rediverse-adapter", help="ReDiverse-FT adapter filename in the loras folder for $adapter.")
     p.add_argument("--identity-lora")
     p.add_argument("--identity-trigger")
     p.add_argument("--lora-strength", type=float, default=1.0)
@@ -367,8 +447,13 @@ def main():
                         image=relative.as_posix(),
                         checkpoint=workflow["1"]["inputs"]["unet_name"],
                         weight_dtype=workflow["1"]["inputs"]["weight_dtype"],
-                        steps=workflow["8"]["inputs"]["steps"], cfg=workflow["8"]["inputs"]["cfg"],
+                        **sampler_config(workflow),
                     )
+                    # The resolved arm configuration, so arms that differ only in temporal profile or
+                    # start position never share an identity.
+                    arm = args.variants.get(method, {"method": method})
+                    result.update(profile=arm, profile_sha256=hashlib.sha256(
+                        json.dumps(arm, sort_keys=True).encode()).hexdigest()[:16])
                     if args.planner_megapixels is not None:
                         result["planner_image"] = relative.with_name(relative.stem + "_planner.png").as_posix()
                     result["repeats"] = []
