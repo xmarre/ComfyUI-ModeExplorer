@@ -380,9 +380,11 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
     from importlib.util import find_spec
 
     installed = {
-        "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors", "krea2_int8_convrot.safetensors"],
+        "diffusion_models": ["krea2_turbo_fp8_scaled.safetensors", "krea2_int8_convrot.safetensors",
+                             "krea2_raw_bf16.safetensors"],
         "text_encoders": ["qwen3vl_4b_fp8_scaled.safetensors"],
         "vae": ["qwen_image_vae.safetensors"],
+        "loras": ["krea-2-rediverse-comfy.safetensors"],
     }
     monkeypatch.setattr(folder_paths, "get_filename_list", lambda key: installed.get(key, []))
     root = Path(__file__).resolve().parents[1]
@@ -398,7 +400,7 @@ def test_audit_examples_against_installed_node_schemas(model, monkeypatch):
         if path.name in ("spectrum_ab.json", "response_spectrum.json") and not spectrum_available:
             continue
         if (path.name.startswith(("projection_", "structural_discovery_")) or path.name in ("scale_locked_spectrum.json", "response_scale_locked.json",
-                                                                  "conditioning_contrast.json")) and not (
+                                                                  "conditioning_contrast.json", "rediverse_scale_locked.json")) and not (
             scale_locked and spectrum_available
         ):
             continue

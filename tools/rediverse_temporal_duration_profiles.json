@@ -1,0 +1,91 @@
+{
+ "native": {
+  "method": "native"
+ },
+ "sham_4x0": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.0,
+   "adapted_sigmas": 4
+  }
+ },
+ "ref_1x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  }
+ },
+ "weak_1x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5
+  }
+ },
+ "ext_2x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 2
+  }
+ },
+ "ext_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4
+  }
+ },
+ "ext_4x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4
+  }
+ },
+ "ext_6x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 6
+  }
+ },
+ "ext_8x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 8
+  }
+ },
+ "ext_6x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 6
+  }
+ },
+ "ext_8x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 8
+  }
+ },
+ "boundary_16x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 16
+  }
+ }
+}

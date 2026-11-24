@@ -1,0 +1,65 @@
+{
+ "native": {
+  "method": "native"
+ },
+ "constant": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0.5, 0.5, 0.5, 0.5"
+  }
+ },
+ "front_loaded": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0.8, 0.6, 0.4, 0.2"
+  }
+ },
+ "increasing": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0.2, 0.4, 0.6, 0.8"
+  }
+ },
+ "bell": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0.25, 0.75, 0.75, 0.25"
+  }
+ },
+ "delayed_in_window": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0, 0.5, 0.75, 0.75"
+  }
+ },
+ "concentrated_opening": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "2, 0, 0, 0"
+  }
+ }
+}

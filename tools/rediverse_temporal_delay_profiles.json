@@ -1,0 +1,82 @@
+{
+ "native": {
+  "method": "native"
+ },
+ "start0_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 0
+  }
+ },
+ "start1_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 1
+  }
+ },
+ "start2_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 2
+  }
+ },
+ "start4_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 4
+  }
+ },
+ "start6_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 6
+  }
+ },
+ "isolated0_1x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "start_evaluation": 0
+  }
+ },
+ "isolated1_1x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "start_evaluation": 1
+  }
+ },
+ "isolated2_1x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "start_evaluation": 2
+  }
+ },
+ "isolated4_1x1": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "start_evaluation": 4
+  }
+ }
+}
