@@ -1,0 +1,87 @@
+{
+ "native": {
+  "method": "native"
+ },
+ "b0": {
+  "method": "cosine",
+  "settings": {
+   "mode": "Early Structural (B0)",
+   "strength": 0.3,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false,
+   "adaptive": false
+  }
+ },
+ "ft_ref": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  }
+ },
+ "ft_ext_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4
+  }
+ },
+ "ft_ext_4x05_b0": {
+  "method": "cosine",
+  "settings": {
+   "mode": "Early Structural (B0)",
+   "strength": 0.3,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false,
+   "adaptive": false
+  },
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4
+  }
+ },
+ "ft_ext_4x05_b1": {
+  "method": "cosine",
+  "settings": {
+   "mode": "Early Structural (B1)",
+   "strength": 0.3,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false,
+   "adaptive": false
+  },
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4
+  }
+ }
+}
