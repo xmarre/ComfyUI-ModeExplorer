@@ -79,6 +79,12 @@ Use a full-noise empty unmasked latent for feature guidance. Tagged Scale-Locked
 
 See [Research](docs/research.md) for equations and limitations and [Validation](docs/validation.md) for matched comparisons and cost measurements. See [Causal investigation](docs/mechanism.md) for the norm-matched direction experiment and its limitations.
 
+## ReDiverse
+
+**ModeExplorer ReDiverse (Krea 2)** applies the released [ReDiverse](https://arxiv.org/abs/2611.18550) first-step adapter for Krea 2 Turbo only on the opening model evaluation, through scoped forward hooks: no weight merging, upstream weight LoRAs stay active, and later steps run the unmodified model. It can also add per-prompt Krea 2 Raw principal directions at block 26's residual stream (ReDiverse-TF) from the **Calibrate** node. It acts at different coordinates than the attention-feature modes above and composes with them on one MODEL path. With the Spectrum overlay the adapted evaluation stays actual and forecasting restarts after it; tagged high-resolution and partial-denoise passes bypass it.
+
+The adapter is a separately licensed download (Krea 2 Community License); place `krea-2-rediverse-comfy.safetensors` in `models/loras`. Upstream-reported diversity gains have not been reproduced here, and production quality on real checkpoints is not yet qualified. See the [ReDiverse guide](docs/rediverse.md) for the scheduling contract, calibration cost, the directional-collapse probe, evaluation panels and recommendations, and the [example workflows](examples/README.md).
+
 ## Response experiments
 
 Use [ModeExplorer Mechanistic](docs/mechanistic.md) for full-resolution native-site spectra, signed decomposition, matched conditioning experiments, and opt-in clean component steering. The guide includes planner-only research profiles. See [planner structural discovery](docs/structural-discovery.md) for actual-evaluation trajectory capture and the frozen INT8 activation factorial. Use [local research reports](docs/local-research-reports.md) to qualify and compare complete trajectory campaigns in ComfyUI and export one compact ZIP.

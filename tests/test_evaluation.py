@@ -198,3 +198,85 @@ def test_response_profile_and_offline_embeddings(tmp_path):
     path.write_text('{"dino_v2":{"a":[1,0],"b":[0,1]}}')
     result = analyze.embedding_metrics([{"id": "a"}, {"id": "b"}], analyze.load_embeddings(path))
     assert result == {"dino_v2_cosine_distance": 1.0, "dino_v2_vendi": 2.0}
+
+
+def test_rediverse_panels_build_matched_graphs():
+    import pytest
+
+    args = Namespace(
+        model="turbo", encoder="encoder", vae="vae", weight_dtype="default", width=1024, height=1024,
+        steps=8, cfg=1.0, sampler="euler", scheduler="simple", negative="", strength=0.45,
+        fidelity=0.55, fixed=False, similarity=0.7, reference_budget=2, min_sigma=0.82, diagnostics=True,
+        model_lora=None, model_lora_strength=1.0, identity_lora=None, lora_strength=1.0,
+        teacher_model="raw", rediverse_adapter="krea-2-rediverse-comfy.safetensors",
+    )
+    root = Path(evaluate.__file__)
+    args.variants = evaluate.load_profiles(root.with_name("rediverse_reference_profiles.json"))
+    arms = {arm: evaluate.graph(args, arm, "prompt", 42, name=arm) for arm in args.variants}
+    for arm, g in arms.items():
+        sampler = g["8"]
+        assert sampler["class_type"] == "SamplerCustom" and sampler["inputs"]["noise_seed"] == 42
+        assert g["22"]["inputs"]["model"] == ("raw" if arm == "G_raw" else "turbo")
+        assert g["21"]["inputs"]["sampler_name"] == "euler"
+    assert arms["G_raw"]["1"]["inputs"]["unet_name"] == "raw" and arms["G_raw"]["22"]["inputs"]["steps"] == 52
+    assert arms["G_raw"]["8"]["inputs"]["cfg"] == 4.5
+    ft = arms["C_turbo_ft"]["18"]["inputs"]
+    assert ft["adapter"] == "krea-2-rediverse-comfy.safetensors" and ft["strength"] == 1.0 and "directions" not in ft
+    assert arms["C_turbo_ft"]["7"]["inputs"]["model"] == ["18", 0]  # ReDiverse precedes ModeExplorer
+    combined = arms["D_turbo_ft_b1"]
+    assert combined["7"]["inputs"]["mode"] == "Early Structural (B1)" and combined["7"]["inputs"]["model"] == ["18", 0]
+    tf = arms["E_turbo_tf"]
+    assert tf["18"]["inputs"]["adapter"] == "none" and tf["18"]["inputs"]["directions"] == ["20", 0]
+    assert tf["20"]["inputs"]["teacher"] == ["19", 0] and tf["19"]["inputs"]["unet_name"] == "raw"
+    assert tf["20"]["inputs"]["positive"] == ["4", 0] and tf["20"]["inputs"]["rollouts"] == 25
+    assert arms["F_turbo_ft_tf"]["18"]["inputs"]["band"] == 4.0
+    assert "18" not in arms["A_turbo"] and "18" not in arms["B_turbo_b1"]
+    args.teacher_model = None
+    with pytest.raises(ValueError, match="teacher-model"):
+        evaluate.graph(args, "G_raw", "prompt", 42, name="raw")
+
+    args.variants = evaluate.load_profiles(root.with_name("rediverse_production_profiles.json"))
+    args.planner_megapixels, args.composition_lock_sigma, args.sampler = 0.55, 0.60, "er_sde"
+    sham = evaluate.graph(args, "C_route_sham", "prompt", 7, name="sham")
+    assert sham["18"]["inputs"]["strength"] == 0.0 and sham["13"]["inputs"]["model"] == ["7", 0]
+    assert sham["8"]["class_type"] == "Krea2TurboFlowAlignedRegenerate"
+    assert all(cfg.get("spectrum") == "guarded" for cfg in args.variants.values())
+    args.variants = {"reference": {"method": "native", "schedule": "reference_turbo"}}
+    with pytest.raises(ValueError, match="Scale-Locked planner"):
+        evaluate.graph(args, "reference", "prompt", 1, name="reference")
+
+
+def test_rediverse_panels_record_effective_sampler_configuration(tmp_path, monkeypatch):
+    """The main recording path for SamplerCustom (reference) and planner graphs, with mocked rendering."""
+    import sys
+
+    rendered = []
+
+    def fake_render(args, workflow, seed, destination):
+        rendered.append(workflow)
+        destination.write_bytes(b"png")
+        return {"job_id": "x", "wall_seconds": 1.0, "execution_seconds": 1.0, "sampled_peak_device_mib": None,
+                "trace": None, "spectrum": [], "rediverse_calibration": []}
+
+    monkeypatch.setattr(evaluate, "render", fake_render)
+    root = Path(evaluate.__file__)
+    common = ["evaluate.py", "--model", "turbo", "--teacher-model", "raw", "--rediverse-adapter", "adapter", "--smoke"]
+    monkeypatch.setattr(sys, "argv", common + ["--profiles", str(root.with_name("rediverse_reference_profiles.json")),
+                                               "--out", str(tmp_path / "reference")])
+    evaluate.main()
+    records = [json.loads(line) for line in (tmp_path / "reference" / "runs.jsonl").read_text().splitlines()]
+    assert len(records) == 2 * 2 * 7
+    for record in records:
+        raw = record["method"] == "G_raw"
+        assert (record["steps"], record["cfg"]) == ((52, 4.5) if raw else (8, 1.0))
+        assert record["scheduler"] == ("reference_raw" if raw else "reference_turbo") and record["sampler"] == "euler"
+        assert record["checkpoint"] == ("raw" if raw else "turbo")
+    monkeypatch.setattr(sys, "argv", common + ["--profiles", str(root.with_name("rediverse_production_profiles.json")),
+                                               "--out", str(tmp_path / "production"), "--sampler", "er_sde",
+                                               "--steps", "13", "--width", "2048", "--height", "2048",
+                                               "--planner-megapixels", "1.0"])
+    evaluate.main()
+    records = [json.loads(line) for line in (tmp_path / "production" / "runs.jsonl").read_text().splitlines()]
+    assert len(records) == 2 * 2 * 5
+    assert all((r["steps"], r["sampler"], r["scheduler"]) == (13, "er_sde", "simple") for r in records)
+    assert all(r["planner_image"].endswith("_planner.png") for r in records)

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .rediverse_runtime import CAPTURE_KEY as REDIVERSE_CAPTURE
 from .objectives import (
     cell_areas,
     cell_size,
@@ -181,6 +182,7 @@ class Run:
     response: object = None
     guidance: object = None
     trajectory: object = None
+    rediverse: object = None
 
 
 @dataclass
@@ -378,6 +380,9 @@ def isolated_reference(run, *, sol_evaluations=None):
     token_session = current.set(None) if current is not None else None
     token_capture = capture.set(None) if capture is not None else None
     token_sol = None
+    from .rediverse_runtime import LIVE
+
+    token_live = LIVE.set(None)
     try:
         if sol is not None:
             # Use the same dense-warmup position and isolated mutable counters.
@@ -389,6 +394,7 @@ def isolated_reference(run, *, sol_evaluations=None):
             token_sol = sol._ACTIVE.set(aux)
         yield
     finally:
+        LIVE.reset(token_live)
         if token_sol is not None:
             sol._ACTIVE.reset(token_sol)
         if capture is not None:
@@ -435,7 +441,8 @@ def verify_patch_graph(options, settings, registered=None):
         for name in ("sampler_sample", "predict_noise", "calc_cond_batch", "apply_model", "diffusion_model"):
             for key, value in tree.get(name, {}).items():
                 if value and key != KEY and not (sol is not None and key == SOL_KEY and name == "diffusion_model") and not (key == "spectrum_krea2"
-                    and name in ("sampler_sample", "predict_noise", "diffusion_model")):
+                    and name in ("sampler_sample", "predict_noise", "diffusion_model")) and not (
+                        key == REDIVERSE_CAPTURE and name == "diffusion_model"):
                     raise RuntimeError(f"ModeExplorer needs the native {name} path except for verified Spectrum.")
     tr = options.get("transformer_options", {})
     if options.get("model_function_wrapper") or options.get("sampler_calc_cond_batch_function"):
@@ -773,6 +780,10 @@ def guidance_pending(model_options, sigma):
     run = model_options.get("transformer_options", {}).get(RUN)
     if type(run) is not Run or run.phase != "sample":
         return False
+    # Spectrum keeps every evaluation of a pending ReDiverse sigma actual and
+    # starts new forecast history at the adapted-to-native boundary.
+    if run.rediverse is not None and run.rediverse.pending(float(sigma)):
+        return True
     if run.guidance is not None:
         state = run.guidance
         return state.config.strength(state.ordinal, sigma) > 0
@@ -797,6 +808,15 @@ def diffusion_wrapper(executor, x, timesteps, context, attention_mask=None, ref_
                       transformer_options=None, **kwargs):
     options = transformer_options or {}
     run = options.get(RUN)
+    if run is not None and run.rediverse is not None and run.phase == "sample" and not run.rediverse.schedule.closed:
+        from .rediverse_runtime import evaluation_scope
+
+        with evaluation_scope(run, executor.class_obj, x, options):
+            return _diffusion(executor, x, timesteps, context, attention_mask, ref_latents, options, run, **kwargs)
+    return _diffusion(executor, x, timesteps, context, attention_mask, ref_latents, options, run, **kwargs)
+
+
+def _diffusion(executor, x, timesteps, context, attention_mask, ref_latents, options, run, **kwargs):
     arguments = (x, timesteps, context, attention_mask, ref_latents, options)
     if run is None:
         return executor(*arguments, **kwargs)
@@ -1040,10 +1060,11 @@ def optimize_noise(model_wrap, sigmas, options, noise, latent_image, run, evalua
 
 
 class SamplerWrapper:
-    def __init__(self, settings, response=None, guidance=None):
+    def __init__(self, settings, response=None, guidance=None, rediverse=None):
         self.settings = settings
         self.response = response
         self.guidance = guidance
+        self.rediverse = rediverse
 
     def __call__(self, executor, model_wrap, sigmas, extra_args, callback, noise,
                  latent_image=None, denoise_mask=None, disable_pbar=False):
@@ -1081,6 +1102,30 @@ class SamplerWrapper:
         seed = extra_args.get("seed")
         start = float(sigmas[0])
         batch = noise.shape[0]
+        rediverse = None
+        if self.rediverse is not None:
+            rediverse_reasons = set()
+            if not math.isclose(start, 1.0, abs_tol=1e-5):
+                rediverse_reasons.add("partial_denoise")
+            if denoise_mask is not None:
+                rediverse_reasons.add("latent_mask")
+            if spatial_image(noise) is None:
+                rediverse_reasons.add("unsupported_latent_shape")
+            if rediverse_reasons:
+                LOGGER.info("ModeExplorer ReDiverse bypassed %s (seed=%s)", ", ".join(sorted(rediverse_reasons)), seed)
+            else:
+                from .rediverse_runtime import start_run
+
+                if self.rediverse.steers and (any(
+                        group and ("reference_latents" in group[0] or "control" in group[0])
+                        for group in model_wrap.conds.values() if group is not None)
+                        or len(model_wrap.conds.get("positive") or ()) != 1
+                        or CONDITION_FLAGS.intersection(model_wrap.conds["positive"][0])):
+                    # Never return a silently untreated arm: FT alone is a different experiment.
+                    raise RuntimeError("ReDiverse steering needs exactly one plain positive text conditioning without "
+                                       "reference images, control, areas, masks or hooks. Disconnect the directions to run FT alone.")
+                positive = model_wrap.conds.get("positive") or [{}]
+                rediverse = start_run(self.rediverse, seed, batch, positive[0].get("cross_attn"), sigmas)
         active = settings.strength > 0 and (settings.feature != "native" or settings.initialization)
         reasons = set()
         if active or self.response is not None:
@@ -1134,14 +1179,25 @@ class SamplerWrapper:
                                         or model_options.get(STAGE) != "planner"
                                         or len(settings.ablation_route) != len(sigmas) - 1):
             raise RuntimeError("Temporal ablation requires CFG 1, native ER-SDE ending at zero, verified guarded Spectrum and two eligible reference calls.")
-        if not (feature_active or initialize or settings.diagnostics or settings.trajectory_label or self.response is not None):
+        if not (feature_active or initialize or settings.diagnostics or settings.trajectory_label
+                or self.response is not None or rediverse is not None):
             return sample()
 
         scale = getattr(sampling, "noise_scale", 1.0)
         if not math.isfinite(scale) or scale <= 0:
             raise RuntimeError("ModeExplorer requires a finite positive flow noise scale.")
         run = Run(settings, int(seed or 0), start, scale, batch, tuple(noise.shape), feature_active,
-                  spectrum=spectrum, sol=sol, reasons=reasons, stage=model_options.get(STAGE, "standalone"))
+                  spectrum=spectrum, sol=sol, reasons=reasons, stage=model_options.get(STAGE, "standalone"),
+                  rediverse=rediverse)
+        if rediverse is not None and spectrum is not None and spectrum[3] is None:
+            # Without the deferred-probe contract Spectrum cannot be told that the
+            # opening evaluations use another operator. Keep this pass all-actual.
+            from .response_runtime import spectrum_all_actual
+
+            forced = spectrum_all_actual(spectrum)
+            if forced is None:
+                raise RuntimeError("ModeExplorer ReDiverse needs Spectrum's ModeExplorer overlay or its all-native control.")
+            rediverse.reasons.add("spectrum_all_actual")
         sample_callback = callback
         if settings.trajectory_label:
             from .trajectory import Trajectory
@@ -1161,7 +1217,7 @@ class SamplerWrapper:
                 run.trajectory.step = int(step) + 1
                 if callback is not None:
                     return callback(step, denoised, noisy, total)
-        force_native = nullcontext()
+        force_native = forced if rediverse is not None and "spectrum_all_actual" in rediverse.reasons else nullcontext()
         response = self.response
         if response is not None:
             from .response_runtime import ResponseRun, spectrum_all_actual
@@ -1234,6 +1290,10 @@ class SamplerWrapper:
             return result
         finally:
             run.shadows.clear()
+            if rediverse is not None:
+                rediverse.release()
+                if rediverse.reasons - {"spectrum_all_actual"}:
+                    LOGGER.info("ModeExplorer ReDiverse: %s (seed=%s)", ", ".join(sorted(rediverse.reasons)), seed)
             trajectory = None
             if run.trajectory is not None:
                 try:
@@ -1242,7 +1302,8 @@ class SamplerWrapper:
                     trajectory = {"status": "failed", "reason": str(exc)}
                     if settings.ablation_route and completed:
                         run.trajectory.ablation.update(status="unqualified", reason="trajectory_write_failed")
-            if settings.diagnostics or run.response is not None or trajectory is not None:
+            if settings.diagnostics or run.response is not None or trajectory is not None or (
+                    rediverse is not None and rediverse.config.diagnostics):
                 payload = {
                     "seed": run.seed, "completed": completed, "batch": batch, "stage": run.stage,
                     "sham": settings.sham, "feature_direction": settings.feature_direction,
@@ -1258,6 +1319,8 @@ class SamplerWrapper:
                 }
                 if trajectory is not None:
                     payload["trajectory"] = trajectory
+                if rediverse is not None:
+                    payload["rediverse"] = rediverse.summary()
                 if settings.ablation_route:
                     payload["ablation"] = run.trajectory.ablation
                 if run.response is not None:

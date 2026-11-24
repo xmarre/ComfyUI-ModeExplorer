@@ -1,0 +1,85 @@
+{
+ "A_turbo": {
+  "method": "native",
+  "schedule": "reference_turbo"
+ },
+ "B_turbo_b1": {
+  "method": "cosine",
+  "schedule": "reference_turbo",
+  "settings": {
+   "mode": "Early Structural (B1)",
+   "strength": 0.03,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false
+  }
+ },
+ "C_turbo_ft": {
+  "method": "native",
+  "schedule": "reference_turbo",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  }
+ },
+ "D_turbo_ft_b1": {
+  "method": "cosine",
+  "schedule": "reference_turbo",
+  "settings": {
+   "mode": "Early Structural (B1)",
+   "strength": 0.03,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false
+  },
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  }
+ },
+ "E_turbo_tf": {
+  "method": "native",
+  "schedule": "reference_turbo",
+  "rediverse": {
+   "band": 2.0,
+   "calibrate": {
+    "teacher_model": "$teacher"
+   }
+  }
+ },
+ "F_turbo_ft_tf": {
+  "method": "native",
+  "schedule": "reference_turbo",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "band": 4.0,
+   "calibrate": {
+    "teacher_model": "$teacher"
+   }
+  }
+ },
+ "G_raw": {
+  "method": "native",
+  "schedule": "reference_raw",
+  "model": "$teacher",
+  "steps": 52,
+  "cfg": 4.5
+ }
+}
