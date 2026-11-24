@@ -16,6 +16,15 @@ STRUCTURAL_MODES = {
 MODES = ("Original", *STRUCTURAL_MODES, "Custom")
 
 
+def check_rediverse_settings(initialization, full_spectrum, ablation):
+    if initialization:
+        raise ValueError("ReDiverse cannot be combined with ModeExplorer initialization; use a separate MODEL branch.")
+    if full_spectrum:
+        raise ValueError("ReDiverse requires guarded Spectrum. Disable Full Spectrum on the ModeExplorer node.")
+    if ablation:
+        raise ValueError("Temporal ablation routes do not support ReDiverse.")
+
+
 def _remove_modeexplorer_wrappers(clone):
     from comfy.patcher_extension import WrappersMP
 
@@ -109,6 +118,8 @@ class ModeExplorer:
         response = next((wrapper.response for wrapper in samplers
                          if type(wrapper) is SamplerWrapper and wrapper.response is not None), None)
         guidance = next((wrapper.guidance for wrapper in samplers if type(wrapper) is SamplerWrapper), None)
+        rediverse = next((wrapper.rediverse for wrapper in samplers
+                          if type(wrapper) is SamplerWrapper and wrapper.rediverse is not None), None)
         attached = bool(samplers or model.get_wrappers(wrapper_types[1], KEY))
         active = enabled and (diagnostics or advanced.get("trajectory_label") or advanced.get("trajectory_roi")
                               or ablation or (strength != 0 and (feature != "native" or initialization)))
@@ -118,6 +129,8 @@ class ModeExplorer:
             return (model,)
         if not active and not attached:
             return (model,)
+        if rediverse is not None and active:
+            check_rediverse_settings(initialization and strength != 0, full_spectrum, ablation)
         settings = Settings(feature="native")
         if active:
             if "feature_grid" in advanced and isinstance(advanced["feature_grid"], str):
@@ -137,8 +150,8 @@ class ModeExplorer:
         clone = model.clone()
         if attached:
             _remove_modeexplorer_wrappers(clone)
-        if active or response is not None:
-            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response))
+        if active or response is not None or rediverse is not None:
+            clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, response, rediverse=rediverse))
             clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, KEY, diffusion_wrapper)
             clone.set_model_attn1_output_patch(attention_feature)
         return (clone,)
@@ -257,19 +270,20 @@ class ModeExplorerResponse:
                     if site_head >= blocks[site_block].attn.heads:
                         raise ValueError(f"Head {site_head} is outside native block {site_block}.")
             verify_patch_graph(model.model_options, Settings(feature="native"), model.wrappers)
+        rediverse = samplers[0].rediverse if samplers else None
         if not samplers:
             clone, = ModeExplorer().apply(model, feature="native", diagnostics=True)
             settings = Settings(feature="native", diagnostics=False)
         else:
             settings = samplers[0].settings
-            if not enabled and settings.feature == "native" and not (
+            if not enabled and settings.feature == "native" and rediverse is None and not (
                     settings.diagnostics or settings.initialization or settings.trajectory_label):
                 clone = model.clone()
                 _remove_modeexplorer_wrappers(clone)
                 return (clone,)
             clone = model.clone()
         clone.remove_wrappers_with_key(WrappersMP.SAMPLER_SAMPLE, KEY)
-        clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, config))
+        clone.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, KEY, SamplerWrapper(settings, config, rediverse=rediverse))
         return (clone,)
 
 
@@ -408,6 +422,8 @@ class ModeExplorerProjectionGuidance:
         if config is None and not attached:
             return (model,)
         if config is not None:
+            if any(getattr(wrapper, "rediverse", None) is not None for wrapper in samplers):
+                raise ValueError("Use separate MODEL branches for projection guidance and ReDiverse.")
             if samplers and not attached:
                 raise ValueError("Use a separate MODEL branch for projection guidance.")
             if has_spectrum(model.model_options, model.wrappers):
