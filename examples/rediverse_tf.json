@@ -1,0 +1,1076 @@
+{
+ "last_node_id": 19,
+ "last_link_id": 30,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "UNETLoader",
+   "pos": [
+    30,
+    30
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      6,
+      8,
+      10
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "UNETLoader"
+   },
+   "widgets_values": [
+    "krea2_turbo_fp8_scaled.safetensors",
+    "default"
+   ]
+  },
+  {
+   "id": 2,
+   "type": "CLIPLoader",
+   "pos": [
+    30,
+    200
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPLoader"
+   },
+   "widgets_values": [
+    "qwen3vl_4b_fp8_scaled.safetensors",
+    "krea2",
+    "default"
+   ]
+  },
+  {
+   "id": 3,
+   "type": "VAELoader",
+   "pos": [
+    30,
+    370
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": [
+      15,
+      22,
+      29
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAELoader"
+   },
+   "widgets_values": [
+    "qwen_image_vae.safetensors"
+   ]
+  },
+  {
+   "id": 4,
+   "type": "CLIPTextEncode",
+   "pos": [
+    370,
+    210
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 1
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      2,
+      4,
+      11,
+      18,
+      25
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPTextEncode"
+   },
+   "widgets_values": [
+    "A documentary photograph of someone waiting for a ferry on a misty morning."
+   ]
+  },
+  {
+   "id": 5,
+   "type": "ConditioningZeroOut",
+   "pos": [
+    370,
+    400
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": 2
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      12,
+      19,
+      26
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ConditioningZeroOut"
+   }
+  },
+  {
+   "id": 6,
+   "type": "EmptyLatentImage",
+   "pos": [
+    370,
+    520
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      5,
+      13,
+      20,
+      27
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "EmptyLatentImage"
+   },
+   "widgets_values": [
+    1024,
+    1024,
+    1
+   ]
+  },
+  {
+   "id": 7,
+   "type": "UNETLoader",
+   "pos": [
+    30,
+    520
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "UNETLoader"
+   },
+   "widgets_values": [
+    "krea2_raw_bf16.safetensors",
+    "default"
+   ]
+  },
+  {
+   "id": 8,
+   "type": "ModeExplorerReDiverseCalibrateKrea2",
+   "pos": [
+    370,
+    650
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "teacher",
+     "type": "MODEL",
+     "link": 3
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 4
+    },
+    {
+     "name": "latent",
+     "type": "LATENT",
+     "link": 5
+    },
+    {
+     "name": "negative",
+     "type": "CONDITIONING",
+     "link": null
+    },
+    {
+     "name": "sigmas",
+     "type": "SIGMAS",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "directions",
+     "type": "MODEEXPLORER_REDIVERSE_DIRECTIONS",
+     "links": [
+      7,
+      9
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "summary",
+     "type": "STRING",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ModeExplorerReDiverseCalibrateKrea2"
+   },
+   "widgets_values": [
+    26,
+    5,
+    52,
+    25,
+    8,
+    0,
+    "fixed",
+    5,
+    "",
+    1.0,
+    "auto",
+    8192
+   ]
+  },
+  {
+   "id": 9,
+   "type": "ModeExplorerReDiverseKrea2",
+   "pos": [
+    700,
+    30
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 6
+    },
+    {
+     "name": "directions",
+     "type": "MODEEXPLORER_REDIVERSE_DIRECTIONS",
+     "link": 7
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      17
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ModeExplorerReDiverseKrea2"
+   },
+   "widgets_values": [
+    true,
+    "none",
+    1.0,
+    2.0,
+    "first_evaluation",
+    1,
+    8,
+    0,
+    "random",
+    false
+   ]
+  },
+  {
+   "id": 10,
+   "type": "ModeExplorerReDiverseKrea2",
+   "pos": [
+    700,
+    250
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 8
+    },
+    {
+     "name": "directions",
+     "type": "MODEEXPLORER_REDIVERSE_DIRECTIONS",
+     "link": 9
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      24
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ModeExplorerReDiverseKrea2"
+   },
+   "widgets_values": [
+    true,
+    "krea-2-rediverse-comfy.safetensors",
+    1.0,
+    4.0,
+    "first_evaluation",
+    1,
+    8,
+    0,
+    "random",
+    false
+   ]
+  },
+  {
+   "id": 11,
+   "type": "KSampler",
+   "pos": [
+    1050,
+    30
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 10
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 11
+    },
+    {
+     "name": "negative",
+     "type": "CONDITIONING",
+     "link": 12
+    },
+    {
+     "name": "latent_image",
+     "type": "LATENT",
+     "link": 13
+    }
+   ],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      14
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "KSampler"
+   },
+   "widgets_values": [
+    12345,
+    "fixed",
+    8,
+    1.0,
+    "euler",
+    "simple",
+    1.0
+   ]
+  },
+  {
+   "id": 12,
+   "type": "VAEDecode",
+   "pos": [
+    1050,
+    330
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "samples",
+     "type": "LATENT",
+     "link": 14
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 15
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      16
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAEDecode"
+   }
+  },
+  {
+   "id": 13,
+   "type": "SaveImage",
+   "pos": [
+    1050,
+    450
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 16
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "SaveImage"
+   },
+   "widgets_values": [
+    "modeexplorer/rediverse_A_native"
+   ]
+  },
+  {
+   "id": 14,
+   "type": "KSampler",
+   "pos": [
+    1380,
+    30
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 13,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 17
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 18
+    },
+    {
+     "name": "negative",
+     "type": "CONDITIONING",
+     "link": 19
+    },
+    {
+     "name": "latent_image",
+     "type": "LATENT",
+     "link": 20
+    }
+   ],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      21
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "KSampler"
+   },
+   "widgets_values": [
+    12345,
+    "fixed",
+    8,
+    1.0,
+    "euler",
+    "simple",
+    1.0
+   ]
+  },
+  {
+   "id": 15,
+   "type": "VAEDecode",
+   "pos": [
+    1380,
+    330
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 14,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "samples",
+     "type": "LATENT",
+     "link": 21
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 22
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      23
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAEDecode"
+   }
+  },
+  {
+   "id": 16,
+   "type": "SaveImage",
+   "pos": [
+    1380,
+    450
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 15,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 23
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "SaveImage"
+   },
+   "widgets_values": [
+    "modeexplorer/rediverse_E_tf"
+   ]
+  },
+  {
+   "id": 17,
+   "type": "KSampler",
+   "pos": [
+    1710,
+    30
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 16,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 24
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 25
+    },
+    {
+     "name": "negative",
+     "type": "CONDITIONING",
+     "link": 26
+    },
+    {
+     "name": "latent_image",
+     "type": "LATENT",
+     "link": 27
+    }
+   ],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      28
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "KSampler"
+   },
+   "widgets_values": [
+    12345,
+    "fixed",
+    8,
+    1.0,
+    "euler",
+    "simple",
+    1.0
+   ]
+  },
+  {
+   "id": 18,
+   "type": "VAEDecode",
+   "pos": [
+    1710,
+    330
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 17,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "samples",
+     "type": "LATENT",
+     "link": 28
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 29
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      30
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAEDecode"
+   }
+  },
+  {
+   "id": 19,
+   "type": "SaveImage",
+   "pos": [
+    1710,
+    450
+   ],
+   "size": [
+    300,
+    120
+   ],
+   "flags": {},
+   "order": 18,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 30
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "SaveImage"
+   },
+   "widgets_values": [
+    "modeexplorer/rediverse_F_ft_tf"
+   ]
+  }
+ ],
+ "links": [
+  [
+   1,
+   2,
+   0,
+   4,
+   0,
+   "CLIP"
+  ],
+  [
+   2,
+   4,
+   0,
+   5,
+   0,
+   "CONDITIONING"
+  ],
+  [
+   3,
+   7,
+   0,
+   8,
+   0,
+   "MODEL"
+  ],
+  [
+   4,
+   4,
+   0,
+   8,
+   1,
+   "CONDITIONING"
+  ],
+  [
+   5,
+   6,
+   0,
+   8,
+   2,
+   "LATENT"
+  ],
+  [
+   6,
+   1,
+   0,
+   9,
+   0,
+   "MODEL"
+  ],
+  [
+   7,
+   8,
+   0,
+   9,
+   1,
+   "MODEEXPLORER_REDIVERSE_DIRECTIONS"
+  ],
+  [
+   8,
+   1,
+   0,
+   10,
+   0,
+   "MODEL"
+  ],
+  [
+   9,
+   8,
+   0,
+   10,
+   1,
+   "MODEEXPLORER_REDIVERSE_DIRECTIONS"
+  ],
+  [
+   10,
+   1,
+   0,
+   11,
+   0,
+   "MODEL"
+  ],
+  [
+   11,
+   4,
+   0,
+   11,
+   1,
+   "CONDITIONING"
+  ],
+  [
+   12,
+   5,
+   0,
+   11,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   13,
+   6,
+   0,
+   11,
+   3,
+   "LATENT"
+  ],
+  [
+   14,
+   11,
+   0,
+   12,
+   0,
+   "LATENT"
+  ],
+  [
+   15,
+   3,
+   0,
+   12,
+   1,
+   "VAE"
+  ],
+  [
+   16,
+   12,
+   0,
+   13,
+   0,
+   "IMAGE"
+  ],
+  [
+   17,
+   9,
+   0,
+   14,
+   0,
+   "MODEL"
+  ],
+  [
+   18,
+   4,
+   0,
+   14,
+   1,
+   "CONDITIONING"
+  ],
+  [
+   19,
+   5,
+   0,
+   14,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   20,
+   6,
+   0,
+   14,
+   3,
+   "LATENT"
+  ],
+  [
+   21,
+   14,
+   0,
+   15,
+   0,
+   "LATENT"
+  ],
+  [
+   22,
+   3,
+   0,
+   15,
+   1,
+   "VAE"
+  ],
+  [
+   23,
+   15,
+   0,
+   16,
+   0,
+   "IMAGE"
+  ],
+  [
+   24,
+   10,
+   0,
+   17,
+   0,
+   "MODEL"
+  ],
+  [
+   25,
+   4,
+   0,
+   17,
+   1,
+   "CONDITIONING"
+  ],
+  [
+   26,
+   5,
+   0,
+   17,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   27,
+   6,
+   0,
+   17,
+   3,
+   "LATENT"
+  ],
+  [
+   28,
+   17,
+   0,
+   18,
+   0,
+   "LATENT"
+  ],
+  [
+   29,
+   3,
+   0,
+   18,
+   1,
+   "VAE"
+  ],
+  [
+   30,
+   18,
+   0,
+   19,
+   0,
+   "IMAGE"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.6,
+   "offset": [
+    10,
+    20
+   ]
+  }
+ },
+ "version": 0.4
+}

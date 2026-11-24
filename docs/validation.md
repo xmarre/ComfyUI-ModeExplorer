@@ -25,6 +25,10 @@ Use `--server-log /path/to/comfy.log` to record INFO traces. Spectrum reports in
 
 For end-to-end Scale-Locked runs, specify a larger output size and `--planner-megapixels 1.0` with your preferred sampler. The panel records both planner and final decodes. Run analysis with `--stage planner` and `--stage final` independently to locate changes in anatomy, pose and identity.
 
+## ReDiverse panels
+
+The [ReDiverse guide](rediverse.md#evaluation) defines a reference panel (upstream-style Euler and reference schedules, arms A–G) and a production panel (ER-SDE, guarded Spectrum, Scale-Locked planner, arms A–D and a route-matched sham) with profiles in `tools/rediverse_reference_profiles.json` and `tools/rediverse_production_profiles.json`.
+
 ## Blinded review
 
 Use group IDs consistently within each prompt for composition, camera, pose and layout. Score adherence, quality and applicable identity from 1 to 5 and mark visible artifacts as 0 or 1. Leave inapplicable entries empty. Feed the completed CSV to `--ratings`. The report measures the fraction of unique groups and pairwise group differences across matched seeds, and bootstraps paired prompt-level differences. Review anatomy and identity at native size. Optional LPIPS and the built-in edge-layout metric respond to texture, crop and contrast, so report them alongside the semantic groups and fidelity scores.
