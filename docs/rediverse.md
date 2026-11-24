@@ -129,7 +129,7 @@ With Diagnostics on, the `temporal` record of the trace lists:
 - the reached and unreached slots, and the window's entry and exit σ;
 - for each slot: its index, σ, multiplier, effective strength, state (`adapter_active`, `zero_strength` or `steering_only`), calls, live and auxiliary forwards, and adapter module calls.
 
-A selected zero slot is not evidence that adapter arithmetic ran. That evidence is a nonzero `adapter_module_calls`, which equals 216 × (live + auxiliary forwards) for the released adapter.
+The top-level `adapted_evaluations` keeps its established meaning: admitted window evaluations with a live forward, zero-strength slots and the Strength 0 sham included. `temporal.adapter_active_evaluations` counts only those with a nonzero effective strength. A probe measures only the opening evaluation, so a probe through a ReDiverse node requires start evaluation 0 and records the probed effective strength. A selected zero slot is not evidence that adapter arithmetic ran. That evidence is a nonzero `adapter_module_calls`, which equals 216 × (live + auxiliary forwards) for the released adapter.
 
 The adapter is bypassed (the sampler runs natively and the reason is logged) for partial denoise (first σ not 1), latent masks, unsupported latent layouts and tagged Scale-Locked high-resolution stages. Projection guidance, multi-GPU and context-window dispatch keep ModeExplorer's existing rejections.
 

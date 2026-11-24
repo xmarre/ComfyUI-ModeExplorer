@@ -411,7 +411,8 @@ def evaluation_scope(run, dit, x, options):
         return
     strength = rd.config.strength * rd.config.multipliers[position]
     adapts = rd.config.adapter is not None and strength != 0
-    index = position + (rd.config.start if rd.config.schedule == "first_evaluation" else 0)
+    # first_interval admits several sigmas at position 0; diagnose each distinct sigma separately.
+    index = position + rd.config.start if rd.config.schedule == "first_evaluation" else len(rd.schedule.seen) - 1
     slot = rd.slots.get(index)
     if slot is None:
         slot = rd.slots[index] = {
@@ -963,6 +964,12 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
     attached = _attached_rediverse(model)
     if attached is not None and sigma != 1.0:
         raise ValueError("A probe through ReDiverse must start at sigma 1; other sigmas bypass the adapter.")
+    if attached is not None and attached.get("start_evaluation", 0) != 0:
+        raise ValueError("A probe runs only the opening evaluation; a ReDiverse window starting later would not be "
+                         "measured. Probe with start evaluation 0.")
+    if attached is not None and attached.get("planned_strengths"):
+        # The probe measures slot 0 only; record the strength it actually measures.
+        attached = {**attached, "probed_effective_strength": attached["planned_strengths"][0]}
     shape = _latent_shape(latent, model)
     grid = (math.ceil(shape[-2] / dit.patch), math.ceil(shape[-1] / dit.patch))
     width = dit.blocks[0].attn.wo.out_features

@@ -978,3 +978,38 @@ def test_temporal_lifecycle_has_no_stale_state(caplog, model, workspace):
     assert torch.equal(first, second)
     one, two = summaries(caplog)[-2:]
     assert one["temporal"] == two["temporal"] and [s["evaluation"] for s in one["temporal"]["slots"]] == [0, 1, 2, 3]
+
+
+def test_adapter_is_transferred_once_per_invocation_and_probes_reject_delayed_windows(model, workspace, monkeypatch):
+    patched = rediverse(model, adapted_sigmas=5, strength_profile="cosine_decay")
+    config = patched.get_wrappers("sampler_sample", KEY)[0].rediverse
+    adapter_tensors = {id(t) for modules in config.adapter.modules.values() for down, up, _ in modules.values()
+                       for t in (down, up)}
+    moved = []
+    original = torch.Tensor.to
+
+    def counting(self, *args, **kwargs):
+        if id(self) in adapter_tensors:
+            moved.append(id(self))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counting)
+    draw(patched)
+    monkeypatch.undo()
+    # Five slots, four of them nonzero: each A and B tensor reaches the device exactly once.
+    assert sorted(moved) == sorted(adapter_tensors)
+    p, _ = conditions()
+    with pytest.raises(ValueError, match="start evaluation 0"):
+        ModeExplorerActivationProbe().probe(rediverse(model, start_evaluation=1), p, {"samples": LATENT}, "1", 3, 0, 1.0, 3, "d")
+    report = _report(ModeExplorerActivationProbe().probe(rediverse(model, strength=.5, adapted_sigmas=3,
+                                                                   strength_profile="linear_increase"),
+                                                         p, {"samples": LATENT}, "1", 3, 0, 1.0, 3, "z")[0])
+    assert report["rediverse"]["probed_effective_strength"] == 0.0
+
+
+def test_first_interval_diagnoses_each_stage_sigma(caplog, model, workspace):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    draw(rediverse(model, schedule="first_interval", diagnostics=True), sampler="dpmpp_2s_ancestral")
+    slots = summaries(caplog)[-1]["temporal"]["slots"]
+    assert len(slots) >= 2 and len({s["sigma"] for s in slots}) == len(slots)
+    assert all(s["sigma"] > .93 and s["effective_strength"] == 1.0 for s in slots)
