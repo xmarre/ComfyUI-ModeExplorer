@@ -1,0 +1,89 @@
+{
+ "A_turbo": {
+  "method": "native",
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "B_turbo_b1": {
+  "method": "cosine",
+  "spectrum": "guarded",
+  "settings": {
+   "mode": "Early Structural (B1)",
+   "strength": 0.03,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false
+  },
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "C_turbo_ft": {
+  "method": "native",
+  "spectrum": "guarded",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  },
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "C_route_sham": {
+  "method": "native",
+  "spectrum": "guarded",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.0
+  },
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "D_turbo_ft_b1": {
+  "method": "cosine",
+  "spectrum": "guarded",
+  "settings": {
+   "mode": "Early Structural (B1)",
+   "strength": 0.03,
+   "fidelity": 0.7,
+   "min_sigma": 0.82,
+   "reference_budget": 2,
+   "feature_grid": "4",
+   "reference_source": "bank",
+   "reference_bank_size": 8,
+   "reference_trajectories": 1,
+   "reference_selection": "all",
+   "reference_continuation": "first_estimate",
+   "feature_update": "bounded",
+   "sham": false
+  },
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0
+  },
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ }
+}
