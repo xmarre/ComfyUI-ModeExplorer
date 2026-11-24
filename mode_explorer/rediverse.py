@@ -328,9 +328,14 @@ def patch_fingerprint(patcher):
 # ------------------------------------------------------------------ archives --
 REQUIRED_METADATA = (
     "schema", "implementation", "coordinate", "block", "token_grid", "d_model", "teacher_model_sha256",
-    "teacher_patches", "conditioning_sha256", "sigma_in", "sigma_out", "teacher_forward", "teacher_steps",
-    "guidance", "seeds", "rollouts", "normalization", "basis_dtype", "directions", "valid_directions",
+    "teacher_patches", "conditioning_sha256", "negative_conditioning_sha256", "sigma_in", "sigma_out",
+    "teacher_forward", "teacher_steps", "teacher_sigmas", "guidance", "seeds", "rollouts", "initial_noise_sha256",
+    "normalization", "basis_dtype", "directions", "valid_directions", "identity_sha256",
 )
+COORDINATE = "block_output_image_rows"
+# Tolerances for a bf16-stored basis: rounding perturbs each unit row by about 2^-9 relative.
+BASIS_TOLERANCE = 2e-2
+SPREAD_TOLERANCE = 1e-3
 
 
 @dataclass
@@ -420,12 +425,31 @@ def load_directions(path, max_bytes=MAX_ARCHIVE_BYTES):
     if not (torch.isfinite(U.float()).all() and torch.isfinite(s).all() and torch.isfinite(eigenvalues).all()
             and (mean is None or torch.isfinite(mean.float()).all())):
         raise ValueError("The direction archive holds nonfinite values.")
-    if (s < 0).any() or metadata["valid_directions"] < 1:
-        raise ValueError("The direction archive holds no usable directions.")
-    norms = U.float().norm(dim=1)
+    if metadata["coordinate"] != COORDINATE:
+        raise ValueError(f"Unsupported direction coordinate {metadata['coordinate']!r}; expected {COORDINATE}.")
     usable = s > 0
-    if usable.any() and not torch.allclose(norms[usable], torch.ones_like(norms[usable]), atol=2e-2):
-        raise ValueError("The direction archive basis is not unit-normalized.")
+    if (s < 0).any() or int(usable.sum()) < 1 or int(usable.sum()) != metadata["valid_directions"]:
+        raise ValueError("The direction archive holds no usable directions or disagrees with its valid count.")
+    rows = U.float()
+    norms = rows.norm(dim=1)
+    if bool(norms[~usable].any()):
+        raise ValueError("The direction archive holds nonzero basis rows without spread.")
+    valid = rows[usable]
+    gram = valid @ valid.T
+    if not torch.allclose(gram, torch.eye(len(valid)), atol=BASIS_TOLERANCE):
+        raise ValueError("The direction archive basis is not unit-normalized and mutually orthogonal.")
+    rollouts = metadata["rollouts"]
+    if (type(rollouts) is not int or eigenvalues.shape != (rollouts,) or len(metadata["seeds"]) != rollouts
+            or k > rollouts):
+        raise ValueError("The direction archive eigenvalues disagree with its rollout count.")
+    leading = float(eigenvalues.max()) if eigenvalues.numel() else 0.0
+    if leading <= 0 or bool((eigenvalues[:-1] < eigenvalues[1:] - 1e-6 * leading).any()) \
+            or bool((eigenvalues < -1e-6 * leading).any()):
+        raise ValueError("The direction archive eigenvalues are not a nonnegative descending spectrum.")
+    implied = (eigenvalues[:k].double().clamp_min(0) / rollouts).sqrt()
+    spreads = s.double()
+    if not torch.allclose(spreads[usable], implied[usable], rtol=SPREAD_TOLERANCE, atol=1e-12):
+        raise ValueError("The direction archive spreads disagree with sqrt(eigenvalue / rollouts).")
     return Directions(path, U, s.float(), eigenvalues.float(), mean, metadata, digest)
 
 

@@ -244,3 +244,39 @@ def test_rediverse_panels_build_matched_graphs():
     args.variants = {"reference": {"method": "native", "schedule": "reference_turbo"}}
     with pytest.raises(ValueError, match="Scale-Locked planner"):
         evaluate.graph(args, "reference", "prompt", 1, name="reference")
+
+
+def test_rediverse_panels_record_effective_sampler_configuration(tmp_path, monkeypatch):
+    """The main recording path for SamplerCustom (reference) and planner graphs, with mocked rendering."""
+    import sys
+
+    rendered = []
+
+    def fake_render(args, workflow, seed, destination):
+        rendered.append(workflow)
+        destination.write_bytes(b"png")
+        return {"job_id": "x", "wall_seconds": 1.0, "execution_seconds": 1.0, "sampled_peak_device_mib": None,
+                "trace": None, "spectrum": [], "rediverse_calibration": []}
+
+    monkeypatch.setattr(evaluate, "render", fake_render)
+    root = Path(evaluate.__file__)
+    common = ["evaluate.py", "--model", "turbo", "--teacher-model", "raw", "--rediverse-adapter", "adapter", "--smoke"]
+    monkeypatch.setattr(sys, "argv", common + ["--profiles", str(root.with_name("rediverse_reference_profiles.json")),
+                                               "--out", str(tmp_path / "reference")])
+    evaluate.main()
+    records = [json.loads(line) for line in (tmp_path / "reference" / "runs.jsonl").read_text().splitlines()]
+    assert len(records) == 2 * 2 * 7
+    for record in records:
+        raw = record["method"] == "G_raw"
+        assert (record["steps"], record["cfg"]) == ((52, 4.5) if raw else (8, 1.0))
+        assert record["scheduler"] == ("reference_raw" if raw else "reference_turbo") and record["sampler"] == "euler"
+        assert record["checkpoint"] == ("raw" if raw else "turbo")
+    monkeypatch.setattr(sys, "argv", common + ["--profiles", str(root.with_name("rediverse_production_profiles.json")),
+                                               "--out", str(tmp_path / "production"), "--sampler", "er_sde",
+                                               "--steps", "13", "--width", "2048", "--height", "2048",
+                                               "--planner-megapixels", "1.0"])
+    evaluate.main()
+    records = [json.loads(line) for line in (tmp_path / "production" / "runs.jsonl").read_text().splitlines()]
+    assert len(records) == 2 * 2 * 5
+    assert all((r["steps"], r["sampler"], r["scheduler"]) == (13, "er_sde", "simple") for r in records)
+    assert all(r["planner_image"].endswith("_planner.png") for r in records)

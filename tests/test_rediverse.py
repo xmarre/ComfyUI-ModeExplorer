@@ -228,7 +228,8 @@ def _archive(tmp_path, **overrides):
         "token_grid": grid, "d_model": width, "teacher_model_sha256": "t", "teacher_patches": {},
         "conditioning_sha256": "c", "sigma_in": 1.0, "sigma_out": .9, "teacher_forward": 1, "teacher_steps": 2,
         "guidance": {"cfg": 1.0}, "seeds": [1, 2, 3, 4], "rollouts": 4, "normalization": "N",
-        "basis_dtype": "float32", "directions": k, "valid_directions": k,
+        "basis_dtype": "float32", "directions": k, "valid_directions": k, "negative_conditioning_sha256": None,
+        "teacher_sigmas": [1.0, .9, 0.0], "initial_noise_sha256": "n", "identity_sha256": "i",
     }
     metadata.update(overrides.pop("metadata", {}))
     tensors = dict(U=U, s=torch.tensor([3., 2., 1.]), eigenvalues=torch.tensor([36., 16., 4., 0.]))
@@ -236,6 +237,13 @@ def _archive(tmp_path, **overrides):
     path = str(tmp_path / "d.safetensors")
     save_directions(path, tensors["U"], tensors["s"], tensors["eigenvalues"], metadata)
     return path
+
+
+def _nonorthogonal():
+    g = torch.Generator().manual_seed(1)
+    U = torch.linalg.qr(torch.randn(24, 3, generator=g))[0].T.contiguous()
+    U[1] = (U[0] + U[1]) / (U[0] + U[1]).norm()  # unit rows, not orthogonal
+    return U
 
 
 def test_direction_archive_round_trip_and_rejections(tmp_path):
@@ -252,6 +260,15 @@ def test_direction_archive_round_trip_and_rejections(tmp_path):
         ({"s": torch.tensor([math.inf, 1., 1.])}, "nonfinite"),
         ({"U": torch.ones(3, 24)}, "unit"),
         ({"s": torch.tensor([-1., 1., 1.])}, "usable"),
+        # Semantic validation beyond shapes.
+        ({"metadata": {"coordinate": "attention_output"}}, "coordinate"),
+        ({"metadata": {"valid_directions": 2}}, "valid count"),
+        ({"s": torch.zeros(3), "U": torch.zeros(3, 24)}, "usable"),
+        ({"s": torch.tensor([3., 2., 0.]), "metadata": {"valid_directions": 2}}, "without spread"),
+        ({"U": _nonorthogonal()}, "orthogonal"),
+        ({"s": torch.tensor([3., 2., 1.5])}, "sqrt"),
+        ({"eigenvalues": torch.tensor([16., 36., 4., 0.]), "s": torch.tensor([2., 3., 1.])}, "descending"),
+        ({"eigenvalues": torch.tensor([36., 16., 4.])}, "rollout"),
     ):
         path = _archive(tmp_path, **overrides)
         with pytest.raises(ValueError, match=message):

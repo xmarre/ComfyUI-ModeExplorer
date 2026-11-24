@@ -199,6 +199,21 @@ def graph(args, method, prompt, seed, *, name):
     return g
 
 
+def sampler_config(workflow):
+    """Effective sampling configuration of a graph from ``graph``, for KSampler and SamplerCustom."""
+    node = workflow["8"]
+    inputs = node["inputs"]
+    if node["class_type"] == "SamplerCustom":
+        schedule = workflow[inputs["sigmas"][0]]["inputs"]
+        return {"steps": schedule["steps"], "cfg": inputs["cfg"],
+                "sampler": workflow[inputs["sampler"][0]]["inputs"]["sampler_name"],
+                "scheduler": f"reference_{schedule['model']}"}
+    if node["class_type"] in ("KSampler", "Krea2TurboFlowAlignedRegenerate"):
+        return {"steps": inputs["steps"], "cfg": inputs["cfg"], "sampler": inputs["sampler_name"],
+                "scheduler": inputs["scheduler"]}
+    raise ValueError(f"Unknown sampler node {node['class_type']!r}.")
+
+
 def request(base, endpoint, payload=None):
     data = None if payload is None else json.dumps(payload).encode()
     req = Request(base.rstrip("/") + endpoint, data=data, headers={"Content-Type": "application/json"} if data else {})
@@ -429,7 +444,7 @@ def main():
                         image=relative.as_posix(),
                         checkpoint=workflow["1"]["inputs"]["unet_name"],
                         weight_dtype=workflow["1"]["inputs"]["weight_dtype"],
-                        steps=workflow["8"]["inputs"]["steps"], cfg=workflow["8"]["inputs"]["cfg"],
+                        **sampler_config(workflow),
                     )
                     if args.planner_megapixels is not None:
                         result["planner_image"] = relative.with_name(relative.stem + "_planner.png").as_posix()

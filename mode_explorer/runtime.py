@@ -1111,17 +1111,19 @@ class SamplerWrapper:
                 rediverse_reasons.add("latent_mask")
             if spatial_image(noise) is None:
                 rediverse_reasons.add("unsupported_latent_shape")
-            if self.rediverse.steers and (any(
-                    group and ("reference_latents" in group[0] or "control" in group[0])
-                    for group in model_wrap.conds.values() if group is not None)
-                    or len(model_wrap.conds.get("positive") or ()) != 1
-                    or CONDITION_FLAGS.intersection(model_wrap.conds["positive"][0])):
-                rediverse_reasons.add("tf_unsupported_conditioning")
             if rediverse_reasons:
                 LOGGER.info("ModeExplorer ReDiverse bypassed %s (seed=%s)", ", ".join(sorted(rediverse_reasons)), seed)
             else:
                 from .rediverse_runtime import start_run
 
+                if self.rediverse.steers and (any(
+                        group and ("reference_latents" in group[0] or "control" in group[0])
+                        for group in model_wrap.conds.values() if group is not None)
+                        or len(model_wrap.conds.get("positive") or ()) != 1
+                        or CONDITION_FLAGS.intersection(model_wrap.conds["positive"][0])):
+                    # Never return a silently untreated arm: FT alone is a different experiment.
+                    raise RuntimeError("ReDiverse steering needs exactly one plain positive text conditioning without "
+                                       "reference images, control, areas, masks or hooks. Disconnect the directions to run FT alone.")
                 positive = model_wrap.conds.get("positive") or [{}]
                 rediverse = start_run(self.rediverse, seed, batch, positive[0].get("cross_attn"), sigmas)
         active = settings.strength > 0 and (settings.feature != "native" or settings.initialization)

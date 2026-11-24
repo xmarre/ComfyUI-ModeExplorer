@@ -7,6 +7,7 @@ evidence of image quality or diversity on real checkpoints.
 import copy
 import json
 import logging
+import math
 import os
 
 import pytest
@@ -288,7 +289,10 @@ def test_calibration_archive_provenance_and_teacher_isolation(model, calibrated)
         model, p, {"samples": torch.zeros(1, 4, 8, 12)}, block=2, teacher_forward=2, teacher_steps=6, rollouts=6,
         directions=4, seed=3, batch=4, label="tiny")
     assert torch.equal(again.U, directions.U) and again.metadata["latent_shape"] == [16, 1, 8, 12]
-    assert json.loads(text)["path"] == summary["path"]  # identical calibration identity, one archive
+    # Identical calibration identity; the repeat is preserved next to the first archive.
+    assert again.metadata["identity_sha256"] == meta["identity_sha256"]
+    assert json.loads(text)["path"] == summary["path"].replace(".safetensors", "-r2.safetensors")
+    assert os.path.isfile(summary["path"])
     other, text = ModeExplorerReDiverseCalibrate().calibrate(
         model, p, {"samples": LATENT}, block=2, teacher_forward=2, teacher_steps=6, rollouts=6, directions=4,
         seed=4, batch=4, label="tiny")
@@ -298,9 +302,43 @@ def test_calibration_archive_provenance_and_teacher_isolation(model, calibrated)
     assert no_hooks(model)
     assert all(torch.equal(v, state[k]) for k, v in model.model.state_dict().items())
     loaded, text = ModeExplorerReDiverseDirections().load(os.path.basename(summary["path"]))
-    assert json.loads(text)["sha256"] == again.sha256 and torch.equal(loaded.U, directions.U)
+    assert json.loads(text)["sha256"] == directions.sha256 and torch.equal(loaded.U, directions.U)
     with pytest.raises(ValueError):
         ModeExplorerReDiverseDirections().load("../escape.safetensors")
+
+
+def test_calibration_records_the_complete_teacher_trajectory(model, workspace, calibrated):
+    from mode_explorer.rediverse import reference_sigmas
+
+    directions, summary = calibrated
+    meta = directions.metadata
+    assert set(summary["timings"]) == {"rollout_seconds", "pca_seconds", "write_and_validate_seconds", "total_seconds"}
+    assert summary["timings"]["total_seconds"] >= summary["timings"]["rollout_seconds"] + summary["timings"]["pca_seconds"]
+    assert meta["teacher_sigmas"] == pytest.approx(reference_sigmas(6, 24))
+    assert meta["executed_sigmas"] == pytest.approx(reference_sigmas(6, 24)[:3])
+    assert meta["negative_conditioning_sha256"] is None and meta["initial_noise_sha256"] and meta["capture_input_sha256"]
+    assert "not a full checkpoint hash" in meta["teacher_model_fingerprint"]
+    assert set(meta["timings"]) == {"rollout_seconds", "pca_seconds"}
+    p, n = conditions()
+    node = ModeExplorerReDiverseCalibrate()
+    common = dict(block=2, teacher_forward=2, teacher_steps=6, rollouts=6, directions=4, seed=3, batch=4, label="tiny")
+    # Same capture sigmas reached through another preceding schedule: a distinct archive identity.
+    other = torch.tensor(reference_sigmas(6, 24))
+    other[1] = (other[0] + other[1]) / 2
+    shifted, _ = node.calibrate(model, p, {"samples": LATENT}, sigmas=other, **common)
+    assert shifted.metadata["identity_sha256"] != meta["identity_sha256"]
+    for bad in (torch.tensor([1.0, .95, .97, .5]), torch.tensor([1.0, math.nan, .5, .1]),
+                torch.tensor([.9, .8, .7, .1]), torch.tensor([1.0, .9])):
+        with pytest.raises(ValueError, match="Connected teacher sigmas"):
+            node.calibrate(model, p, {"samples": LATENT}, sigmas=bad, **common)
+    with pytest.raises(ValueError, match="needs a negative"):
+        node.calibrate(model, p, {"samples": LATENT}, cfg=2.0, **common)
+    guided, _ = node.calibrate(model, p, {"samples": LATENT}, negative=n, cfg=2.0, **common)
+    other_negative, _ = node.calibrate(model, p, {"samples": LATENT}, negative=[[n[0][0] + 1, {}]], cfg=2.0, **common)
+    assert guided.metadata["guidance"] == {"cfg": 2.0, "branches": "guided"}
+    assert guided.metadata["negative_conditioning_sha256"] != other_negative.metadata["negative_conditioning_sha256"]
+    assert guided.metadata["identity_sha256"] != other_negative.metadata["identity_sha256"]
+    assert no_hooks(model)
 
 
 def test_calibration_capture_matches_manual_rollout(model, calibrated):
@@ -403,54 +441,119 @@ def test_tf_adds_no_dit_forwards_and_combines_with_ft(caplog, model, workspace, 
     assert trace["rediverse"]["adapter_module_calls"] == 2 * len(COMFY_MODULES)
 
 
-def test_cohort_logdet_is_bounded_and_falls_back_for_single_images(caplog, model, workspace, calibrated):
-    from mode_explorer.rediverse_runtime import cohort_coefficients
+def test_cohort_logdet_and_its_norm_matched_control(caplog, model, workspace, calibrated):
+    from mode_explorer.rediverse_runtime import activation_norm, cohort_coefficients, expected_random_norm
 
     caplog.set_level(logging.INFO, logger="ModeExplorer")
     directions, _ = calibrated
-    experimental, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0, steering="cohort_logdet",
-                                                  diagnostics=True)
-    draw(experimental, latent=torch.zeros(3, 16, 1, 8, 12), batch=3)
-    summary = summaries(caplog)[-1]
-    alpha = torch.tensor(summary["coefficients"])
-    assert alpha.shape == (3, 4) and alpha.abs().max() <= 2.0 + 1e-6
-    assert summary["config"]["experimental"]
-    draw(experimental, latent=LATENT)
-    assert "tf_cohort_requires_batch_random_fallback" in summaries(caplog)[-1]["reasons"]
-    hidden = torch.zeros(2, 24, 64)
-    assert cohort_coefficients(hidden, directions.U.float(), directions.s, 2.0) is None
+    s = directions.s[:4]
+    target = expected_random_norm(s, 2.0)
+    batch = torch.zeros(3, 16, 1, 8, 12)
+    norms = {}
+    for mode in ("random", "random_norm_matched", "cohort_logdet"):
+        patched, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0, steering=mode, diagnostics=True)
+        draw(patched, latent=batch, batch=3)
+        summary = summaries(caplog)[-1]
+        alpha = torch.tensor(summary["coefficients"])
+        norms[mode] = torch.tensor(summary["tf_offset_norms"])
+        assert torch.allclose(norms[mode], activation_norm(alpha, s).float(), rtol=1e-5)
+        assert summary["config"]["experimental"] == (mode != "random")
+    # Activation-space norms sqrt(sum_k s_k^2 alpha_k^2), not coefficient norms, are matched exactly.
+    assert torch.allclose(norms["cohort_logdet"], torch.full((3,), target), rtol=1e-5)
+    assert torch.allclose(norms["random_norm_matched"], norms["cohort_logdet"], rtol=1e-5)
+    assert not torch.allclose(norms["random"], norms["cohort_logdet"], rtol=1e-3)
+    # The uniform draw's RMS activation norm is the matched target.
+    from mode_explorer.rediverse import coefficients
+
+    draws = coefficients(5, 4000, 4, 2.0)
+    assert float(activation_norm(draws, s).square().mean().sqrt()) == pytest.approx(target, rel=0.03)
+    # No silent arm changes: single images and degenerate cohorts are errors.
+    patched, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0, steering="cohort_logdet")
+    with pytest.raises(RuntimeError, match="batch of 2 to 8"):
+        draw(patched, latent=LATENT)
+    assert cohort_coefficients(torch.zeros(2, 24, 64), directions.U.float(), directions.s, 2.0) is None
+    assert no_hooks(model)
 
 
-def test_probe_reports_spectra_and_reference_comparison(model, workspace, calibrated):
+def _report(text):
+    with open(json.loads(text)["path"]) as handle:
+        return json.load(handle)
+
+
+def test_probe_reports_spectra_and_qualified_reference_comparison(model, workspace, calibrated):
     directions, _ = calibrated
     p, _ = conditions()
-    text, = ModeExplorerActivationProbe().probe(model, p, {"samples": LATENT}, "0-2", 8, 0, 1.0, 3, "student",
-                                                reference=directions, workspace="cpu", workspace_mib=1)
-    summary = json.loads(text)
-    with open(summary["path"]) as handle:
-        report = json.load(handle)
+    probe = ModeExplorerActivationProbe().probe
+    report = _report(probe(model, p, {"samples": LATENT}, "0-2", 8, 0, 1.0, 3, "student",
+                           reference=directions, workspace="cpu", workspace_mib=1)[0])
     assert set(report["blocks"]) == {"block00", "block01", "block02"}
     entry = report["blocks"]["block02"]
     assert 0 < entry["pr"] <= 7 and entry["conc"] == pytest.approx(entry["tv"] / entry["pr"])
     ref = entry["reference"]
-    assert ref["coordinate_match"] == "native_trajectory_states" and len(ref["retained_variance_ratio"]) == 4
-    assert 0 <= ref["subspace_alignment"] <= 1 + 1e-9
+    # Same prompt, but the archive is teacher forward 2 from other noise: an independent population.
+    assert ref["comparison"] == report["reference_comparison"] == "same_conditioning_independent_samples"
+    assert len(ref["retained_variance_ratio"]) == 4 and 0 <= ref["subspace_alignment"] <= 1 + 1e-9
     assert "mean_displacement_rms" in ref
-    teacher_text, = ModeExplorerActivationProbe().probe(model, p, {"samples": LATENT}, "2", 8, 0, 1.0, 4, "teacher")
-    teacher = json.loads(teacher_text)
-    compared, = ModeExplorerActivationProbe().probe(model, p, {"samples": LATENT}, "2", 8, 0, 1.0, 8, "again",
-                                                    compare_with=os.path.basename(teacher["path"]))
-    ratios = json.loads(compared)["comparison"]
+    other = [[p[0][0] * -1, {}]]
+    crossed = _report(probe(model, other, {"samples": LATENT}, "2", 8, 0, 1.0, 8, "crossed", reference=directions)[0])
+    assert crossed["reference_comparison"] == "cross_conditioning_exploratory"
     large = {"samples": torch.zeros(1, 16, 1, 40, 40)}
-    grouped, = ModeExplorerActivationProbe().probe(model, p, large, "0-2", 8, 0, 1.0, 8, "grouped",
-                                                   workspace="cpu", workspace_mib=1)
-    with open(json.loads(grouped)["path"]) as handle:
-        grouped_report = json.load(handle)
-    # 409,600 staged bytes per block: a 1 MiB workspace holds two blocks per forward group.
-    assert grouped_report["groups"] == [[0, 1], [2]] and len(grouped_report["blocks"]) == 3
-    # Same model, inputs and batch-independent capture: ratios are exactly one.
-    assert ratios["matched_inputs"] and ratios["blocks"]["block02"]["pr_ratio"] == pytest.approx(1.0, rel=1e-6)
+    grouped = _report(probe(model, p, large, "0-2", 8, 0, 1.0, 8, "grouped", workspace="cpu", workspace_mib=4)[0])
+    # 409,600 staged bytes per block beside 3,379,200 bytes of float64 Gram chunks and the mean:
+    # a 4 MiB workspace holds one staged block per forward group.
+    from mode_explorer.rediverse_runtime import research_workspace_bytes
+
+    assert research_workspace_bytes(8, 400 * 64, 0, 0) == 3_379_200
+    assert grouped["groups"] == [[0], [1], [2]] and len(grouped["blocks"]) == 3
+    with pytest.raises(ValueError, match="research workspace"):
+        probe(model, p, large, "0", 8, 0, 1.0, 8, "small", workspace="cpu", workspace_mib=1)
     assert no_hooks(model)
+
+
+def test_probe_pairs_are_qualified_by_input_evidence(model, workspace):
+    from mode_explorer.rediverse_runtime import compare_probes
+
+    p, _ = conditions()
+    probe = ModeExplorerActivationProbe().probe
+    teacher = _report(probe(model, p, {"samples": LATENT}, "2", 8, 0, 1.0, 4, "teacher")[0])
+    # Another batch size executes the same inputs: an exact matched state, ratios exactly one.
+    same = _report(probe(model, p, {"samples": LATENT}, "2", 8, 0, 1.0, 8, "student")[0])
+    assert same["capture_input_sha256"] == teacher["capture_input_sha256"]
+    paired = compare_probes(teacher, same)
+    assert paired["comparison"] == "exact_matched_noisy_state" and paired["matched_inputs"]
+    assert paired["blocks"]["block02"]["pr_ratio"] == pytest.approx(1.0, rel=1e-6)
+    # Equal sigma, samples, prompt and grid but other seeds: never a matched state.
+    reseeded = _report(probe(model, p, {"samples": LATENT}, "2", 8, 1, 1.0, 8, "student")[0])
+    unmatched = compare_probes(teacher, reseeded)
+    assert unmatched["comparison"] == "same_conditioning_independent_samples" and not unmatched["matched_inputs"]
+    assert compare_probes(teacher, {**same, "conditioning_sha256": "x"})["comparison"] == "cross_conditioning_exploratory"
+    assert compare_probes(teacher, {**same, "capture_input_sha256": "y"})["comparison"] == \
+        "matched_noise_state_representation_differs"
+    assert compare_probes(teacher, {**same, "token_grid": [2, 3]})["comparison"] == "incompatible_geometry"
+
+
+def test_probe_archives_have_complete_identities_and_are_never_replaced(model, workspace, calibrated):
+    directions, _ = calibrated
+    p, _ = conditions()
+    probe = ModeExplorerActivationProbe().probe
+    base = ("2", 8, 0, 1.0, 4, "id")
+    first = json.loads(probe(model, p, {"samples": LATENT}, *base)[0])["path"]
+    variants = {
+        "seed": ("2", 8, 1, 1.0, 4, "id"), "blocks": ("1-2", 8, 0, 1.0, 4, "id"), "batch": ("2", 8, 0, 1.0, 8, "id"),
+    }
+    paths = {first}
+    for name, args in variants.items():
+        path = json.loads(probe(model, p, {"samples": LATENT}, *args)[0])["path"]
+        assert path not in paths, name
+        paths.add(path)
+    referenced = json.loads(probe(model, p, {"samples": LATENT}, *base, reference=directions)[0])["path"]
+    guided = json.loads(probe(ModeExplorer().apply(model, mode="Early Structural (B1)", strength=.03)[0],
+                              p, {"samples": LATENT}, *base)[0])["path"]
+    repeated = json.loads(probe(model, p, {"samples": LATENT}, *base)[0])["path"]
+    assert len({*paths, referenced, guided, repeated}) == len(paths) + 3
+    assert repeated == first.replace(".json", "-r2.json") and os.path.isfile(first)
+    with pytest.raises(ValueError, match="sigma 1"):
+        probe(rediverse(model), p, {"samples": LATENT}, "2", 8, 0, 0.9, 4, "adapted")
 
 
 def test_reference_turbo_schedule_equals_native_simple_scheduler(model):
@@ -496,20 +599,98 @@ def test_adapter_requires_module_calls_and_restores_force_forward(model, workspa
     assert torch.equal(draw(rediverse(model, strength=0.0)), draw(model))
 
 
-def test_tf_rejects_multiple_positive_conditionings(caplog, model, workspace, calibrated):
+def test_tf_rejects_multiple_positive_conditionings(model, workspace, calibrated):
     directions, _ = calibrated
-    steered, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0)
+    steered = rediverse(model, directions=directions, band=2.0)
     p, n = conditions()
     guider = comfy.samplers.CFGGuider(steered)
     guider.set_conds(p + [[p[0][0] * 2, {}]], n)
     guider.set_cfg(1.0)
-    caplog.set_level(logging.INFO, logger="ModeExplorer")
-    with torch.inference_mode():
-        guider.sample(comfy.sample.prepare_noise(LATENT, 1), LATENT, comfy.samplers.ksampler("euler"), SIGMAS,
-                      disable_pbar=True, seed=1)
-    assert any("tf_unsupported_conditioning" in r.message for r in caplog.records)
+    # A combined FT+TF arm never degrades silently into FT alone or the native model.
+    with pytest.raises(RuntimeError, match="exactly one plain positive"):
+        with torch.inference_mode():
+            guider.sample(comfy.sample.prepare_noise(LATENT, 1), LATENT, comfy.samplers.ksampler("euler"), SIGMAS,
+                          disable_pbar=True, seed=1)
+    assert no_hooks(model)
     with pytest.raises(ValueError, match="exactly one positive"):
         ModeExplorerReDiverseCalibrate().calibrate(model, p + p, {"samples": LATENT}, 2, 2, 6, 6, 4, 3, 4, "")
     # The teacher must be the plain model.
     with pytest.raises(ValueError, match="plain teacher"):
         ModeExplorerReDiverseCalibrate().calibrate(rediverse(model), p, {"samples": LATENT}, 2, 2, 6, 6, 4, 3, 4, "")
+    from mode_explorer.rediverse_runtime import start_run
+
+    with pytest.raises(RuntimeError, match="integer noise seed"):
+        start_run(steered.get_wrappers("sampler_sample", KEY)[0].rediverse, None, 1, None, SIGMAS)
+
+
+def test_actual_forward_with_no_adapter_execution_fails(model, workspace, monkeypatch):
+    """Every hooked module bypassed (e.g. a fused path) on an actual forward: an error, not a forecast."""
+    import mode_explorer.rediverse_runtime as runtime
+
+    detached = {}
+
+    def unexecuted(block, name):
+        layer = resolve_module(block, name)
+        key = (id(block), name)
+        if key not in detached:
+            detached[key] = torch.nn.Linear(layer.in_features, layer.out_features, bias=False)
+        return detached[key]
+
+    monkeypatch.setattr(runtime, "resolve_module", unexecuted)
+    with pytest.raises(RuntimeError, match="not executed through their module call"):
+        draw(rediverse(model))
+    assert no_hooks(model)
+
+
+def test_live_omission_is_not_masked_by_auxiliary_forwards(model, workspace, monkeypatch):
+    """A reference forward that runs the adapter cannot certify a live forward that skipped it."""
+    import torch.nn.functional as F
+
+    from mode_explorer.rediverse_runtime import LIVE
+
+    mlp = model.get_model_object("diffusion_model").blocks[0].mlp
+    native = type(mlp).forward
+
+    def live_only_fused(x):
+        if LIVE.get() is not None:
+            return F.linear(F.silu(mlp.gate(x)) * mlp.up(x), mlp.down.weight)
+        return native(mlp, x)
+
+    monkeypatch.setattr(mlp, "forward", live_only_fused)
+    combined, = ModeExplorer().apply(rediverse(model), mode="Early Structural (B1)", strength=.03, fidelity=.7)
+    with pytest.raises(RuntimeError, match="0.mlp.down"):
+        draw(combined)
+    assert no_hooks(model)
+
+
+def test_overlapping_scopes_are_refused_and_hooks_respect_ownership(caplog, model, workspace):
+    import contextvars
+
+    import mode_explorer.rediverse_runtime as runtime
+
+    dit = model.get_model_object("diffusion_model")
+    runtime._ACTIVE[id(dit)] = object()
+    try:
+        with pytest.raises(RuntimeError, match="Overlapping execution"):
+            draw(rediverse(model))
+    finally:
+        runtime._ACTIVE.pop(id(dit), None)
+    assert no_hooks(model)
+    layer = dit.blocks[0].attn.wq
+    probe_input = torch.randn(1, 3, layer.in_features)
+    seen = {}
+
+    def during(module, args):
+        # First forward only: the adapted one. A foreign execution context sees the native layer.
+        if not seen:
+            seen["foreign"] = contextvars.Context().run(layer, probe_input)
+            seen["owner"] = layer(probe_input)
+
+    handle = dit.blocks[1].register_forward_pre_hook(during)
+    try:
+        draw(rediverse(model))
+    finally:
+        handle.remove()
+    native = torch.nn.functional.linear(probe_input, layer.weight, layer.bias)
+    assert torch.equal(seen["foreign"], native) and not torch.allclose(seen["owner"], native)
+    assert no_hooks(model)

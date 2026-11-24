@@ -59,7 +59,7 @@ class ModeExplorerReDiverse:
             "adapted_sigmas": ("INT", {"default": 1, "min": 1, "max": 4, "advanced": True, "tooltip": "Number of opening evaluation sigmas. Values above 1 are experimental."}),
             "direction_count": ("INT", {"default": DIRECTIONS, "min": 1, "max": 32, "advanced": True}),
             "coefficient_trial": ("INT", {"default": 0, "min": 0, "max": 65535, "advanced": True, "tooltip": "Independent deterministic coefficient draw for the same noise seed."}),
-            "steering": (["random", "cohort_logdet"], {"default": "random", "advanced": True, "tooltip": "random is ReDiverse-TF. cohort_logdet is an experimental teacher-informed batch objective with matched norm."}),
+            "steering": (["random", "random_norm_matched", "cohort_logdet"], {"default": "random", "advanced": True, "tooltip": "random is ReDiverse-TF. cohort_logdet is an experimental teacher-informed batch objective; random_norm_matched is its control with identical activation-space offset norms."}),
             "diagnostics": ("BOOLEAN", {"default": False, "advanced": True}),
         }}
 
@@ -173,11 +173,11 @@ class ModeExplorerReDiverseCalibrate:
             raise ValueError("Use 1–64 letters, digits, hyphens or underscores for the label.")
         if negative is not None and cfg == 1.0:
             negative = None
-        path, archive = calibrate(teacher, positive, latent, negative=negative, guidance=cfg, steps=teacher_steps,
+        path, archive, timings = calibrate(teacher, positive, latent, negative=negative, guidance=cfg, steps=teacher_steps,
                                   forward=teacher_forward, block=block, rollouts=rollouts, directions=directions,
                                   seed=seed, batch=batch, sigmas=sigmas, label=label, device=workspace,
                                   workspace_mib=workspace_mib)
-        return (archive, json.dumps({"path": path, **archive.describe()}, indent=1))
+        return (archive, json.dumps({"path": path, **archive.describe(), "timings": timings}, indent=1))
 
 
 class ModeExplorerReDiverseDirections:
