@@ -803,3 +803,178 @@ def test_tf_reports_realized_per_sample_offsets(caplog, model, workspace, calibr
     # Both CFG branches of a sample get the same offset; bf16 basis and native rounding stay within 1 %.
     by_branch = torch.tensor(realized["realized_offset_norms"]).reshape(2, 2)
     assert torch.allclose(by_branch, intended.expand(2, 2), rtol=1e-2)
+
+
+# ------------------------------------------------------------------ temporal FT --
+@torch.inference_mode()
+def stepwise_reference(model, tensors, strengths, sigmas=SIGMAS, seed=55, cfg=1.0):
+    """Independent trajectory: Euler step i runs a model with the adapter merged at strengths[i] (native for 0)."""
+    x = torch.zeros(1, 16, 1, 7, 11)
+    noise = comfy.sample.prepare_noise(x, seed)
+    p, n = conditions()
+    state = None
+    for i in range(len(sigmas) - 1):
+        stage = merged(model, tensors, strengths[i]) if strengths[i] else model
+        guider = comfy.samplers.CFGGuider(stage)
+        guider.set_conds(p, n)
+        guider.set_cfg(cfg)
+        start = noise if state is None else state / sigmas[i]
+        out = guider.sample(start, x, comfy.samplers.ksampler("euler"), sigmas[i:i + 2], disable_pbar=True, seed=seed)
+        last = float(sigmas[i + 1])
+        # The guider returns process_latent_out(x / (1 - sigma_last)) for CONST flow.
+        state = out if last == 0 else stage.model.process_latent_in(out) * (1 - last)
+    return state
+
+
+@pytest.mark.parametrize("kwargs,strengths", [
+    (dict(adapted_sigmas=3), [1.0, 1.0, 1.0, 0, 0]),
+    (dict(adapted_sigmas=4, strength=.5), [.5, .5, .5, .5, 0]),
+    (dict(adapted_sigmas=3, start_evaluation=1, strength_profile="custom", custom_profile="0.5, 0, 1.25"), [0, .5, 0, 1.25, 0]),
+    (dict(adapted_sigmas=3, strength_profile="linear_increase"), [0, .5, 1.0, 0, 0]),
+    (dict(adapted_sigmas=5, strength=.8, strength_profile="cosine_decay"),
+     [.8 * (1 + math.cos(math.pi * i / 4)) / 2 for i in range(5)]),
+    (dict(adapted_sigmas=2, start_evaluation=3), [0, 0, 0, 1.0, 1.0]),
+])
+def test_temporal_schedule_matches_independent_per_step_merged_reference(caplog, model, workspace, kwargs, strengths):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    state = {k: v.clone() for k, v in model.model.state_dict().items()}
+    reference = stepwise_reference(model, workspace, strengths)
+    result = draw(rediverse(model, diagnostics=True, **kwargs))
+    assert torch.allclose(result, reference, atol=2e-5), (result - reference).abs().max()
+    temporal = summaries(caplog)[-1]["temporal"]
+    start = kwargs.get("start_evaluation", 0)
+    slots = temporal["slots"]
+    assert [slot["evaluation"] for slot in slots] == list(range(start, start + kwargs["adapted_sigmas"]))
+    assert [slot["effective_strength"] for slot in slots] == pytest.approx(strengths[start:start + len(slots)])
+    for slot in slots:
+        active = slot["effective_strength"] != 0
+        assert slot["state"] == ("adapter_active" if active else "zero_strength")
+        assert slot["live_forwards"] == 1 and slot["auxiliary_forwards"] == 0
+        assert slot["adapter_module_calls"] == (2 * len(COMFY_MODULES) if active else 0)
+        assert slot["sigma"] == pytest.approx(float(SIGMAS[slot["evaluation"]]))
+    assert temporal["adapter_active_evaluations"] == sum(1 for v in strengths if v)
+    assert temporal["native_before_window"] == start
+    assert all(torch.equal(v, state[k]) for k, v in model.model.state_dict().items())
+    assert no_hooks(model)
+
+
+def test_legacy_constant_configurations_are_unchanged(caplog, model, workspace):
+    """Default controls reproduce the reference recipe; explicit defaults equal omitted fields."""
+    legacy = draw(rediverse(model))
+    explicit = draw(rediverse(model, start_evaluation=0, strength_profile="constant", custom_profile="", adapted_sigmas=1))
+    assert torch.equal(legacy, explicit)
+    assert torch.allclose(legacy, split_reference(merged(model, workspace), model), atol=2e-5)
+    two = draw(rediverse(model, adapted_sigmas=2))
+    assert torch.equal(two, draw(rediverse(model, adapted_sigmas=2, strength_profile="custom", custom_profile="1, 1")))
+    # Custom text is ignored by built-in profiles.
+    assert torch.equal(two, draw(rediverse(model, adapted_sigmas=2, custom_profile="0.1, 0.2")))
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    draw(rediverse(model, diagnostics=True))
+    summary = summaries(caplog)[-1]
+    assert summary["admitted_sigmas"] == [1.0] and summary["adapted_evaluations"] == 1
+    assert summary["config"]["experimental"] is False and summary["temporal"]["planned_strengths"] == [1.0]
+
+
+def test_zero_strength_temporal_sham_is_bitwise_native(model, workspace):
+    for kwargs in (dict(adapted_sigmas=4, start_evaluation=1), dict(adapted_sigmas=3, strength_profile="cosine_decay")):
+        assert torch.equal(draw(rediverse(model, strength=0.0, **kwargs)), draw(model))
+    # Zero slots of a nonzero profile run no adapter arithmetic.
+    assert torch.equal(draw(rediverse(model, adapted_sigmas=2, strength_profile="custom", custom_profile="0, 0")), draw(model))
+
+
+def test_truncated_and_unreachable_windows_are_reported(caplog, model, workspace):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    draw(rediverse(model, diagnostics=True, adapted_sigmas=8, strength=.5))
+    temporal = summaries(caplog)[-1]["temporal"]
+    assert temporal["window_slots_reached"] == 5 and temporal["unreached_window_slots"] == [5, 6, 7]
+    assert "temporal_window_truncated" in summaries(caplog)[-1]["reasons"]
+    assert any("temporal_window_truncated" in r.message for r in caplog.records if "ReDiverse:" in r.message)
+    caplog.clear()
+    result = draw(rediverse(model, diagnostics=True, adapted_sigmas=2, start_evaluation=6))
+    summary = summaries(caplog)[-1]
+    assert summary["temporal"]["window_slots_reached"] == 0 and "temporal_window_not_reached" in summary["reasons"]
+    assert summary["temporal"]["slots"] == [] and torch.equal(result, draw(model))
+    caplog.clear()
+    draw(rediverse(model, diagnostics=True, adapted_sigmas=2, start_evaluation=2))
+    temporal = summaries(caplog)[-1]["temporal"]
+    assert temporal["window_entry_sigma"] == pytest.approx(.83) and temporal["window_exit_sigma"] == pytest.approx(.2)
+    assert summaries(caplog)[-1]["reasons"] == []
+
+
+def test_auxiliary_forwards_inherit_their_evaluation_strength(caplog, model, workspace, monkeypatch):
+    """ModeExplorer references use the live evaluation's effective strength and never advance the window."""
+    import mode_explorer.rediverse_runtime as runtime
+
+    used = []
+    original = runtime._lora_hook
+
+    def recording(run, down, up, scale):
+        hook = original(run, down, up, scale)
+
+        def wrapped(module, args, output):
+            if runtime.SCOPE.get() is run:
+                used.append((len(run.slots) - 1, scale, runtime.AUXILIARY.get()))
+            return hook(module, args, output)
+        return wrapped
+
+    monkeypatch.setattr(runtime, "_lora_hook", recording)
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    ft = rediverse(model, adapted_sigmas=3, strength_profile="custom", custom_profile="1, 0.5, 0.25", diagnostics=True)
+    combined, = ModeExplorer().apply(ft, mode="Early Structural (B1)", strength=.03, fidelity=.7, reference_budget=2,
+                                     diagnostics=True)
+    draw(combined)
+    trace = traces(caplog)[-1]
+    slots = trace["rediverse"]["temporal"]["slots"]
+    assert trace["feature_reference_dit_calls"] == 2
+    assert [s["evaluation"] for s in slots] == [0, 1, 2]
+    for slot in slots:
+        assert slot["adapter_module_calls"] == 2 * len(COMFY_MODULES) * (slot["live_forwards"] + slot["auxiliary_forwards"])
+    assert sum(s["auxiliary_forwards"] for s in slots) == 2 and all(s["live_forwards"] == 1 for s in slots)
+    by_slot = {}
+    for slot, scale, auxiliary in used:
+        by_slot.setdefault(slot, set()).add(scale)
+    assert by_slot == {0: {1.0}, 1: {0.5}, 2: {0.25}}
+    assert {auxiliary for *_, auxiliary in used} == {False, True}
+    assert no_hooks(model)
+
+
+def test_split_cfg_and_multistage_solvers_share_slots_per_sigma(caplog, model, workspace):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    draw(rediverse(model, adapted_sigmas=2, diagnostics=True), cfg=2.0, split_cfg=True)
+    slots = summaries(caplog)[-1]["temporal"]["slots"]
+    assert [(s["evaluation"], s["calls"], s["live_forwards"]) for s in slots] == [(0, 2, 2), (1, 2, 2)]
+    caplog.clear()
+    # Heun: the corrector at sigma 1 and the next predictor at the same sigma share slot 1.
+    draw(rediverse(model, adapted_sigmas=2, diagnostics=True), sampler="heun")
+    slots = summaries(caplog)[-1]["temporal"]["slots"]
+    assert [(s["evaluation"], s["calls"]) for s in slots] == [(0, 1), (1, 2)]
+    assert [s["sigma"] for s in slots] == pytest.approx([1.0, .93])
+    caplog.clear()
+    draw(rediverse(model, adapted_sigmas=3, start_evaluation=1, diagnostics=True), sampler="er_sde")
+    temporal = summaries(caplog)[-1]["temporal"]
+    assert temporal["evaluation_sigmas"][0] < 1.0 and [s["evaluation"] for s in temporal["slots"]] == [1, 2, 3]
+
+
+def test_temporal_lifecycle_has_no_stale_state(caplog, model, workspace):
+    dit = model.get_model_object("diffusion_model")
+    calls = []
+
+    def boom(module, args, output):
+        calls.append(1)
+        if len(calls) == 3:
+            raise RuntimeError("cancelled")
+
+    patched = rediverse(model, adapted_sigmas=4, strength_profile="linear_decay")
+    handle = dit.blocks[2].register_forward_hook(boom)
+    try:
+        with pytest.raises(RuntimeError, match="cancelled"):
+            draw(patched)  # stops inside the third adapted evaluation
+    finally:
+        handle.remove()
+    assert no_hooks(model) and all("comfy_force_forward" not in m.__dict__ for m in dit.modules())
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    patched = rediverse(model, adapted_sigmas=4, strength_profile="linear_decay", diagnostics=True)
+    first, second = draw(patched), draw(patched)
+    assert torch.equal(first, second)
+    one, two = summaries(caplog)[-2:]
+    assert one["temporal"] == two["temporal"] and [s["evaluation"] for s in one["temporal"]["slots"]] == [0, 1, 2, 3]

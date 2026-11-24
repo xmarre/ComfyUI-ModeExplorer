@@ -1,4 +1,5 @@
 from argparse import Namespace
+import pytest
 import csv
 import io
 import json
@@ -287,3 +288,45 @@ def test_rediverse_panels_record_effective_sampler_configuration(tmp_path, monke
     assert len(records) == 2 * 2 * 5
     assert all((r["steps"], r["sampler"], r["scheduler"]) == (13, "er_sde", "simple") for r in records)
     assert all(r["planner_image"].endswith("_planner.png") for r in records)
+
+
+def test_temporal_rediverse_panels_build_distinct_graphs():
+    args = Namespace(
+        model="turbo", encoder="encoder", vae="vae", weight_dtype="default", width=1024, height=1024,
+        steps=16, cfg=1.0, sampler="er_sde", scheduler="simple", negative="", strength=0.45,
+        fidelity=0.55, fixed=False, similarity=0.7, reference_budget=2, min_sigma=0.82, diagnostics=True,
+        model_lora=None, model_lora_strength=1.0, identity_lora=None, lora_strength=1.0,
+        teacher_model="raw", rediverse_adapter="krea-2-rediverse-comfy.safetensors",
+    )
+    root = Path(evaluate.__file__)
+    seen = {}
+    for panel in ("duration", "shape", "delay", "combination", "spectrum"):
+        args.variants = evaluate.load_profiles(root.with_name(f"rediverse_temporal_{panel}_profiles.json"))
+        for arm in args.variants:
+            g = evaluate.graph(args, arm, "prompt", 7, name=arm)
+            if "18" in g:
+                node = g["18"]["inputs"]
+                assert node["adapter"] == "krea-2-rediverse-comfy.safetensors" and "directions" not in node
+                key = (node["strength"], node.get("adapted_sigmas", 1), node.get("start_evaluation", 0),
+                       node.get("strength_profile", "constant"), node.get("custom_profile", ""),
+                       g.get("7", {}).get("inputs", {}).get("mode"), "13" in g)
+                assert seen.setdefault((panel, key), arm) == arm, (panel, arm, seen[(panel, key)])
+    shape = evaluate.load_profiles(root.with_name("rediverse_temporal_shape_profiles.json"))
+    # Nominal cumulative strength 2.0 in every shape arm (not equal activation displacement).
+    for arm, cfg in shape.items():
+        if "rediverse" in cfg:
+            values = [float(v) for v in cfg["rediverse"]["custom_profile"].split(",")]
+            assert sum(values) * cfg["rediverse"]["strength"] == pytest.approx(2.0), arm
+    combination = evaluate.load_profiles(root.with_name("rediverse_temporal_combination_profiles.json"))
+    guided = {arm: cfg["settings"] for arm, cfg in combination.items() if "settings" in cfg}
+    # Only the mode differs between B0 and B1 arms: no confounded ModeExplorer strength changes.
+    assert len({json.dumps({k: v for k, v in s.items() if k != "mode"}, sort_keys=True) for s in guided.values()}) == 1
+    spectrum = evaluate.load_profiles(root.with_name("rediverse_temporal_spectrum_profiles.json"))
+    assert all(cfg["spectrum"] == "guarded" for cfg in spectrum.values())
+    # Every treated arm has a sham with the same window, hence the same Spectrum route.
+    for arm, sham_arm in (("ext_4x05", "ext_4x05_sham"), ("start2_4x05", "start2_4x05_sham"),
+                          ("front_loaded", "ext_4x05_sham")):
+        treated, sham = spectrum[arm]["rediverse"], spectrum[sham_arm]["rediverse"]
+        assert sham["strength"] == 0.0
+        assert sham.get("start_evaluation", 0) == treated.get("start_evaluation", 0)
+        assert sham.get("adapted_sigmas", 1) == treated.get("adapted_sigmas", 1)

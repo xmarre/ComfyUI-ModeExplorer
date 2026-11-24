@@ -33,6 +33,7 @@ Open a JSON file in ComfyUI and select your native Krea 2 Turbo diffusion model,
 | [Token-adaptive projection Gaussian](projection_guidance_token_adaptive.json) | Matched higher-RMS comparison with bounded native token scales. |
 | [Response with Scale-Locked](response_scale_locked.json) | Planner-only response probes with separate planner and final outputs on the native refinement graph. |
 | [ReDiverse FT](rediverse_ft.json) | Native Turbo and Turbo with the ReDiverse first-evaluation adapter at the same seed. Needs `krea-2-rediverse-comfy.safetensors` in `models/loras`. |
+| [ReDiverse temporal](rediverse_temporal.json) | Experimental temporal adapter schedules at one seed: native, constant 4 × 0.5, the same window delayed to evaluation 2, and a front-loaded custom profile 0.8, 0.6, 0.4, 0.2. Diagnostics log the executed slots. |
 | [ReDiverse panel](rediverse_panel.json) | Screening arms A–D at one seed: native, Early Structural (B1), adapter, adapter + B1. |
 | [ReDiverse TF](rediverse_tf.json) | Krea 2 Raw calibration of teacher directions for the prompt, then Turbo with TF (band 2) and adapter + TF (band 4). Select your Raw diffusion model. |
 | [Activation probe](rediverse_probe.json) | Directional-collapse spectra of blocks 22–27 for Raw, Turbo and Turbo with the adapter, 200 seeds. Research only; long-running. |

@@ -132,15 +132,143 @@ def test_reference_schedules_match_upstream_constants():
 def test_first_evaluation_contract():
     plan = FirstEvaluations()
     assert plan.pending(1.0)
-    assert plan.admit(1.0) and plan.admit(1.0)  # CFG branches of one evaluation
-    assert not plan.pending(0.9) and not plan.admit(0.9)
-    assert plan.closed and not plan.admit(1.0)
+    assert plan.admit(1.0) == 0 and plan.admit(1.0) == 0  # CFG branches of one evaluation
+    assert not plan.pending(0.9) and plan.admit(0.9) is None
+    assert plan.closed and plan.admit(1.0) is None and plan.exit_sigma == 0.9
     two = FirstEvaluations(count=2)
-    assert two.admit(.99) and two.admit(.9) and two.admit(.9) and not two.admit(.8)
+    assert [two.admit(v) for v in (.99, .9, .9, .8)] == [0, 1, 1, None]
     interval = FirstEvaluations("first_interval", boundary=.9)
-    assert interval.admit(1.0) and interval.admit(.95) and not interval.admit(.9) and interval.closed
+    assert interval.admit(1.0) == 0 and interval.admit(.95) == 0 and interval.admit(.9) is None and interval.closed
+    for bad in (dict(count=0), dict(count=17), dict(start=16), dict(start=-1), dict(schedule="first_interval", start=1)):
+        with pytest.raises(ValueError):
+            FirstEvaluations(**bad)
+
+
+SCHEDULE = [0.999968, 0.979327, 0.956724, 0.931906, 0.904531, 0.874183, 0.840349, 0.802392,
+            0.759511, 0.710679, 0.654567, 0.589414, 0.512844, 0.421569, 0.310901, 0.173927]
+
+
+@pytest.mark.parametrize("start,count", [(0, 1), (0, 2), (0, 4), (0, 8), (0, 16), (1, 4), (2, 4), (4, 4), (6, 4), (15, 1)])
+def test_window_selects_distinct_sigma_indices(start, count):
+    plan = FirstEvaluations(count=count, start=start)
+    positions = []
+    for sigma in SCHEDULE:
+        expected = plan.pending(sigma)
+        first = plan.admit(sigma)
+        assert (first is not None) == expected
+        # A second branch or nested forward at the same sigma shares the slot and the window position.
+        assert plan.admit(sigma) == first
+        positions.append(first)
+    selected = [i for i, value in enumerate(positions) if value is not None]
+    assert selected == list(range(start, min(start + count, len(SCHEDULE))))
+    assert [positions[i] for i in selected] == list(range(len(selected)))
+    assert plan.reached == len(selected) and plan.window_sigmas == SCHEDULE[start:start + count]
+    assert plan.seen == SCHEDULE[:min(start + count, len(SCHEDULE))]
+
+
+def test_short_and_unreachable_windows_are_reported_never_wrapped():
+    plan = FirstEvaluations(count=8, start=2)
+    positions = [plan.admit(sigma) for sigma in SCHEDULE[:5]]
+    assert positions == [None, None, 0, 1, 2] and plan.reached == 3 and not plan.closed
+    plan = FirstEvaluations(count=4, start=6)
+    assert [plan.admit(sigma) for sigma in SCHEDULE[:4]] == [None] * 4 and plan.reached == 0
+    # A fresh invocation starts at index 0 again: no carryover.
+    again = FirstEvaluations(count=4, start=6)
+    assert again.seen == [] and again.pending(SCHEDULE[0]) is False and again.pending(SCHEDULE[0]) is False
+
+
+def test_pending_is_a_pure_query_and_tracks_the_next_slot():
+    plan = FirstEvaluations(count=2, start=1)
+    for _ in range(3):
+        assert not plan.pending(1.0)
+    assert plan.admit(1.0) is None
+    assert plan.pending(1.0) is False  # same sigma as the native opening evaluation
+    assert plan.pending(0.9) and plan.admit(0.9) == 0 and plan.pending(0.9)
+    assert plan.pending(0.8) and plan.admit(0.8) == 1
+    assert not plan.pending(0.7) and plan.admit(0.7) is None and plan.closed
+
+
+def test_builtin_profiles_have_exact_documented_values():
+    from mode_explorer.rediverse import profile_multipliers as profile
+
+    for name in ("constant", "linear_decay", "cosine_decay", "linear_increase", "bell_curve"):
+        assert profile(name, 1) == (1.0,)
+    assert profile("constant", 4) == (1.0, 1.0, 1.0, 1.0)
+    assert profile("linear_decay", 4) == pytest.approx((1.0, 2 / 3, 1 / 3, 0.0))
+    assert profile("linear_increase", 4) == pytest.approx((0.0, 1 / 3, 2 / 3, 1.0))
+    assert profile("linear_increase", 4)[0] == 0.0 and profile("linear_decay", 4)[-1] == 0.0
+    assert profile("cosine_decay", 3) == pytest.approx((1.0, 0.5, 0.0))
+    assert profile("cosine_decay", 5) == pytest.approx(tuple((1 + math.cos(math.pi * i / 4)) / 2 for i in range(5)))
+    bell = profile("bell_curve", 4)
+    assert bell[0] == 0.0 and bell[-1] == 0.0 and bell[1] == bell[2] == pytest.approx(math.sin(math.pi / 3))
+    assert max(bell) < 1.0  # even length: no implicit normalization of the peak
+    assert profile("bell_curve", 5) == pytest.approx((0.0, math.sin(math.pi / 4), 1.0, math.sin(math.pi / 4), 0.0))
+    assert profile("bell_curve", 2) == (0.0, 0.0)
+    assert len(profile("cosine_decay", 16)) == 16
+
+
+def test_custom_profiles_are_parsed_exactly_and_invalid_lists_rejected():
+    from mode_explorer.rediverse import profile_multipliers as profile
+
+    assert profile("custom", 4, "0.5, 0.75, 1.0, 0.25") == (0.5, 0.75, 1.0, 0.25)
+    assert profile("custom", 4, "2,0,0,0") == (2.0, 0.0, 0.0, 0.0)
+    assert profile("custom", 1, " 1.5 ") == (1.5,)
+    for bad, count in (("", 4), (" ", 1), ("0.5, 0.5", 4), ("0.5,,0.5,0.5", 4), ("a,b,c,d", 4), ("nan,1,1,1", 4),
+                       ("inf,1,1,1", 4), ("-0.1,1,1,1", 4), ("1,1,1,1,1", 4), ("1;1;1;1", 4)):
+        with pytest.raises(ValueError):
+            profile("custom", count, bad)
     with pytest.raises(ValueError):
-        FirstEvaluations(count=0)
+        profile("unknown", 4)
+
+
+def _config(**kwargs):
+    from types import SimpleNamespace
+
+    from mode_explorer.rediverse_runtime import ReDiverseConfig
+
+    adapter = SimpleNamespace(describe=lambda: {"file": "a"})
+    return ReDiverseConfig(adapter=adapter, **kwargs)
+
+
+def test_config_scales_profiles_by_global_strength_without_normalization_or_clamping():
+    assert _config().strengths() == [1.0] and not _config().temporal and not _config().experimental
+    assert _config(strength=.5, evaluations=4, profile="custom", custom="0.5, 0.75, 1.0, 0.25").strengths() == \
+        pytest.approx([.25, .375, .5, .125])
+    assert _config(strength=1.0, evaluations=4, profile="custom", custom="2, 0, 0, 0").strengths() == [2.0, 0, 0, 0]
+    with pytest.raises(ValueError, match="exceed"):
+        _config(strength=1.5, evaluations=4, profile="custom", custom="2, 0, 0, 0")
+    with pytest.raises(ValueError, match="adapted sigmas"):
+        _config(evaluations=4, profile="custom", custom="1, 1")
+    with pytest.raises(ValueError):
+        _config(evaluations=17)
+    with pytest.raises(ValueError, match="first_evaluation"):
+        _config(schedule="first_interval", start=1)
+    with pytest.raises(ValueError, match="first_evaluation"):
+        _config(schedule="first_interval", evaluations=2, profile="linear_decay")
+    assert _config(schedule="first_interval", evaluations=3).strengths() == [1.0, 1.0, 1.0]
+    sham = _config(strength=0.0, evaluations=4, start=2, profile="cosine_decay")
+    assert sham.strengths() == [0.0] * 4 and not sham.adapts and sham.experimental
+    described = _config(strength=.5, evaluations=4, start=1, profile="custom", custom="1, 1, .5, 0").describe()
+    assert described["start_evaluation"] == 1 and described["planned_evaluations"] == [1, 2, 3, 4]
+    assert described["custom_multipliers"] == [1.0, 1.0, 0.5, 0.0]
+    assert described["planned_strengths"] == [.5, .5, .25, 0.0]
+    assert _config(evaluations=4).describe() != _config(evaluations=4, start=1).describe()
+    assert _config(evaluations=4).describe() != _config(evaluations=4, profile="linear_decay").describe()
+
+
+def test_temporal_ft_options_are_rejected_with_active_tf():
+    from types import SimpleNamespace
+
+    from mode_explorer.rediverse_runtime import ReDiverseConfig
+
+    archive = SimpleNamespace(U=torch.zeros(8, 4), describe=lambda: {})
+    adapter = SimpleNamespace(describe=lambda: {})
+    for options in (dict(start=1), dict(evaluations=4, profile="linear_decay")):
+        with pytest.raises(ValueError, match="ReDiverse-TF"):
+            ReDiverseConfig(adapter=adapter, directions=archive, band=2.0, **options)
+        ReDiverseConfig(adapter=adapter, directions=archive, band=0.0, **options)  # band 0: no steering
+    # The constant profile from evaluation 0 keeps the established multi-sigma FT+TF behavior.
+    assert ReDiverseConfig(adapter=adapter, directions=archive, band=2.0, evaluations=8).strengths() == [1.0] * 8
 
 
 def test_coefficients_are_deterministic_and_leave_global_rng_untouched():

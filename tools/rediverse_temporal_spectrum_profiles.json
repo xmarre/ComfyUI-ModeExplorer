@@ -1,0 +1,85 @@
+{
+ "native": {
+  "method": "native",
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "ext_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4
+  },
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "ext_4x05_sham": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.0,
+   "adapted_sigmas": 4
+  },
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "start2_4x05": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.5,
+   "adapted_sigmas": 4,
+   "start_evaluation": 2
+  },
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "start2_4x05_sham": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 0.0,
+   "adapted_sigmas": 4,
+   "start_evaluation": 2
+  },
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ },
+ "front_loaded": {
+  "method": "native",
+  "rediverse": {
+   "adapter": "$adapter",
+   "strength": 1.0,
+   "adapted_sigmas": 4,
+   "strength_profile": "custom",
+   "custom_profile": "0.8, 0.6, 0.4, 0.2"
+  },
+  "spectrum": "guarded",
+  "spectrum_settings": {
+   "extrapolation_guard_enabled": true,
+   "max_extrapolation_span_ratio": 0.5,
+   "extrapolation_guard_scope": "planner_only"
+  }
+ }
+}

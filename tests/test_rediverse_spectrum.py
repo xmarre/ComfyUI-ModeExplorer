@@ -83,3 +83,71 @@ def test_scale_locked_planner_only(caplog, model, workspace):
     reports = logs(caplog, "Spectrum Krea 2 summary: ")
     assert {item["stage"] for item in reports} == {"planner", "highres"}
     assert CURRENT.get() is None
+
+
+def _routes(report):
+    return {item["step"]: item["route"] for item in report["denoiser_decisions"] if item["route"] != "forecast_rejected"}
+
+
+@pytest.mark.parametrize("profile", ["constant", "zero_inside", "sham"])
+def test_delayed_window_routes_and_history_boundaries(caplog, model, workspace, profile):
+    """Forecasts before the window, all-actual inside it, a forced actual exit and fresh native history after."""
+    caplog.set_level(logging.INFO)
+    kwargs = dict(adapted_sigmas=3, start_evaluation=4, diagnostics=True)
+    if profile == "zero_inside":
+        kwargs.update(strength_profile="custom", custom_profile="1, 0, 1")
+    if profile == "sham":
+        kwargs.update(strength=0.0)
+    # Long enough for Spectrum to rebuild history and forecast again after the window.
+    sigmas = torch.linspace(1.0, 0.0, 21)
+    draw(spectrum(rediverse(model, **kwargs), warmup=1), sigmas=sigmas)
+    report, = logs(caplog, "Spectrum Krea 2 summary: ")
+    routes = _routes(report)
+    assert report["fallback"] is None, report
+    assert any(routes[step] != "actual" for step in (1, 2, 3)), routes  # ordinary forecasting before the window
+    assert [routes[step] for step in (4, 5, 6, 7)] == ["actual"] * 4, routes  # window and its forced exit
+    assert any(routes[step] != "actual" for step in range(8, 20)), routes  # resumed with fresh native history
+    assert report["actual_reasons"]["ModeExplorer early-feature regime transition"] == 2  # entry and exit
+    temporal = traces(caplog)[-1]["rediverse"]["temporal"]
+    assert [s["evaluation"] for s in temporal["slots"]] == [4, 5, 6]
+    assert all(s["live_forwards"] == 1 for s in temporal["slots"])  # no forecast consumed a slot
+    assert temporal["slots"][0]["sigma"] == pytest.approx(float(sigmas[4]))  # forecasts did not shift the window
+    expected = {"constant": [1.0, 1.0, 1.0], "zero_inside": [1.0, 0.0, 1.0], "sham": [0.0, 0.0, 0.0]}[profile]
+    assert [s["effective_strength"] for s in temporal["slots"]] == expected
+    assert CURRENT.get() is None
+
+
+def test_delayed_sham_matches_treated_routes(caplog, model, workspace):
+    caplog.set_level(logging.INFO)
+    reports = []
+    for strength in (1.0, 0.0):
+        caplog.clear()
+        draw(spectrum(rediverse(model, adapted_sigmas=2, start_evaluation=3, strength=strength), warmup=1), sigmas=SIGMAS)
+        report, = logs(caplog, "Spectrum Krea 2 summary: ")
+        reports.append(_routes(report))
+    assert reports[0] == reports[1]
+
+
+@pytest.mark.skipif(not os.environ.get("MODEEXPLORER_SCALE_LOCKED"), reason="Scale-Locked is optional")
+@pytest.mark.parametrize("start,count", [(1, 3), (4, 8)])
+def test_scale_locked_temporal_window_stays_in_the_planner(caplog, model, workspace, start, count):
+    import asyncio
+
+    import nodes
+
+    assert asyncio.run(nodes.load_custom_node(os.environ["MODEEXPLORER_SCALE_LOCKED"]))
+    node = nodes.NODE_CLASS_MAPPINGS["Krea2TurboFlowAlignedRegenerate"]()
+    caplog.set_level(logging.INFO)
+    p, n = conditions()
+    patched = rediverse(model, diagnostics=True, adapted_sigmas=count, start_evaluation=start, strength=.5)
+    with torch.inference_mode():
+        output, _, _ = node.sample(spectrum(patched), p, n, {"samples": torch.zeros(1, 16, 1, 80, 80)}, 902, 0.25,
+                                   0.0, 0.0, steps=6, composition_lock_sigma=0.60, sampler_name="er_sde")
+    assert torch.isfinite(output["samples"]).all()
+    found = traces(caplog)
+    assert len(found) == 1 and found[0]["stage"] == "planner"  # the high-resolution stage never runs ReDiverse
+    temporal = found[0]["rediverse"]["temporal"]
+    assert temporal["slots"] and temporal["slots"][0]["evaluation"] == start
+    if start + count > len(temporal["evaluation_sigmas"]):
+        assert "temporal_window_truncated" in found[0]["rediverse"]["reasons"]
+    assert CURRENT.get() is None

@@ -38,7 +38,7 @@ RESPONSE_CONTROLS = {
 }
 REDIVERSE_CONTROLS = {
     "adapter", "strength", "band", "schedule", "adapted_sigmas", "direction_count", "coefficient_trial",
-    "steering", "diagnostics", "calibrate",
+    "steering", "diagnostics", "calibrate", "start_evaluation", "strength_profile", "custom_profile",
 }
 CALIBRATION_CONTROLS = {
     "teacher_model", "block", "teacher_forward", "teacher_steps", "rollouts", "directions", "seed", "batch",
@@ -449,6 +449,11 @@ def main():
                         weight_dtype=workflow["1"]["inputs"]["weight_dtype"],
                         **sampler_config(workflow),
                     )
+                    # The resolved arm configuration, so arms that differ only in temporal profile or
+                    # start position never share an identity.
+                    arm = args.variants.get(method, {"method": method})
+                    result.update(profile=arm, profile_sha256=hashlib.sha256(
+                        json.dumps(arm, sort_keys=True).encode()).hexdigest()[:16])
                     if args.planner_megapixels is not None:
                         result["planner_image"] = relative.with_name(relative.stem + "_planner.png").as_posix()
                     result["repeats"] = []
