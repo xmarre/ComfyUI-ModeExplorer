@@ -72,7 +72,7 @@ Place it on the MODEL path before ModeExplorer feature guidance, Sol-Krea2 and S
 | **Directions** | Output of the Calibrate or Directions node. |
 | Schedule, Adapted sigmas | Advanced. See the scheduling contract. Anything other than `first_evaluation` with one sigma is experimental. |
 | Direction count, Coefficient trial | Advanced. Number of archived directions used; an independent deterministic coefficient draw for the same seed. |
-| Steering | Advanced. `random` is ReDiverse-TF; `cohort_logdet` is experimental. |
+| Steering | Advanced. `random` is ReDiverse-TF; `cohort_logdet` is experimental and `random_norm_matched` is its control. |
 | Diagnostics | Logs a `MODEEXPLORER_TRACE` record with admitted sigmas, adapted evaluations, adapter module calls, TF applications, coefficients and the realized TF offset magnitude. |
 
 ### Scheduling contract
@@ -99,9 +99,13 @@ During an admitted evaluation, PyTorch forward hooks are registered on the execu
 
 - upstream weight LoRAs (identity LoRAs, for example) remain applied on every step;
 - the base linear can be any native implementation, including quantized layers, because the hook only uses its input and output;
-- no model reload, weight backup or re-patching occurs between the adapted and native evaluations, and cloned or unrelated workflows never see the hooks.
+- no model reload, weight backup or re-patching occurs between the adapted and native evaluations.
 
-While hooked, the adapted linears are marked `comfy_force_forward`, as ComfyUI's own bypass adapters do, so fused quantized paths fall back to the module call. If any adapted module is still not executed through its module call, sampling stops with an error naming it instead of applying a partial adapter.
+While hooked, the adapted linears are marked `comfy_force_forward`, as ComfyUI's own bypass adapters do, so fused quantized paths fall back to the module call. Every actual transformer forward inside an admitted evaluation is verified on its own: a pre-hook on the first block opens a record, the last block closes it, and the record must contain every adapted linear (and, for a live forward with TF, exactly one steering application). A forward that executes none or only some of the adapted linears stops sampling with an error naming them; an auxiliary reference forward cannot vouch for a live one. An admitted evaluation in which no transformer forward ran at all was replaced by a forecast and is reported as `admitted_evaluation_not_executed`.
+
+**Execution contract.** Supported execution is ComfyUI's serialized queue: one sampler invocation at a time per loaded transformer. The hooks act only in the execution context that owns the scope (a `ContextVar`), so another context calling the same modules sees native outputs, and a second scope on the same transformer while one is active is refused with an error. The temporary `comfy_force_forward` flag is a module attribute and is visible to any overlapping execution; overlapping or concurrent execution on shared modules is therefore unsupported, not merely untested.
+
+A requested arm is never silently changed. Partial denoise, masks, unsupported latent layouts and tagged high-resolution stages bypass the whole ReDiverse configuration (both adapter and steering) with a logged reason, as documented above. TF requested with unsupported conditioning, without an integer noise seed, with an unverifiable batch layout (for example a batch split under memory pressure), or `cohort_logdet` without a usable cohort is an error; disconnect the directions to run the adapter alone.
 
 The adapter tensors are copied to the evaluation device once per sampler invocation (about 414 MB for the released fp32 adapter) and released when the invocation ends. Outside admitted evaluations no hook exists. With TF, the first adapted evaluation hashes the positive conditioning once (one device-to-host copy) to check the archive; there are no other synchronizations unless Diagnostics is enabled.
 
@@ -123,13 +127,15 @@ ReDiverse applies to the composition-forming planner stage only. Tagged high-res
 
 Directions follow paper Eq. 2 with the unnormalized centred Gram G = XcXcᵀ, eigenpairs (λₖ, vₖ): uₖ = Xcᵀvₖ / ‖Xcᵀvₖ‖ and sₖ = std(√λₖ vₖ) with the biased standard deviation, which equals √(λₖ/N). The Gram is accumulated in float64 over feature chunks, each centred before its product; the basis is stored in bfloat16 as upstream. Directions with eigenvalue ≤ 10⁻¹⁰ of the leading one are stored as zero rows with zero spread and excluded from the valid count.
 
-Cost: 25 × (τ−1) full teacher forwards plus 25 truncated ones, batched by 5, and N × D bf16 staging (1.26 GB at 1024²) on the GPU, or on the CPU with *workspace* `cpu`. Upstream reports about 60 s per prompt on an RTX PRO 6000 and about 400 MB per archive at 1024². ComfyUI caches the node's output, so later seeds of the same prompt reuse it; changing the prompt, size or teacher recalibrates. Report calibration time with every TF comparison; TF is not free because its teacher forwards run before generation.
+Guided calibration (CFG above 1) requires a negative conditioning; without one the node refuses instead of recording a guided label for a conditional-only run. A connected SIGMAS schedule must be finite, start at 1, stay in [0, 1], decrease strictly and cover the requested forward.
+
+Cost: 25 × (τ−1) full teacher forwards plus 25 truncated ones, batched by 5, and N × D bf16 staging (1.26 GB at 1024²) on the GPU, or on the CPU with *workspace* `cpu`. The archive records rollout and PCA seconds; the node summary and the `ModeExplorer ReDiverse calibration` log line add archive write/validation and total seconds, which the evaluator records per job. Upstream reports about 60 s per prompt on an RTX PRO 6000 and about 400 MB per archive at 1024². ComfyUI caches the node's output, so later seeds of the same prompt reuse it; changing the prompt, size or teacher recalibrates. Report calibration time with every TF comparison; TF is not free because its teacher forwards run before generation.
 
 ### Archive
 
-Archives are safetensors files in `output/modeexplorer_rediverse/directions/` with tensors `U [K, D]`, `s [K]`, `eigenvalues [N]` (unnormalized Gram; covariance eigenvalue = value / N) and the teacher mean, plus JSON metadata: schema and implementation, upstream revision, coordinate and block, token grid and width, latent shape, teacher weight fingerprint and weight-patch fingerprint, conditioning fingerprint, σ in/out, forward and step count, schedule source, guidance, seeds and seed rule, rollouts, normalization, basis dtype, direction counts, spectrum summary and wall time. The file name includes a hash of the calibration identity, so different settings never overwrite each other.
+Archives are safetensors files in `output/modeexplorer_rediverse/directions/` with tensors `U [K, D]`, `s [K]`, `eigenvalues [N]` (unnormalized Gram; covariance eigenvalue = value / N) and the teacher mean, plus JSON metadata: schema and implementation, upstream revision, coordinate and block, token grid and width, latent shape, teacher weight fingerprint, weight-patch fingerprint and a summary of wrappers, patches and attention override, teacher noise scale, positive and negative conditioning fingerprints, the complete teacher schedule and the executed part of it, solver, guidance, seeds and seed rule, batch, a digest of the initial noises and of the executed inputs at the captured forward, rollouts, normalization, staging and basis dtype, direction counts, spectrum summary and timings. The weight and patch fingerprints are *sampled* (fixed slices of named tensors, the first 256 values of each patch tensor) and say so in the archive; they distinguish checkpoints and patch sets in practice but are not full checkpoint hashes. The file name includes a hash of the complete calibration identity (everything except labels, results and timings); a repeated calibration with the same identity is written next to the first as `-r2`, `-r3`, …, never over it.
 
-Loading never unpickles. Unknown schemas, missing fields, extra tensors, shape or dtype disagreement with the metadata, nonfinite values, negative spreads, non-unit basis rows and files over 8 GiB are rejected. At sampling time a different positive conditioning or token grid is an error: directions are never resized or reused across prompts. The **ModeExplorer ReDiverse Directions (Krea 2)** node reloads an archive by name.
+Loading never unpickles. Rejected: unknown schemas, missing fields, extra tensors, shape or dtype disagreement with the metadata, a coordinate other than the block-output image rows, nonfinite values, negative spreads, a valid-direction count that differs from the number of positive spreads (including all-zero spreads), nonzero rows without spread, basis rows that are not orthonormal within 0.02 (bf16 storage tolerance), eigenvalues that are not a nonnegative descending spectrum of one value per rollout, spreads that differ from √(eigenvalue / rollouts) by more than 0.1 %, and files over 8 GiB. At sampling time a different positive conditioning or token grid is an error: directions are never resized or reused across prompts. The **ModeExplorer ReDiverse Directions (Krea 2)** node reloads an archive by name.
 
 ### Inference
 
@@ -137,7 +143,7 @@ During the opening evaluation, the block hook adds Σₖ αₖ sₖ uₖ, comput
 
 ### Experimental cohort steering
 
-`cohort_logdet` replaces the random draw for an equally conditioned batch of 2–8. In teacher-whitened coordinates zᵦ = (U hᵦ)/s of the student's own block output, the cohort covariance C gives ∇ log det(C + I) ∝ (C + I)⁻¹(zᵦ − z̄); the identity stands for the teacher's whitened covariance, which damps directions where the cohort already matches or exceeds the teacher. One step is taken per sample, scaled to the RMS norm of a U[−band, band] draw (band·√(K/3)) and clipped to the band, so arm E is its norm-matched control. Single images and degenerate cohorts fall back to the random draw (logged). There is no acceptance test and no evidence that this is better than random; treat it as a separate research arm.
+`cohort_logdet` replaces the random draw for an equally conditioned batch of 2–8. In teacher-whitened coordinates zᵦ = (U hᵦ)/s of the student's own block output, the cohort covariance C gives ∇ log det(C + I) ∝ (C + I)⁻¹(zᵦ − z̄); the identity stands for the teacher's whitened covariance, which damps directions where the cohort already matches or exceeds the teacher. The realized offset is Δh = U diag(s) α, whose norm for the orthonormal basis is √(Σₖ sₖ² αₖ²); equal coefficient norms therefore do not give equal displacements when the spreads differ. Each sample's step is rescaled, without clipping, so its activation-space norm equals the RMS norm of the uniform draw, band·√(Σₖ sₖ²/3) (coefficients may then exceed the band). The random arm (E) matches that norm only on average; the norm-matched control is `random_norm_matched`, which uses the same uniform direction as `random` rescaled to exactly the same per-sample activation norm as `cohort_logdet`. The trace records the coefficients and the pre-rounding offset norm of every sample, and Diagnostics adds the realized post-rounding offset RMS. Single images and degenerate cohorts are errors. There is no acceptance test and no evidence that this is better than random; treat it as a separate research arm.
 
 ## Directional-collapse probe
 
@@ -146,7 +152,9 @@ During the opening evaluation, the block hook adds Σₖ αₖ sₖ uₖ, comput
 - total variance TV = Σλ, participation ratio PR = (Σλ)²/Σλ², concentration TV/PR, entropy effective rank exp(−Σ p log p), the top 32 eigenvalues, cumulative explained variance and the leading share;
 - covariance normalization N (population), with PR capped at N − 1. These are sample-limited spectra, not the intrinsic dimension of the model.
 
-Activations are staged as bf16 in a fixed workspace (16 GiB default; 10 GB per block at N = 200, 1024²). Blocks are processed in groups that fit; each group repeats the forwards and stops after its deepest block. The Gram is exact (float64, chunk-centred); no D × D covariance is formed and no pooling is used. Reports go to `output/modeexplorer_rediverse/probes/`; `python -m tools.rediverse_probe_report teacher.json student.json` prints student/teacher ratios and the upstream collapsed-block rule (largest step in the concentration ratio). A probe through a ReDiverse node measures the adapted first step.
+Activations are staged as bf16 (10 GB per block at N = 200, 1024²). The workspace limit (16 GiB default for the probe, 8 GiB for calibration) covers staging *and* the analysis temporaries: two float64 N × 2²⁰ Gram/projection chunks, the float32 column mean and, for calibration, the float32 and bf16 copies of the K × D basis; a reference basis adds K × D bf16. It excludes model weights, activations, cached allocator memory and transfer buffers, so it bounds research allocations, not total device memory. Blocks are processed in groups that fit; each group repeats the forwards and stops after its deepest block. No D × D covariance is formed and no pooling is used. The Gram is accumulated exactly in float64, but over the bf16-staged values: activations computed in fp16 or fp32 are rounded to bf16 first, so the spectra are those of the staged values.
+
+At 3.5 MP (about 13,700 image tokens × 6,144 features), one 200-sample block stages about 31.3 GiB, so the default probe workspace refuses that configuration; calibration with 25 rollouts stages about 3.9 GiB plus about 3.8 GiB of basis reconstruction. Fit full-resolution probes to the device explicitly (fewer samples, one block, or a lower resolution), and defer them until the adapter has shown practical value. Reports go to `output/modeexplorer_rediverse/probes/`; `python -m tools.rediverse_probe_report teacher.json student.json` prints student/teacher ratios and the upstream collapsed-block rule (largest step in the concentration ratio). A probe through a ReDiverse node measures the adapted first step.
 
 With a connected direction archive at a probed block and the same token grid, the report adds a comparison in the archive's subspace, using only the N × K projections:
 
@@ -155,7 +163,20 @@ With a connected direction archive at a probed block and the same token grid, th
 - eigenvalues of Cₜ − Cₛ in the teacher subspace, split into *deficit* (positive) and *excess* (negative) parts. The difference is indefinite in general and is reported, not injected;
 - mean displacement (overall RMS, along each teacher direction and relative to the cohort's spread).
 
-`coordinate_match` states whether the comparison is a *matched frozen state* (same σ) or between *native trajectory states* (the default archive is teacher forward 5 at σ 0.967, the probe student step 1 at σ 1). Mean shifts, subspace rotations, representation scaling and differing trajectory states can all produce variance differences; the probe separates the first three only within the teacher's K-dimensional span.
+Every comparison is qualified from recorded evidence, never from σ alone. Probe reports record the seed and seed rule, batch, latent shape, noise scale, a digest of the initial noises and a digest of the model inputs actually executed at the captured forward (positive rows, row by row, so batch chunking does not change it); archives record the same digests for the teacher rollouts. The categories, in `comparison` of a teacher/student pair (`tools/rediverse_probe_report.py`) and in `reference_comparison` of a probe against an archive:
+
+| Category | Evidence |
+| --- | --- |
+| `exact_matched_noisy_state` | Same conditioning and identical executed inputs. Only this sets `matched_inputs`. |
+| `matched_noise_state_representation_differs` | Same conditioning, initial noise, σ and noise scale at the first forward, but the executed inputs differ (for example another input dtype). |
+| `matched_initial_noise_evolved_trajectories` | Same conditioning and initial noise, captured after different trajectories. |
+| `same_conditioning_independent_samples` | Same conditioning, other noise: a population comparison. The default archive (teacher forward 5 from rollout noise) against a probe (σ 1 from probe noise) is in this category. |
+| `cross_conditioning_exploratory` | Different or unknown conditioning. |
+| `incompatible_geometry` | Coordinate, token grid, width or sample count differ (ratios are still printed). |
+
+Mean shifts, subspace rotations, representation scaling and differing trajectory states can all produce variance differences; the probe separates the first three only within the teacher's K-dimensional span.
+
+Probe report names hash the complete experimental configuration: model and patch fingerprints, model options, attached ReDiverse and ModeExplorer settings, conditioning, latent and token geometry, samples, seed and noise digest, σ and noise scale, requested blocks, batch, reference archive and workspace device. A repeated run of the same configuration is written as `-r2`, `-r3`, …, never over an earlier report. A probe through a ReDiverse node must start at σ 1, because other σ bypass the adapter.
 
 ## Evaluation
 
@@ -207,8 +228,12 @@ Established on CPU with ComfyUI's native Krea 2 transformer at tiny width (see `
 - the adapted run equals an independent reference (first Euler step on merged weights, remaining steps native) within 2·10⁻⁵, for CFG 1 and packed CFG 2, at strengths 1 and 0.5; upstream weight patches remain applied;
 - multistage solvers, ER-SDE's offset σ, split CFG dispatch, partial denoise, masks and high-resolution stages follow the contract above;
 - no hook survives a run, an exception or an interrupt; repeated runs are deterministic; the shared model is unchanged;
+- an actual forward that executes none or only some adapted linears fails, also when an auxiliary forward did execute them; overlapping scopes on one transformer are refused, and hooks leave other execution contexts native;
 - TF adds exactly Σ αₖ sₖ uₖ to image rows (text rows unchanged) on the first evaluation only, rejects other prompts and grids, adds no transformer call and leaves the sampler's noise stream unchanged;
-- calibration reproduces a manual rollout's PCA, does not modify the teacher, and archives round-trip; covariance statistics match explicit covariances for known spectra and are invariant to chunking;
+- calibration reproduces a manual rollout's PCA, does not modify the teacher, and archives round-trip; different preceding schedules and negative prompts give distinct archive identities; repeats never overwrite; malformed and inconsistent archives are rejected; covariance statistics match explicit covariances for known spectra and are invariant to chunking;
+- probe pairs with other seeds, prompts or geometries are never certified as matched; probe identities change with seed, blocks, batch, reference archive and ModeExplorer settings;
+- `cohort_logdet` and `random_norm_matched` produce identical per-sample activation-space offset norms;
+- the evaluator records the effective sampler configuration for KSampler, SamplerCustom (reference schedules) and Scale-Locked graphs through its main recording path;
 - with Spectrum PR #6 and Scale-Locked v1.3.2: the adapted step is actual, the next starts fresh history, forecasts resume afterwards, the planner alone is adapted; without the deferred contract the pass is all-actual.
 
 Not established: behavior and timing on real Krea 2 checkpoints, CUDA, native INT8 ConvRot and Comfy Kitchen kernels, torch.compile, memory peaks at production resolutions, and every perceptual property (diversity, anatomy, identity, adherence, detail, artifacts). The code paths are kernel-independent by construction, but that is not evidence of correct quantized CUDA behavior.
