@@ -24,7 +24,7 @@ def _cached_adapter(path):
         return _ADAPTERS[key]
     adapter = load_adapter(path)
     _ADAPTERS[key] = adapter
-    while len(_ADAPTERS) > 2:
+    while len(_ADAPTERS) > 1:
         _ADAPTERS.popitem(last=False)
     return adapter
 

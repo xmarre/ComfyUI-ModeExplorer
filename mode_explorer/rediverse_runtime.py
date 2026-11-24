@@ -39,6 +39,7 @@ LOGGER = logging.getLogger("ModeExplorer")
 CAPTURE_KEY = "modeexplorer_rediverse_capture"
 TF_MODES = ("random", "cohort_logdet")
 IMPLEMENTATION = "modeexplorer-rediverse-1"
+_MISSING = object()
 # Set on the live solver evaluation; auxiliary forwards clear it.
 LIVE = ContextVar("modeexplorer_rediverse_live", default=None)
 SCOPE = ContextVar("modeexplorer_rediverse_scope", default=None)
@@ -157,9 +158,10 @@ def _sigma(options):
     return low if math.isfinite(low) and low == high else None
 
 
-def _lora_hook(run, down, up, scale):
+def _lora_hook(run, down, up, scale, fired):
     def hook(module, args, output):
         run.module_calls += 1
+        fired.add(id(module))
         x = args[0]
         delta = (x.to(torch.float32) @ down.T) @ up.T
         return (output.to(torch.float32) + delta * scale).to(output.dtype)
@@ -189,7 +191,8 @@ def _tf_offsets(run, device, live_rows, hidden=None, positive=None):
     else:
         alpha = None
         if cfg.tf_mode == "cohort_logdet":
-            run.reasons.add("tf_cohort_requires_batch_random_fallback")
+            run.reasons.add("tf_cohort_requires_batch_random_fallback" if run.batch <= 1
+                            else "tf_cohort_positive_branch_unavailable_random_fallback")
     if alpha is None:
         alpha = coefficients(run.seed, run.batch, cfg.count, cfg.band, cfg.trial)
     run.coefficient_values = alpha.cpu()
@@ -288,6 +291,9 @@ def evaluation_scope(run, dit, x, options):
         yield
         return
     handles = []
+    forced = []
+    fired = set()
+    layers = []
     live_token = scope_token = None
     branches = tuple(options.get("cond_or_uncond", ()))
     try:
@@ -299,8 +305,12 @@ def evaluation_scope(run, dit, x, options):
                         rd.device_weights[key] = (down.to(x.device), up.to(x.device))
                     weights = rd.device_weights[key]
                     layer = resolve_module(dit.blocks[block], name)
+                    layers.append((block, name, layer))
                     handles.append(layer.register_forward_hook(
-                        _lora_hook(rd, *weights, scale * rd.config.strength)))
+                        _lora_hook(rd, *weights, scale * rd.config.strength, fired)))
+                    # As ComfyUI's bypass adapters do: fused quantized paths must call the module.
+                    forced.append((layer, layer.__dict__.get("comfy_force_forward", _MISSING)))
+                    layer.comfy_force_forward = True
         steer = rd.steer and branches and x.shape[0] == rd.batch * len(branches)
         if rd.steer and not steer:
             rd.reasons.add("tf_unverified_condition_dispatch")
@@ -331,9 +341,18 @@ def evaluation_scope(run, dit, x, options):
             rd.forecast_consumed += 1
             rd.adapted_calls -= 1
             rd.reasons.add("admitted_evaluation_not_executed")
+        elif rd.config.adapts and len(fired) != len(layers):
+            missing = [f"{block}.{name}" for block, name, layer in layers if id(layer) not in fired][:4]
+            raise RuntimeError("ReDiverse adapter modules were not executed through their module call (" + ", ".join(missing)
+                               + "); the native Krea 2 forward path differs from the supported one.")
     finally:
         for handle in handles:
             handle.remove()
+        for layer, previous in forced:
+            if previous is _MISSING:
+                layer.__dict__.pop("comfy_force_forward", None)
+            else:
+                layer.comfy_force_forward = previous
         if scope_token is not None:
             SCOPE.reset(scope_token)
         if live_token is not None:
@@ -372,6 +391,9 @@ class CaptureWrapper:
     def __call__(self, executor, x, timesteps, context, attention_mask=None, ref_latents=None,
                  transformer_options=None, **kwargs):
         options = transformer_options or {}
+        if 0 not in options.get("cond_or_uncond", (0,)):
+            # Separately batched negative branches are not counted as teacher forwards.
+            return executor(x, timesteps, context, attention_mask, ref_latents, options, **kwargs)
         self.calls += 1
         call = self.calls
         blocks = sorted(self.plan(call))
@@ -405,6 +427,16 @@ class CaptureWrapper:
         if seen != set(blocks):
             raise RuntimeError("ReDiverse capture hooks did not fire; the executing model differs from the patched one.")
         return result
+
+
+def conditioning_fingerprint(positive):
+    """Fingerprint of the single positive text conditioning a direction archive belongs to."""
+    if len(positive) != 1 or not torch.is_tensor(positive[0][0]):
+        raise ValueError("ReDiverse calibration needs exactly one positive text conditioning.")
+    flags = {"area", "mask", "control", "hooks", "gligen", "reference_latents", "start_percent", "end_percent"}
+    if flags.intersection(positive[0][1]):
+        raise ValueError("ReDiverse calibration does not support area, mask, control, hook or reference conditioning.")
+    return tensor_fingerprint(positive[0][0])
 
 
 def _guider(model, positive, negative, cfg):
@@ -450,6 +482,15 @@ def _verify_research_model(model):
         raise ValueError("Run ReDiverse calibration and probes on a MODEL without Spectrum.")
 
 
+def _attached_settings(model):
+    from comfy.patcher_extension import WrappersMP
+
+    from .runtime import KEY
+
+    samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+    return dict(vars(samplers[0].settings)) if samplers else None
+
+
 def _attached_rediverse(model):
     from comfy.patcher_extension import WrappersMP
 
@@ -490,6 +531,8 @@ def calibrate(teacher, positive, latent, *, negative=None, guidance=1.0, steps=T
     from .rediverse import ARCHIVE_SCHEMA, archive_root, load_directions
 
     _verify_research_model(teacher)
+    if teacher.get_wrappers(WrappersMP.SAMPLER_SAMPLE, "mode_explorer_krea2"):
+        raise ValueError("Calibrate on the plain teacher MODEL, without ModeExplorer or ReDiverse nodes.")
     model = teacher
     dit = teacher.get_model_object("diffusion_model")
     if not 0 <= block < len(dit.blocks):
@@ -526,8 +569,7 @@ def calibrate(teacher, positive, latent, *, negative=None, guidance=1.0, steps=T
     wrapper = CaptureWrapper(lambda call: (block,) if call == forward else (), sink, stop_after=forward)
     clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CAPTURE_KEY, wrapper)
     guider = _guider(clone, positive, negative, guidance)
-    fingerprint = tensor_fingerprint(guider.original_conds["positive"][0]["cross_attn"]) \
-        if "cross_attn" in guider.original_conds["positive"][0] else None
+    fingerprint = conditioning_fingerprint(positive)
     started = time.perf_counter()
     sampler = comfy.samplers.ksampler("euler")
     for start in range(0, rollouts, batch):
@@ -550,7 +592,7 @@ def calibrate(teacher, positive, latent, *, negative=None, guidance=1.0, steps=T
     U, s, valid = covariance.principal_basis(X, vectors, values, directions)
     if valid < 1:
         raise RuntimeError("Teacher rollouts produced no variance at the requested block.")
-    mean = X.float().mean(0).to(torch.bfloat16).cpu() if store_mean else None
+    mean = covariance.column_mean(X).to(torch.bfloat16).cpu() if store_mean else None
     stats = covariance.spectrum_stats(values, rollouts)
     model_hash = model_fingerprint(dit)
     metadata = {
@@ -622,7 +664,8 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
               "comparison": "matched_frozen_state", "sigma": sigma, "samples": samples, "seed_rule": "1000000 + seed * 100003 + i",
               "token_grid": list(grid), "d_model": width, "model_sha256": model_fingerprint(dit),
               "patches": patch_fingerprint(model), "blocks": {}, "label": label, "groups": [list(g) for g in groups],
-              "rediverse": _attached_rediverse(model)}
+              "rediverse": _attached_rediverse(model), "conditioning_sha256": conditioning_fingerprint(positive),
+              "modeexplorer": _attached_settings(model)}
     started = time.perf_counter()
     sampler = comfy.samplers.ksampler("euler")
     for group in groups:
@@ -640,10 +683,6 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
         wrapper = CaptureWrapper(lambda call, group=group: tuple(group) if call == 1 else (), sink, stop_after=1)
         clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CAPTURE_KEY, wrapper)
         guider = _guider(clone, positive, None, 1.0)
-        if "fingerprint" not in report:
-            first = guider.original_conds["positive"][0]
-            report["conditioning_sha256"] = tensor_fingerprint(first["cross_attn"]) if "cross_attn" in first else None
-            report["fingerprint"] = True
         for start in range(0, samples, batch):
             comfy.model_management.throw_exception_if_processing_interrupted()
             chunk = seeds[start:start + batch]
@@ -671,7 +710,7 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
                     "matched_frozen_state" if abs(float(reference.metadata["sigma_in"]) - sigma) < 1e-6
                     else "native_trajectory_states")
                 if reference.mean is not None:
-                    displacement = X.float().mean(0) - reference.mean.to(workspace, torch.float32)
+                    displacement = covariance.column_mean(X) - reference.mean.to(workspace, torch.float32)
                     entry["reference"]["mean_displacement_rms"] = float(displacement.square().mean().sqrt())
                     entry["reference"]["mean_displacement_along_directions"] = [
                         float(v) for v in (U.float() @ displacement).cpu()]
@@ -679,7 +718,6 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
                         displacement.norm() / max(math.sqrt(entry["tv"]), 1e-30))
             report["blocks"][f"block{block:02d}"] = entry
             del X
-    report.pop("fingerprint", None)
     report["seconds"] = time.perf_counter() - started
     os.makedirs(os.path.join(archive_root(), "probes"), exist_ok=True)
     identity = hashlib.sha256(json.dumps({key: report.get(key) for key in (

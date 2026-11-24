@@ -12,7 +12,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -344,7 +344,6 @@ class Directions:
     mean: torch.Tensor | None
     metadata: dict
     sha256: str = ""
-    device_cache: dict = field(default_factory=dict, repr=False)
 
     @property
     def block(self):

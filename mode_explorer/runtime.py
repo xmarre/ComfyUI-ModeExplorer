@@ -1111,10 +1111,12 @@ class SamplerWrapper:
                 rediverse_reasons.add("latent_mask")
             if spatial_image(noise) is None:
                 rediverse_reasons.add("unsupported_latent_shape")
-            if self.rediverse.steers and any(
+            if self.rediverse.steers and (any(
                     group and ("reference_latents" in group[0] or "control" in group[0])
-                    for group in model_wrap.conds.values() if group is not None):
-                rediverse_reasons.add("tf_reference_or_control_conditioning")
+                    for group in model_wrap.conds.values() if group is not None)
+                    or len(model_wrap.conds.get("positive") or ()) != 1
+                    or CONDITION_FLAGS.intersection(model_wrap.conds["positive"][0])):
+                rediverse_reasons.add("tf_unsupported_conditioning")
             if rediverse_reasons:
                 LOGGER.info("ModeExplorer ReDiverse bypassed %s (seed=%s)", ", ".join(sorted(rediverse_reasons)), seed)
             else:

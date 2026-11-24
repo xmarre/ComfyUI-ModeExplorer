@@ -473,3 +473,43 @@ def test_probe_of_adapted_student_measures_the_adapted_first_step(model, workspa
     # Block 1 output depends on the block 0-1 adapter, so the spectra differ.
     assert reports[0]["tv"] != pytest.approx(reports[1]["tv"], rel=1e-6)
     assert no_hooks(model)
+
+
+def test_adapter_requires_module_calls_and_restores_force_forward(model, workspace, monkeypatch):
+    import torch.nn.functional as F
+
+    mlp = model.get_model_object("diffusion_model").blocks[0].mlp
+    seen = []
+
+    def fused(x):
+        # A fused path that reads the weight directly would skip the module hook.
+        seen.append(getattr(mlp.down, "comfy_force_forward", False))
+        return F.linear(F.silu(mlp.gate(x)) * mlp.up(x), mlp.down.weight)
+
+    monkeypatch.setattr(mlp, "forward", fused)
+    with pytest.raises(RuntimeError, match="0.mlp.down"):
+        draw(rediverse(model))
+    # During the adapted evaluation the module-level forward was requested, then restored.
+    assert seen[0] is True and "comfy_force_forward" not in mlp.down.__dict__
+    assert no_hooks(model)
+    monkeypatch.undo()
+    assert torch.equal(draw(rediverse(model, strength=0.0)), draw(model))
+
+
+def test_tf_rejects_multiple_positive_conditionings(caplog, model, workspace, calibrated):
+    directions, _ = calibrated
+    steered, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0)
+    p, n = conditions()
+    guider = comfy.samplers.CFGGuider(steered)
+    guider.set_conds(p + [[p[0][0] * 2, {}]], n)
+    guider.set_cfg(1.0)
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    with torch.inference_mode():
+        guider.sample(comfy.sample.prepare_noise(LATENT, 1), LATENT, comfy.samplers.ksampler("euler"), SIGMAS,
+                      disable_pbar=True, seed=1)
+    assert any("tf_unsupported_conditioning" in r.message for r in caplog.records)
+    with pytest.raises(ValueError, match="exactly one positive"):
+        ModeExplorerReDiverseCalibrate().calibrate(model, p + p, {"samples": LATENT}, 2, 2, 6, 6, 4, 3, 4, "")
+    # The teacher must be the plain model.
+    with pytest.raises(ValueError, match="plain teacher"):
+        ModeExplorerReDiverseCalibrate().calibrate(rediverse(model), p, {"samples": LATENT}, 2, 2, 6, 6, 4, 3, 4, "")

@@ -101,6 +101,8 @@ During an admitted evaluation, PyTorch forward hooks are registered on the execu
 - the base linear can be any native implementation, including quantized layers, because the hook only uses its input and output;
 - no model reload, weight backup or re-patching occurs between the adapted and native evaluations, and cloned or unrelated workflows never see the hooks.
 
+While hooked, the adapted linears are marked `comfy_force_forward`, as ComfyUI's own bypass adapters do, so fused quantized paths fall back to the module call. If any adapted module is still not executed through its module call, sampling stops with an error naming it instead of applying a partial adapter.
+
 The adapter tensors are copied to the evaluation device once per sampler invocation (about 414 MB for the released fp32 adapter) and released when the invocation ends. Outside admitted evaluations no hook exists. With TF, the first adapted evaluation hashes the positive conditioning once (one device-to-host copy) to check the archive; there are no other synchronizations unless Diagnostics is enabled.
 
 ### Spectrum

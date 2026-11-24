@@ -42,10 +42,19 @@ def centred_gram(X, chunk=1 << 20, mean=None):
     return G
 
 
+def column_mean(X, chunk=1 << 20, dtype=torch.float32):
+    """Per-feature mean of [N, D] rows without a full-precision copy of X."""
+    out = torch.empty(X.shape[1], dtype=dtype, device=X.device)
+    for start in range(0, X.shape[1], chunk):
+        out[start:start + chunk] = X[:, start:start + chunk].double().mean(0).to(dtype)
+    return out
+
+
 def eigenpairs(G):
-    """Descending eigenvalues and eigenvectors of a symmetric Gram (float64)."""
+    """Descending eigenvalues and eigenvectors of a symmetric N x N Gram (float64, on the CPU)."""
+    G = G.double().cpu()
     G = (G + G.T) * 0.5
-    values, vectors = torch.linalg.eigh(G.double())
+    values, vectors = torch.linalg.eigh(G)
     order = torch.arange(values.numel() - 1, -1, -1, device=values.device)
     return values[order], vectors[:, order]
 
@@ -90,7 +99,7 @@ def principal_basis(X, vectors, values, k, chunk=1 << 20, dtype=torch.bfloat16, 
     usable = [float(values[i]) > max(relative_floor * lead, 0.0) for i in range(k)]
     V = vectors[:, :k].to(device=X.device, dtype=torch.float32)
     U = torch.zeros(k, d, dtype=torch.float32, device=X.device)
-    centre = X.float().mean(0) if mean is None else mean.to(X.device, torch.float32)
+    centre = column_mean(X, chunk) if mean is None else mean.to(X.device, torch.float32)
     for start in range(0, d, chunk):
         block = X[:, start:start + chunk].float() - centre[start:start + chunk]
         U[:, start:start + chunk] = V.T @ block
@@ -112,7 +121,7 @@ def project(X, U, mean=None, chunk=1 << 20):
     """Coordinates P = Xc U^T [N, k] of centred rows on unit directions U [k, D] (float64)."""
     n, d = X.shape
     P = torch.zeros(n, U.shape[0], dtype=torch.float64, device=X.device)
-    centre = X.double().mean(0) if mean is None else mean.to(X.device, torch.float64)
+    centre = column_mean(X, chunk, torch.float64) if mean is None else mean.to(X.device, torch.float64)
     for start in range(0, d, chunk):
         block = X[:, start:start + chunk].double() - centre[start:start + chunk]
         P.addmm_(block, U[:, start:start + chunk].to(X.device, torch.float64).T)
