@@ -282,12 +282,23 @@ def test_calibration_archive_provenance_and_teacher_isolation(model, calibrated)
     assert meta["guidance"]["branches"] == "conditional_only" and meta["teacher_forward"] == 2
     assert meta["sigma_in"] == pytest.approx(meta["sigma_in"]) and 0 < meta["sigma_out"] < meta["sigma_in"] <= 1
     assert meta["valid_directions"] == 4 and directions.U.dtype == torch.bfloat16
+    # An EmptyLatentImage-style 4-channel 4D latent resolves to the model's latent layout.
+    p, _ = conditions()
+    again, text = ModeExplorerReDiverseCalibrate().calibrate(
+        model, p, {"samples": torch.zeros(1, 4, 8, 12)}, block=2, teacher_forward=2, teacher_steps=6, rollouts=6,
+        directions=4, seed=3, batch=4, label="tiny")
+    assert torch.equal(again.U, directions.U) and again.metadata["latent_shape"] == [16, 1, 8, 12]
+    assert json.loads(text)["path"] == summary["path"]  # identical calibration identity, one archive
+    other, text = ModeExplorerReDiverseCalibrate().calibrate(
+        model, p, {"samples": LATENT}, block=2, teacher_forward=2, teacher_steps=6, rollouts=6, directions=4,
+        seed=4, batch=4, label="tiny")
+    assert json.loads(text)["path"] != summary["path"] and not torch.equal(other.U, directions.U)
     assert torch.allclose(directions.U.float().norm(dim=1), torch.ones(4), atol=1e-2)
     assert os.path.isfile(summary["path"])
     assert no_hooks(model)
     assert all(torch.equal(v, state[k]) for k, v in model.model.state_dict().items())
     loaded, text = ModeExplorerReDiverseDirections().load(os.path.basename(summary["path"]))
-    assert json.loads(text)["sha256"] == directions.sha256 and torch.equal(loaded.U, directions.U)
+    assert json.loads(text)["sha256"] == again.sha256 and torch.equal(loaded.U, directions.U)
     with pytest.raises(ValueError):
         ModeExplorerReDiverseDirections().load("../escape.safetensors")
 
@@ -439,4 +450,26 @@ def test_probe_reports_spectra_and_reference_comparison(model, workspace, calibr
     assert grouped_report["groups"] == [[0, 1], [2]] and len(grouped_report["blocks"]) == 3
     # Same model, inputs and batch-independent capture: ratios are exactly one.
     assert ratios["matched_inputs"] and ratios["blocks"]["block02"]["pr_ratio"] == pytest.approx(1.0, rel=1e-6)
+    assert no_hooks(model)
+
+
+def test_reference_turbo_schedule_equals_native_simple_scheduler(model):
+    from mode_explorer.rediverse_nodes import ModeExplorerReferenceSigmas
+
+    sigmas, = ModeExplorerReferenceSigmas().sigmas({"samples": torch.zeros(1, 16, 1, 128, 128)}, "turbo", 8)
+    native = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), "simple", 8)
+    assert torch.allclose(sigmas, native.float(), atol=1e-6)
+    raw, = ModeExplorerReferenceSigmas().sigmas({"samples": torch.zeros(1, 16, 1, 128, 128)}, "raw", 52)
+    assert raw.shape == (53,) and float(raw[4]) == pytest.approx(0.96743, abs=5e-5)
+
+
+def test_probe_of_adapted_student_measures_the_adapted_first_step(model, workspace):
+    p, _ = conditions()
+    reports = []
+    for candidate in (model, rediverse(model)):
+        text, = ModeExplorerActivationProbe().probe(candidate, p, {"samples": LATENT}, "1", 6, 0, 1.0, 6, "ft")
+        with open(json.loads(text)["path"]) as handle:
+            reports.append(json.load(handle)["blocks"]["block01"])
+    # Block 1 output depends on the block 0-1 adapter, so the spectra differ.
+    assert reports[0]["tv"] != pytest.approx(reports[1]["tv"], rel=1e-6)
     assert no_hooks(model)

@@ -6,6 +6,7 @@ if __package__:
     from .mode_explorer.nodes import ModeExplorer, ModeExplorerLoadResponse, ModeExplorerMechanistic, ModeExplorerProjectionGuidance, ModeExplorerResponse
     from .mode_explorer.rediverse_nodes import (
         ModeExplorerActivationProbe, ModeExplorerReDiverse, ModeExplorerReDiverseCalibrate, ModeExplorerReDiverseDirections,
+        ModeExplorerReferenceSigmas,
     )
 else:
     from mode_explorer.research_report import ModeExplorerResearchReport
@@ -15,6 +16,7 @@ else:
     from mode_explorer.nodes import ModeExplorer, ModeExplorerLoadResponse, ModeExplorerMechanistic, ModeExplorerProjectionGuidance, ModeExplorerResponse
     from mode_explorer.rediverse_nodes import (
         ModeExplorerActivationProbe, ModeExplorerReDiverse, ModeExplorerReDiverseCalibrate, ModeExplorerReDiverseDirections,
+        ModeExplorerReferenceSigmas,
     )
 
 NODE_CLASS_MAPPINGS = {
@@ -29,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     "ModeExplorerReDiverseCalibrateKrea2": ModeExplorerReDiverseCalibrate,
     "ModeExplorerReDiverseDirectionsKrea2": ModeExplorerReDiverseDirections,
     "ModeExplorerActivationProbeKrea2": ModeExplorerActivationProbe,
+    "ModeExplorerReferenceSigmasKrea2": ModeExplorerReferenceSigmas,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ModeExplorerKrea2": "ModeExplorer (Krea 2)",
@@ -42,6 +45,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ModeExplorerReDiverseCalibrateKrea2": "ModeExplorer ReDiverse Calibrate (Krea 2)",
     "ModeExplorerReDiverseDirectionsKrea2": "ModeExplorer ReDiverse Directions (Krea 2)",
     "ModeExplorerActivationProbeKrea2": "ModeExplorer Activation Probe (Krea 2)",
+    "ModeExplorerReferenceSigmasKrea2": "ModeExplorer Reference Sigmas (Krea 2)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

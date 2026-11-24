@@ -259,3 +259,29 @@ class ModeExplorerActivationProbe:
             with open(os.path.join(archive_root(), "probes", compare_with)) as handle:
                 summary["comparison"] = compare_probes(json.load(handle), report)
         return (json.dumps(summary, indent=1),)
+
+
+class ModeExplorerReferenceSigmas:
+    CATEGORY = "model_patches/ModeExplorer"
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "sigmas"
+    DESCRIPTION = ("Reference Krea 2 FlowMatch Euler schedules: Turbo uses mu 1.15; Raw uses the resolution-dependent "
+                   "mu of Krea2Pipeline (0.906 at 1024x1024).")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT",),
+            "model": (["turbo", "raw"], {"default": "turbo"}),
+            "steps": ("INT", {"default": 8, "min": 1, "max": 1000}),
+        }}
+
+    def sigmas(self, latent, model, steps):
+        import torch
+
+        from .rediverse import reference_sigmas
+
+        height, width = latent["samples"].shape[-2:]
+        tokens = ((height + 1) // 2) * ((width + 1) // 2)
+        values = reference_sigmas(steps, mu=1.15) if model == "turbo" else reference_sigmas(steps, tokens)
+        return (torch.tensor(values, dtype=torch.float32),)

@@ -17,6 +17,7 @@ for activation covariance probes, through a dedicated diffusion-model wrapper.
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -114,7 +115,9 @@ class ReDiverseRun:
     steer: bool = True
 
     def pending(self, sigma):
-        return (self.config.adapts or self.steer) and self.schedule.pending(sigma)
+        # Also with zero strength or band: that configuration is the route-matched
+        # sham, keeping Spectrum's forced-actual boundary without an intervention.
+        return self.schedule.pending(sigma)
 
     def release(self):
         self.device_weights.clear()
@@ -425,8 +428,12 @@ def _noise_batch(seeds, shape):
     return torch.stack(rows)
 
 
-def _latent_shape(latent):
-    samples = latent["samples"]
+def _latent_shape(latent, model):
+    """Per-sample model latent shape, after ComfyUI's native empty-latent channel fix."""
+    import comfy.sample
+
+    samples = comfy.sample.fix_empty_latent_channels(model, latent["samples"], latent.get("downscale_ratio_spacial"),
+                                                     latent.get("downscale_ratio_temporal"))
     if samples.ndim == 5 and samples.shape[2] == 1:
         return tuple(samples.shape[1:])
     if samples.ndim == 4:
@@ -441,6 +448,16 @@ def _verify_research_model(model):
     ModeExplorer.verify_model(model, 0)
     if has_spectrum(model.model_options, model.wrappers):
         raise ValueError("Run ReDiverse calibration and probes on a MODEL without Spectrum.")
+
+
+def _attached_rediverse(model):
+    from comfy.patcher_extension import WrappersMP
+
+    from .runtime import KEY
+
+    samplers = model.get_wrappers(WrappersMP.SAMPLER_SAMPLE, KEY)
+    config = getattr(samplers[0], "rediverse", None) if samplers else None
+    return config.describe() if config is not None else None
 
 
 def _staging(n, features, device, budget_mib):
@@ -473,12 +490,13 @@ def calibrate(teacher, positive, latent, *, negative=None, guidance=1.0, steps=T
     from .rediverse import ARCHIVE_SCHEMA, archive_root, load_directions
 
     _verify_research_model(teacher)
+    model = teacher
     dit = teacher.get_model_object("diffusion_model")
     if not 0 <= block < len(dit.blocks):
         raise ValueError(f"Block {block} is outside the teacher's {len(dit.blocks)} blocks.")
     if not 1 <= forward <= steps or rollouts < 2 or not 1 <= directions <= rollouts:
         raise ValueError("Calibration needs 1 <= forward <= steps and 1 <= directions <= rollouts.")
-    shape = _latent_shape(latent)
+    shape = _latent_shape(latent, model)
     grid = (math.ceil(shape[-2] / dit.patch), math.ceil(shape[-1] / dit.patch))
     tokens = grid[0] * grid[1]
     width = dit.blocks[block].attn.wo.out_features
@@ -550,7 +568,12 @@ def calibrate(teacher, positive, latent, *, negative=None, guidance=1.0, steps=T
         "pc1_share": stats["pc1_share"], "participation_ratio": stats["pr"], "total_variance": stats["tv"],
         "label": label, "seconds": elapsed, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    name = f"{label + '-' if label else ''}{(fingerprint or 'nocond')[:12]}-{model_hash[:8]}-b{block}-f{forward}-n{rollouts}.safetensors"
+    # Identical calibration inputs reuse one name; any other setting gets its own file.
+    identity = hashlib.sha256(json.dumps({key: metadata[key] for key in metadata if key not in ("created", "seconds",
+                              "label", "pc1_share", "participation_ratio", "total_variance", "valid_directions")},
+                              sort_keys=True).encode()).hexdigest()[:8]
+    name = (f"{label + '-' if label else ''}{(fingerprint or 'nocond')[:12]}-{model_hash[:8]}-b{block}-f{forward}"
+            f"-n{rollouts}-{identity}.safetensors")
     path = save_directions(os.path.join(archive_root(), "directions", name), U.cpu(), s, values.float().cpu(), metadata, mean)
     del X
     LOGGER.info("ModeExplorer ReDiverse calibration: %s", json.dumps({"file": name, "seconds": round(elapsed, 3),
@@ -579,7 +602,7 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
     blocks = sorted(set(int(b) for b in blocks))
     if not blocks or blocks[0] < 0 or blocks[-1] >= len(dit.blocks):
         raise ValueError("Probe blocks are outside the loaded model.")
-    shape = _latent_shape(latent)
+    shape = _latent_shape(latent, model)
     grid = (math.ceil(shape[-2] / dit.patch), math.ceil(shape[-1] / dit.patch))
     width = dit.blocks[0].attn.wo.out_features
     features = grid[0] * grid[1] * width
@@ -598,7 +621,8 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
     report = {"schema": 1, "implementation": IMPLEMENTATION, "coordinate": "block_output_image_rows",
               "comparison": "matched_frozen_state", "sigma": sigma, "samples": samples, "seed_rule": "1000000 + seed * 100003 + i",
               "token_grid": list(grid), "d_model": width, "model_sha256": model_fingerprint(dit),
-              "patches": patch_fingerprint(model), "blocks": {}, "label": label, "groups": [list(g) for g in groups]}
+              "patches": patch_fingerprint(model), "blocks": {}, "label": label, "groups": [list(g) for g in groups],
+              "rediverse": _attached_rediverse(model)}
     started = time.perf_counter()
     sampler = comfy.samplers.ksampler("euler")
     for group in groups:
@@ -658,7 +682,11 @@ def probe(model, positive, latent, *, blocks=(ANCHOR_BLOCK,), samples=200, seed=
     report.pop("fingerprint", None)
     report["seconds"] = time.perf_counter() - started
     os.makedirs(os.path.join(archive_root(), "probes"), exist_ok=True)
-    name = f"{label + '-' if label else ''}{report['model_sha256'][:8]}-{(report.get('conditioning_sha256') or 'nocond')[:12]}-n{samples}-s{sigma:g}.json"
+    identity = hashlib.sha256(json.dumps({key: report.get(key) for key in (
+        "model_sha256", "patches", "rediverse", "conditioning_sha256", "token_grid", "samples", "sigma")},
+        sort_keys=True).encode()).hexdigest()[:8]
+    name = (f"{label + '-' if label else ''}{report['model_sha256'][:8]}-{(report.get('conditioning_sha256') or 'nocond')[:12]}"
+            f"-n{samples}-s{sigma:g}-{identity}.json")
     path = os.path.join(archive_root(), "probes", name)
     with open(path + ".tmp", "w") as handle:
         json.dump(report, handle, indent=1)
