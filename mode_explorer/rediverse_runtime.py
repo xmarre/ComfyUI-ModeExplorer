@@ -44,6 +44,9 @@ _MISSING = object()
 # Set on the live solver evaluation; auxiliary forwards clear it.
 LIVE = ContextVar("modeexplorer_rediverse_live", default=None)
 SCOPE = ContextVar("modeexplorer_rediverse_scope", default=None)
+# True inside ModeExplorer auxiliary forwards (references, response probes, initialization
+# estimates); set by runtime.isolated_reference. Research capture ignores them.
+AUXILIARY = ContextVar("modeexplorer_auxiliary_forward", default=False)
 # Transformers with an admitted ReDiverse scope. Hooks live on shared modules, so a
 # second, overlapping scope on the same transformer is refused instead of mixed.
 _ACTIVE = {}
@@ -124,6 +127,7 @@ class ReDiverseRun:
     realized: list = field(default_factory=list)
     steer: bool = True
     forwards: list = field(default_factory=list)
+    verify_prefix: object = None
 
     def pending(self, sigma):
         # Also with zero strength or band: that configuration is the route-matched
@@ -296,11 +300,14 @@ def _tf_hook(run, grid, d_model):
         if run.forwards:
             run.forwards[-1]["tf"] += 1
         if run.config.diagnostics and len(run.realized) < 8:
-            delta = (view.float() - output[:, start:end].float())
-            base = output[:, start:end].float().square().mean().sqrt().clamp_min(1e-12)
-            rms = delta.square().mean().sqrt()
-            run.realized.append({"block": run.config.directions.block, "offset_rms": float(rms),
-                                 "relative_rms": float(rms / base), "rows": rows})
+            # Realized displacement after native-dtype rounding, per row, next to the intended norm.
+            delta = (view.float() - output[:, start:end].float()).flatten(1)
+            base = output[:, start:end].float().flatten(1).norm(dim=1).clamp_min(1e-12)
+            norms = delta.norm(dim=1)
+            run.realized.append({"block": run.config.directions.block, "rows": rows,
+                                 "branches": list(branches),
+                                 "realized_offset_norms": [float(v) for v in norms.cpu()],
+                                 "relative_offset_norms": [float(v) for v in (norms / base).cpu()]})
         return result
     return hook
 
@@ -385,6 +392,20 @@ def evaluation_scope(run, dit, x, options):
         # Marks the live solver evaluation; auxiliary forwards clear it (isolated_reference).
         live_token = LIVE.set(_Live(rd, branches))
 
+        def verify(record, upto=None):
+            """Every adapted linear in blocks <= upto (all blocks when None) ran; live TF applied once."""
+            missing = [f"{b}.{n}" for b, n, layer in layers
+                       if (upto is None or b <= upto) and id(layer) not in record["fired"]]
+            if missing:
+                raise RuntimeError("ReDiverse adapter modules were not executed through their module call ("
+                                   + ", ".join(missing[:4]) + f"{', ...' if len(missing) > 4 else ''}); "
+                                   "the native Krea 2 forward path differs from the supported one.")
+            tf_reached = steer and (upto is None or rd.config.directions.block <= upto)
+            if tf_reached and record["live"] and record["tf"] != 1:
+                raise RuntimeError("The ReDiverse steering hook did not apply exactly once in a live forward.")
+
+        rd.verify_prefix = verify
+
         def opened(module, args):
             if SCOPE.get() is rd:
                 live = LIVE.get()
@@ -393,13 +414,7 @@ def evaluation_scope(run, dit, x, options):
         def finished(module, args, output):
             if SCOPE.get() is rd and rd.forwards:
                 record = rd.forwards.pop()
-                missing = [f"{b}.{n}" for b, n, layer in layers if id(layer) not in record["fired"]]
-                if missing:
-                    raise RuntimeError("ReDiverse adapter modules were not executed through their module call ("
-                                       + ", ".join(missing[:4]) + f"{', ...' if len(missing) > 4 else ''}); "
-                                       "the native Krea 2 forward path differs from the supported one.")
-                if steer and record["live"] and record["tf"] != 1:
-                    raise RuntimeError("The ReDiverse steering hook did not apply exactly once in a live forward.")
+                verify(record)
                 closed.append(record["live"])
 
         # Registered after the adapter and steering hooks, so it closes after them.
@@ -411,7 +426,11 @@ def evaluation_scope(run, dit, x, options):
         rd.live_forwards += live
         rd.auxiliary_forwards += len(closed) - live
         if live == 0:
-            # No actual live transformer forward ran: a forecast replaced this evaluation.
+            # No actual live transformer forward ran. Guarded Spectrum keeps admitted evaluations
+            # actual, so with a requested intervention this is a broken invariant, not a forecast.
+            if rd.config.adapts or steer:
+                raise RuntimeError("An admitted ReDiverse evaluation ran no live transformer forward, so the requested "
+                                   "intervention was not applied. Use guarded Spectrum with the ModeExplorer overlay.")
             rd.forecast_consumed += 1
             rd.reasons.add("admitted_evaluation_not_executed")
         else:
@@ -430,6 +449,7 @@ def evaluation_scope(run, dit, x, options):
         if live_token is not None:
             LIVE.reset(live_token)
         rd.forwards = []
+        rd.verify_prefix = None
         with _ACTIVE_LOCK:
             _ACTIVE.pop(id(dit), None)
 
@@ -467,8 +487,9 @@ class CaptureWrapper:
     def __call__(self, executor, x, timesteps, context, attention_mask=None, ref_latents=None,
                  transformer_options=None, **kwargs):
         options = transformer_options or {}
-        if 0 not in options.get("cond_or_uncond", (0,)):
-            # Separately batched negative branches are not counted as teacher forwards.
+        if AUXILIARY.get() or 0 not in options.get("cond_or_uncond", (0,)):
+            # ModeExplorer auxiliary forwards (references, response probes) and separately batched
+            # negative branches are never captured, counted, fingerprinted or stopped.
             return executor(x, timesteps, context, attention_mask, ref_latents, options, **kwargs)
         self.calls += 1
         call = self.calls
@@ -498,6 +519,10 @@ class CaptureWrapper:
                 self.sink(call, block, output[:, start:end].detach(), options)
                 seen.add(block)
                 if stop and block == blocks[-1]:
+                    # The forward ends here: verify the adapter on the executed block prefix.
+                    owner = SCOPE.get()
+                    if owner is not None and owner.forwards and owner.verify_prefix is not None:
+                        owner.verify_prefix(owner.forwards[-1], upto=block)
                     raise _Stop
             return hook
 

@@ -422,21 +422,23 @@ def load_directions(path, max_bytes=MAX_ARCHIVE_BYTES):
             or str(U.dtype).removeprefix("torch.") != metadata["basis_dtype"]
             or (mean is not None and mean.shape != (features,))):
         raise ValueError("The direction archive tensors do not match their recorded shapes.")
-    if not (torch.isfinite(U.float()).all() and torch.isfinite(s).all() and torch.isfinite(eigenvalues).all()
-            and (mean is None or torch.isfinite(mean.float()).all())):
+    if not (torch.isfinite(U).all() and torch.isfinite(s).all() and torch.isfinite(eigenvalues).all()
+            and (mean is None or torch.isfinite(mean).all())):
         raise ValueError("The direction archive holds nonfinite values.")
     if metadata["coordinate"] != COORDINATE:
         raise ValueError(f"Unsupported direction coordinate {metadata['coordinate']!r}; expected {COORDINATE}.")
     usable = s > 0
     if (s < 0).any() or int(usable.sum()) < 1 or int(usable.sum()) != metadata["valid_directions"]:
         raise ValueError("The direction archive holds no usable directions or disagrees with its valid count.")
-    rows = U.float()
-    norms = rows.norm(dim=1)
-    if bool(norms[~usable].any()):
+    # K x K Gram of the stored rows in float64 over feature chunks: no full-precision copy of the basis.
+    gram = torch.zeros(k, k, dtype=torch.float64)
+    for start in range(0, U.shape[1], 1 << 22):
+        block = U[:, start:start + (1 << 22)].double()
+        gram.addmm_(block, block.T)
+    if bool(gram.diagonal()[~usable].any()):
         raise ValueError("The direction archive holds nonzero basis rows without spread.")
-    valid = rows[usable]
-    gram = valid @ valid.T
-    if not torch.allclose(gram, torch.eye(len(valid)), atol=BASIS_TOLERANCE):
+    valid = gram[usable][:, usable]
+    if not torch.allclose(valid, torch.eye(len(valid), dtype=torch.float64), atol=BASIS_TOLERANCE):
         raise ValueError("The direction archive basis is not unit-normalized and mutually orthogonal.")
     rollouts = metadata["rollouts"]
     if (type(rollouts) is not int or eigenvalues.shape != (rollouts,) or len(metadata["seeds"]) != rollouts

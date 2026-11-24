@@ -380,9 +380,10 @@ def isolated_reference(run, *, sol_evaluations=None):
     token_session = current.set(None) if current is not None else None
     token_capture = capture.set(None) if capture is not None else None
     token_sol = None
-    from .rediverse_runtime import LIVE
+    from .rediverse_runtime import AUXILIARY, LIVE
 
     token_live = LIVE.set(None)
+    token_auxiliary = AUXILIARY.set(True)
     try:
         if sol is not None:
             # Use the same dense-warmup position and isolated mutable counters.
@@ -394,6 +395,7 @@ def isolated_reference(run, *, sol_evaluations=None):
             token_sol = sol._ACTIVE.set(aux)
         yield
     finally:
+        AUXILIARY.reset(token_auxiliary)
         LIVE.reset(token_live)
         if token_sol is not None:
             sol._ACTIVE.reset(token_sol)

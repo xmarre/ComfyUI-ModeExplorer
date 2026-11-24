@@ -231,6 +231,13 @@ def test_rediverse_panels_build_matched_graphs():
     assert tf["20"]["inputs"]["positive"] == ["4", 0] and tf["20"]["inputs"]["rollouts"] == 25
     assert arms["F_turbo_ft_tf"]["18"]["inputs"]["band"] == 4.0
     assert "18" not in arms["A_turbo"] and "18" not in arms["B_turbo_b1"]
+    # Identity and model LoRAs reach the calibration teacher exactly as they reach the student.
+    args.model_lora, args.identity_lora, args.lora_strength = "style", "person", 0.8
+    identity = evaluate.graph(args, "F_turbo_ft_tf", "prompt", 42, name="identity")
+    assert identity["23"]["inputs"] == {"model": ["19", 0], "lora_name": "style", "strength_model": 1.0}
+    assert identity["24"]["inputs"] == {"model": ["23", 0], "lora_name": "person", "strength_model": 0.8}
+    assert identity["20"]["inputs"]["teacher"] == ["24", 0] and identity["12"]["inputs"]["lora_name"] == "person"
+    args.model_lora, args.identity_lora = None, None
     args.teacher_model = None
     with pytest.raises(ValueError, match="teacher-model"):
         evaluate.graph(args, "G_raw", "prompt", 42, name="raw")

@@ -137,11 +137,14 @@ def graph(args, method, prompt, seed, *, name):
             calibration.update(rediverse["calibrate"])
             g["19"] = node("UNETLoader", unet_name=resolve(calibration.pop("teacher_model")), weight_dtype=args.weight_dtype)
             teacher = ["19", 0]
-            if args.model_lora:
-                # The student's weight LoRA is applied to the teacher too, as in the calibration guide.
-                g["23"] = node("LoraLoaderModelOnly", model=teacher, lora_name=args.model_lora,
-                               strength_model=args.model_lora_strength)
-                teacher = ["23", 0]
+            # The teacher gets the student's weight LoRAs, identity LoRA included, at the same strengths,
+            # so teacher directions do not carry variation the student's adapters constrain.
+            for key, lora_name, strength in (
+                ("23", args.model_lora, args.model_lora_strength), ("24", args.identity_lora, args.lora_strength),
+            ):
+                if lora_name:
+                    g[key] = node("LoraLoaderModelOnly", model=teacher, lora_name=lora_name, strength_model=strength)
+                    teacher = [key, 0]
             g["20"] = node("ModeExplorerReDiverseCalibrateKrea2", teacher=teacher, positive=["4", 0],
                            latent=["6", 0], **calibration)
             controls["directions"] = ["20", 0]

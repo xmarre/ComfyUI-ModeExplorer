@@ -694,3 +694,112 @@ def test_overlapping_scopes_are_refused_and_hooks_respect_ownership(caplog, mode
     native = torch.nn.functional.linear(probe_input, layer.weight, layer.bias)
     assert torch.equal(seen["foreign"], native) and not torch.allclose(seen["owner"], native)
     assert no_hooks(model)
+
+
+def _live_rows(model, positive, seeds, sigma=1.0, block=1):
+    """Block output image rows of the live sample, from ordinary single-image sampling with these probe seeds."""
+    from mode_explorer.rediverse_runtime import _noise_batch
+
+    dit = model.get_model_object("diffusion_model")
+    rows = []
+    for seed in seeds:
+        captured = []
+        handle = dit.blocks[block].register_forward_hook(
+            lambda m, a, k, out: captured.append(out[:, -24:].reshape(out.shape[0], -1).clone()), with_kwargs=True)
+        try:
+            noise = _noise_batch([seed], (16, 1, 8, 12))
+            guider = comfy.samplers.CFGGuider(model)
+            guider.inner_set_conds({"positive": positive})
+            guider.set_cfg(1.0)
+            with torch.inference_mode():
+                guider.sample(noise, torch.zeros_like(noise), comfy.samplers.ksampler("euler"),
+                              torch.tensor([sigma, 0.0]), disable_pbar=True, seed=seed)
+        finally:
+            handle.remove()
+        rows.append(captured[-1][0])  # the last forward is the live one; references run first
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize("arm,batch", [("native", 1), ("b1", 1), ("b1", 2), ("ft_b1", 1)])
+def test_probe_captures_live_samples_not_auxiliary_references(model, workspace, arm, batch):
+    """ModeExplorer reference forwards must never be captured, counted or fingerprinted by a probe."""
+    from mode_explorer import covariance
+
+    probed = model
+    if arm == "ft_b1":
+        probed = rediverse(model)
+    if arm in ("b1", "ft_b1"):
+        probed, = ModeExplorer().apply(probed, mode="Early Structural (B1)", strength=.03, fidelity=.7)
+    p, _ = conditions()
+    samples = 3  # with batch 2 the final chunk is a single image
+    report = _report(ModeExplorerActivationProbe().probe(probed, p, {"samples": LATENT}, "1", samples, 0, 1.0,
+                                                         batch, f"live-{arm}-{batch}")[0])
+    seeds = [1_000_000 + i for i in range(samples)]
+    if batch == 1:
+        expected = _live_rows(probed, p, seeds)
+        values, _ = covariance.eigenpairs(covariance.centred_gram(expected.to(torch.bfloat16)))
+        assert report["blocks"]["block01"]["tv"] == pytest.approx(covariance.spectrum_stats(values, samples)["tv"], rel=1e-5)
+    native = _report(ModeExplorerActivationProbe().probe(model, p, {"samples": LATENT}, "1", samples, 0, 1.0, batch,
+                                                         f"native-{arm}-{batch}")[0])
+    # The executed live inputs are the same noisy states as the native probe's.
+    assert report["capture_input_sha256"] == native["capture_input_sha256"]
+    if arm != "native":
+        assert report["blocks"]["block01"]["tv"] != pytest.approx(native["blocks"]["block01"]["tv"], rel=1e-6)
+    assert no_hooks(model)
+
+
+def test_truncated_probe_forwards_verify_the_adapter_prefix(model, workspace, monkeypatch):
+    """A probe stopping at block 1 must still prove that blocks 0-1 ran every adapted linear."""
+    import torch.nn.functional as F
+
+    mlp = model.get_model_object("diffusion_model").blocks[0].mlp
+    monkeypatch.setattr(mlp, "forward", lambda x: F.linear(F.silu(mlp.gate(x)) * mlp.up(x), mlp.down.weight))
+    p, _ = conditions()
+    with pytest.raises(RuntimeError, match="0.mlp.down"):
+        ModeExplorerActivationProbe().probe(rediverse(model), p, {"samples": LATENT}, "1", 3, 0, 1.0, 3, "prefix")
+    monkeypatch.undo()
+    # Unadapted later blocks are not required before an intentional stop.
+    ModeExplorerActivationProbe().probe(rediverse(model), p, {"samples": LATENT}, "0", 3, 0, 1.0, 3, "prefix")
+    assert no_hooks(model)
+
+
+def test_admitted_intervention_without_a_live_forward_is_an_error(caplog, model, workspace):
+    """A path that replaces the admitted evaluation (as a forecast would) must not consume the treatment."""
+    from comfy.patcher_extension import WrappersMP
+
+    from mode_explorer.rediverse_runtime import CAPTURE_KEY
+
+    def skipping(executor, x, *args, **kwargs):
+        options = args[4] if len(args) > 4 else kwargs.get("transformer_options", {})
+        sigmas = options.get("sigmas")
+        if sigmas is not None and float(sigmas.reshape(-1)[0]) == 1.0:
+            return torch.zeros_like(x)  # no transformer forward
+        return executor(x, *args, **kwargs)
+
+    def skipped(patched):
+        clone = patched.clone()
+        clone.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CAPTURE_KEY, skipping)
+        return clone
+
+    with pytest.raises(RuntimeError, match="ran no live transformer forward"):
+        draw(skipped(rediverse(model)))
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    # The strength-0 route sham requests no intervention: recorded, not an error.
+    draw(skipped(rediverse(model, strength=0.0, diagnostics=True)))
+    summary, = summaries(caplog)
+    assert summary["forecast_consumed"] == 1 and "admitted_evaluation_not_executed" in summary["reasons"]
+    assert no_hooks(model)
+
+
+def test_tf_reports_realized_per_sample_offsets(caplog, model, workspace, calibrated):
+    caplog.set_level(logging.INFO, logger="ModeExplorer")
+    directions, _ = calibrated
+    steered, = ModeExplorerReDiverse().apply(model, directions=directions, band=2.0, diagnostics=True)
+    draw(steered, latent=torch.zeros(2, 16, 1, 8, 12), batch=2, cfg=2.0)
+    summary = summaries(caplog)[-1]
+    realized, = summary["tf_realized"]
+    assert realized["rows"] == 4 and len(realized["realized_offset_norms"]) == 4
+    intended = torch.tensor(summary["tf_offset_norms"])
+    # Both CFG branches of a sample get the same offset; bf16 basis and native rounding stay within 1 %.
+    by_branch = torch.tensor(realized["realized_offset_norms"]).reshape(2, 2)
+    assert torch.allclose(by_branch, intended.expand(2, 2), rtol=1e-2)
